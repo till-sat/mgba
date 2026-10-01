@@ -1,5 +1,18 @@
-#ifndef MGBA_INTERNAL_GBA_INPUT_H
-#define MGBA_INTERNAL_GBA_INPUT_H
+/* Copyright (c) 2013-2016 Jeffrey Pfau
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef GBA_INPUT_H
+#define GBA_INPUT_H
+
+#include <mgba-util/common.h>
+
+CXX_GUARD_START
+
+#include <mgba/core/input.h>
+
+extern MGBA_EXPORT const struct mInputPlatformInfo GBAInputInfo;
 
 enum GBAKey {
 	GBA_KEY_A = 0,
@@ -11,7 +24,11 @@ enum GBAKey {
 	GBA_KEY_UP = 6,
 	GBA_KEY_DOWN = 7,
 	GBA_KEY_R = 8,
-	GBA_KEY_L = 9
+	GBA_KEY_L = 9,
+	GBA_KEY_MAX,
+	GBA_KEY_NONE = -1
 };
+
+CXX_GUARD_END
 
 #endif

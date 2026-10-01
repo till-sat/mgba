@@ -26,11 +26,7 @@ struct mSDLAudio {
 	struct mAudioResampler resampler;
 	SDL_AudioSpec desiredSpec;
 	SDL_AudioSpec obtainedSpec;
-#if SDL_VERSION_ATLEAST(3, 0, 0)
-	SDL_AudioStream* stream;
-#elif SDL_VERSION_ATLEAST(2, 0, 0)
 	SDL_AudioDeviceID deviceId;
-#endif
 
 	struct mCore* core;
 	struct mCoreSync* sync;
@@ -39,8 +35,6 @@ struct mSDLAudio {
 struct mCoreThread;
 bool mSDLInitAudio(struct mSDLAudio* context, struct mCoreThread*);
 void mSDLDeinitAudio(struct mSDLAudio* context);
-void mSDLPauseAudio(struct mSDLAudio* context);
-void mSDLResumeAudio(struct mSDLAudio* context);
 
 CXX_GUARD_END
 

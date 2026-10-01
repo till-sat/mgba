@@ -4,74 +4,106 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 #include "main.h"
+#include "sdl-events.h"
 
 #include <mgba/core/core.h>
 #include <mgba/core/thread.h>
 #include <mgba/core/version.h>
 
-static bool mSDLSWInit(struct mSDLRenderer* renderer);
-static void mSDLSWRunloop(struct mSDLRenderer* renderer, void* user);
-static void mSDLSWDeinit(struct mSDLRenderer* renderer);
-
-void mSDLSWCreate(struct mSDLRenderer* renderer) {
-	renderer->init = mSDLSWInit;
-	renderer->deinit = mSDLSWDeinit;
-	renderer->runloop = mSDLSWRunloop;
-}
+#define DEFAULT_WINDOW_SCALE 3
 
 bool mSDLSWInit(struct mSDLRenderer* renderer) {
-	unsigned width, height;
-	renderer->core->baseVideoSize(renderer->core, &width, &height);
-#if SDL_VERSION_ATLEAST(3, 0, 0)
-	renderer->window = SDL_CreateWindow(projectName, renderer->viewportWidth, renderer->viewportHeight, SDL_WINDOW_FULLSCREEN * renderer->player.fullscreen);
-	renderer->sdlRenderer = SDL_CreateRenderer(renderer->window, NULL);
-	SDL_SetRenderVSync(renderer->sdlRenderer, 1);
-#else
-	renderer->window = SDL_CreateWindow(projectName, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, renderer->viewportWidth, renderer->viewportHeight, SDL_WINDOW_FULLSCREEN_DESKTOP * renderer->player.fullscreen);
-	renderer->sdlRenderer = SDL_CreateRenderer(renderer->window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-#endif
-	SDL_GetWindowSize(renderer->window, &renderer->viewportWidth, &renderer->viewportHeight);
-	renderer->player.window = renderer->window;
+	renderer->core->baseVideoSize(renderer->core, &renderer->width, &renderer->height);
+	renderer->window = SDL_CreateWindow(projectName, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+	                                   renderer->width * DEFAULT_WINDOW_SCALE,
+	                                   renderer->height * DEFAULT_WINDOW_SCALE, SDL_WINDOW_RESIZABLE);
+	if (!renderer->window) {
+		return false;
+	}
+	renderer->sdlRenderer = SDL_CreateRenderer(renderer->window, -1, SDL_RENDERER_ACCELERATED);
+	if (!renderer->sdlRenderer) {
+		renderer->sdlRenderer = SDL_CreateRenderer(renderer->window, -1, SDL_RENDERER_SOFTWARE);
+	}
+	if (!renderer->sdlRenderer) {
+		return false;
+	}
+	SDL_SetWindowMinimumSize(renderer->window, renderer->width, renderer->height);
+	if (SDL_RenderSetLogicalSize(renderer->sdlRenderer, renderer->width, renderer->height) < 0 ||
+	    SDL_SetRenderDrawColor(renderer->sdlRenderer, 0, 0, 0, 255) < 0) {
+		return false;
+	}
+	SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
 #ifdef COLOR_16_BIT
 #ifdef COLOR_5_6_5
-	renderer->sdlTex = SDL_CreateTexture(renderer->sdlRenderer, SDL_PIXELFORMAT_RGB565, SDL_TEXTUREACCESS_STREAMING, width, height);
+	Uint32 format = SDL_PIXELFORMAT_RGB565;
 #else
-	renderer->sdlTex = SDL_CreateTexture(renderer->sdlRenderer, SDL_PIXELFORMAT_ABGR1555, SDL_TEXTUREACCESS_STREAMING, width, height);
+	Uint32 format = SDL_PIXELFORMAT_ABGR1555;
 #endif
 #else
-	renderer->sdlTex = SDL_CreateTexture(renderer->sdlRenderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, width, height);
+	Uint32 format = SDL_PIXELFORMAT_ABGR8888;
 #endif
-
-	int stride;
-	SDL_LockTexture(renderer->sdlTex, 0, (void**) &renderer->outputBuffer, &stride);
-	renderer->core->setVideoBuffer(renderer->core, renderer->outputBuffer, stride / BYTES_PER_PIXEL);
-
+	renderer->sdlTex = SDL_CreateTexture(renderer->sdlRenderer, format, SDL_TEXTUREACCESS_STREAMING,
+	                                   renderer->width, renderer->height);
+	if (!renderer->sdlTex) {
+		return false;
+	}
+	renderer->outputBuffer = calloc(renderer->width * renderer->height, sizeof(*renderer->outputBuffer));
+	if (!renderer->outputBuffer) {
+		SDL_SetError("Could not allocate the video buffer");
+		return false;
+	}
+	/* Own a stable buffer; SDL texture locks need not return the same memory. */
+	renderer->core->setVideoBuffer(renderer->core, renderer->outputBuffer, renderer->width);
 	return true;
 }
 
-void mSDLSWRunloop(struct mSDLRenderer* renderer, void* user) {
-	struct mCoreThread* context = user;
+bool mSDLSWRunloop(struct mSDLRenderer* renderer, struct mCoreThread* context) {
 	SDL_Event event;
-
+	SDL_Rect source = { 0, 0, renderer->width, renderer->height };
 	while (mCoreThreadIsActive(context)) {
 		while (SDL_PollEvent(&event)) {
-			mSDLHandleEvent(context, &renderer->player, &event);
+			mSDLHandleEvent(context, &event);
+			if (!mCoreThreadIsActive(context)) {
+				break;
+			}
+		}
+		if (!mCoreThreadIsActive(context)) {
+			break;
 		}
 
-		if (mCoreSyncWaitFrameStart(&context->impl->sync)) {
-			SDL_UnlockTexture(renderer->sdlTex);
-			SDL_RenderCopy(renderer->sdlRenderer, renderer->sdlTex, 0, 0);
-			SDL_RenderPresent(renderer->sdlRenderer);
-			int stride;
-			SDL_LockTexture(renderer->sdlTex, 0, (void**) &renderer->outputBuffer, &stride);
-			renderer->core->setVideoBuffer(renderer->core, renderer->outputBuffer, stride / BYTES_PER_PIXEL);
+		bool ready = mCoreSyncWaitFrameStart(&context->impl->sync);
+		bool success = true;
+		if (ready) {
+			unsigned width, height;
+			renderer->core->currentVideoSize(renderer->core, &width, &height);
+			if (width != (unsigned) source.w || height != (unsigned) source.h) {
+				source.w = width;
+				source.h = height;
+				SDL_SetWindowMinimumSize(renderer->window, width, height);
+				SDL_SetWindowSize(renderer->window, width * DEFAULT_WINDOW_SCALE, height * DEFAULT_WINDOW_SCALE);
+				success = SDL_RenderSetLogicalSize(renderer->sdlRenderer, width, height) == 0;
+			}
+			success = success && SDL_UpdateTexture(renderer->sdlTex, &source, renderer->outputBuffer,
+			                            renderer->width * BYTES_PER_PIXEL) == 0;
 		}
 		mCoreSyncWaitFrameEnd(&context->impl->sync);
+		if (!success) {
+			return false;
+		}
+		if (ready) {
+			if (SDL_RenderClear(renderer->sdlRenderer) < 0 ||
+			    SDL_RenderCopy(renderer->sdlRenderer, renderer->sdlTex, &source, NULL) < 0) {
+				return false;
+			}
+			SDL_RenderPresent(renderer->sdlRenderer);
+		}
 	}
+	return true;
 }
 
 void mSDLSWDeinit(struct mSDLRenderer* renderer) {
-	if (renderer->ratio > 1) {
-		free(renderer->outputBuffer);
-	}
+	SDL_DestroyTexture(renderer->sdlTex);
+	SDL_DestroyRenderer(renderer->sdlRenderer);
+	SDL_DestroyWindow(renderer->window);
+	free(renderer->outputBuffer);
 }

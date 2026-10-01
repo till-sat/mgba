@@ -1,0 +1,50 @@
+.\" Copyright (c) 2015-2016 Anthony J. Bentley <anthony@anjbe.name>
+.\"
+.\" This Source Code Form is subject to the terms of the Mozilla Public
+.\" License, v. 2.0. If a copy of the MPL was not distributed with this
+.\" file, you can obtain one at https://mozilla.org/MPL/2.0/.
+.Dd October 1, 2026
+.Dt MGBA 6
+.Os
+.Sh NAME
+.Nm mgba
+.Nd minimal Game Boy, Game Boy Color and Game Boy Advance player
+.Sh SYNOPSIS
+.Nm mgba
+.Ar ROM
+.Nm mgba
+.Fl -help
+.Sh DESCRIPTION
+.Nm
+runs one uncompressed ROM using SDL2 video, audio, and fixed keyboard controls.
+No global configuration is read.
+Built-in BIOS emulation is used.
+The window opens at three times the native resolution and can be resized.
+The picture retains its aspect ratio with nearest-neighbor scaling and black borders.
+.Sh CONTROLS
+.Bl -tag -width Backspace
+.It Arrow keys
+Directional pad.
+.It Z, X
+A and B.
+.It A, S
+L and R on Game Boy Advance.
+.It Enter
+Start.
+.It Backspace
+Select.
+.It Q, Escape
+Quit. Closing the window also quits.
+.El
+All game keys are released when the window loses focus.
+.Sh SAVES
+Use the game's own save command.
+Battery saves are written beside the ROM with its extension replaced by
+.Pa .sav
+and loaded automatically on the next run.
+The ROM directory must be writable.
+ROMs sharing the same basename in one directory share the same save file.
+.Sh EXIT STATUS
+.Ex -std
+.Sh AUTHORS
+mGBA is developed by Jeffrey Pfau and contributors.

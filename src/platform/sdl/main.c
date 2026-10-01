@@ -1,118 +1,149 @@
+/* Copyright (c) 2013-2026 Jeffrey Pfau
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "main.h"
+#include "sdl-audio.h"
+
+#include <mgba/core/config.h>
 #include <mgba/core/core.h>
-#include <mgba/gba/core.h>
-#include <mgba/internal/gba/input.h>
-#include <mgba-util/vfs.h>
-#include <SDL.h>
-#include <stdio.h>
-#include <fcntl.h>
-#include <stdlib.h>
+#include <mgba/core/thread.h>
 
-struct mSDLRenderer {
-    struct mCore* core;
-    SDL_Window* window;
-    SDL_Renderer* renderer;
-    SDL_Texture* texture;
-    uint32_t* pixels;
-    int width;
-    int height;
-};
+#define PORT "sdl"
 
-static void mSDLRun(struct mSDLRenderer* renderer) {
-    renderer->core->setAudioBufferSize(renderer->core, 2048);
+static int mSDLRun(struct mSDLRenderer* renderer, const char* romPath);
+static struct mStandardLogger _logger;
 
-    bool running = true;
-    SDL_Event event;
-
-    while (running) {
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) {
-                running = false;
-            }
-        }
-
-        const uint8_t* state = SDL_GetKeyboardState(NULL);
-        uint16_t keys = 0;
-        if (state[SDL_SCANCODE_X]) keys |= (1 << GBA_KEY_A);
-        if (state[SDL_SCANCODE_Z]) keys |= (1 << GBA_KEY_B);
-        if (state[SDL_SCANCODE_RETURN]) keys |= (1 << GBA_KEY_START);
-        if (state[SDL_SCANCODE_BACKSPACE]) keys |= (1 << GBA_KEY_SELECT);
-        if (state[SDL_SCANCODE_UP]) keys |= (1 << GBA_KEY_UP);
-        if (state[SDL_SCANCODE_DOWN]) keys |= (1 << GBA_KEY_DOWN);
-        if (state[SDL_SCANCODE_LEFT]) keys |= (1 << GBA_KEY_LEFT);
-        if (state[SDL_SCANCODE_RIGHT]) keys |= (1 << GBA_KEY_RIGHT);
-        if (state[SDL_SCANCODE_S]) keys |= (1 << GBA_KEY_R);
-        if (state[SDL_SCANCODE_A]) keys |= (1 << GBA_KEY_L);
-        
-        renderer->core->setKeys(renderer->core, keys);
-        renderer->core->runFrame(renderer->core);
-
-        // Update texture with ABGR8888 format
-        SDL_UpdateTexture(renderer->texture, NULL, renderer->pixels, renderer->width * sizeof(uint32_t));
-        SDL_RenderClear(renderer->renderer);
-        SDL_RenderCopy(renderer->renderer, renderer->texture, NULL, NULL);
-        SDL_RenderPresent(renderer->renderer);
-    }
+static void usage(const char* name) {
+	printf("Usage: %s ROM\n", name);
+	printf("Run one Game Boy, Game Boy Color, or Game Boy Advance ROM.\n");
+	printf("Keyboard: arrows + Z/X (A/B), A/S (L/R), Enter (Start), Backspace (Select).\n");
+	printf("Q or Escape quits. In-game saves use ROM-name.sav beside the ROM.\n");
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        printf("Usage: %s <game.gba>\n", argv[0]);
-        return 1;
-    }
+#ifdef _WIN32
+	AttachConsole(ATTACH_PARENT_PROCESS);
+	freopen("CONOUT$", "w", stdout);
+#endif
+	if (argc == 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
+		usage(argv[0]);
+		return 0;
+	}
+	if (argc != 2) {
+		usage(argv[0]);
+		return 1;
+	}
 
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        return 1;
-    }
+	struct mSDLRenderer renderer = {0};
+	renderer.core = mCoreFind(argv[1]);
+	if (!renderer.core) {
+		fprintf(stderr, "Unsupported or unreadable ROM: %s\n", argv[1]);
+		return 1;
+	}
+	if (!renderer.core->init(renderer.core)) {
+		fprintf(stderr, "Could not initialize the emulator core.\n");
+		free(renderer.core);
+		return 1;
+	}
 
-    struct mSDLRenderer renderer = {0};
-    renderer.width = 240;
-    renderer.height = 160;
-    renderer.pixels = calloc(renderer.width * renderer.height, sizeof(uint32_t));
+	struct mCoreOptions opts = {
+		.useBios = true,
+		.rewindEnable = false,
+		.audioBuffers = 1024,
+		.videoSync = true,
+		.audioSync = true,
+		.volume = 0x100,
+		.logLevel = mLOG_WARN | mLOG_ERROR | mLOG_FATAL,
+	};
+	mCoreInitConfig(renderer.core, PORT);
+	mCoreConfigSetDefaultIntValue(&renderer.core->config, "logToStdout", true);
+	mCoreConfigLoadDefaults(&renderer.core->config, &opts);
+	/* Fixed controls and saves beside the ROM; do not read global settings. */
+	mCoreLoadForeignConfig(renderer.core, &renderer.core->config);
+	mStandardLoggerInit(&_logger);
+	mStandardLoggerConfig(&_logger, &renderer.core->config);
+	mLogSetDefaultLogger(&_logger.d);
 
-    renderer.window = SDL_CreateWindow("mGBA Minimal", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 
-                                     renderer.width * 3, renderer.height * 3, SDL_WINDOW_SHOWN);
-    renderer.renderer = SDL_CreateRenderer(renderer.window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    
-    // Use ABGR8888 to match mGBA's memory layout
-    renderer.texture = SDL_CreateTexture(renderer.renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 
-                                       renderer.width, renderer.height);
+	int ret = 1;
+	if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+		fprintf(stderr, "Could not initialize SDL video: %s\n", SDL_GetError());
+	} else {
+		ret = mSDLRun(&renderer, argv[1]);
+	}
+	mSDLSWDeinit(&renderer);
+	SDL_Quit();
+	mCoreConfigDeinit(&renderer.core->config);
+	renderer.core->deinit(renderer.core);
+	mLogSetDefaultLogger(NULL);
+	mStandardLoggerDeinit(&_logger);
+	return ret;
+}
 
-    renderer.core = GBACoreCreate();
-    if (!renderer.core) {
-        printf("Failed to create GBA core.\n");
-        return 1;
-    }
+#if defined(_WIN32) && !defined(_UNICODE)
+#include <mgba-util/string.h>
 
-    if (!renderer.core->init(renderer.core)) {
-        printf("Failed to initialize GBA core.\n");
-        return 1;
-    }
+int wmain(int argc, wchar_t** argv) {
+	char** argv8 = malloc(sizeof(char*) * argc);
+	int i;
+	for (i = 0; i < argc; ++i) {
+		argv8[i] = utf16to8((uint16_t*) argv[i], wcslen(argv[i]) * 2);
+	}
+	__argv = argv8;
+	int ret = main(argc, argv8);
+	for (i = 0; i < argc; ++i) {
+		free(argv8[i]);
+	}
+	free(argv8);
+	return ret;
+}
+#endif
 
-    mCoreInitConfig(renderer.core, "sdl");
-    renderer.core->setVideoBuffer(renderer.core, (mColor*)renderer.pixels, renderer.width);
+static int mSDLRun(struct mSDLRenderer* renderer, const char* romPath) {
+	if (!mCoreLoadFile(renderer->core, romPath)) {
+		fprintf(stderr, "Could not load ROM: %s\n", romPath);
+		return 1;
+	}
 
-    struct VFile* rom = VFileOpenFD(argv[1], O_RDONLY);
-    if (!rom) {
-        printf("Could not open ROM: %s\n", argv[1]);
-        renderer.core->deinit(renderer.core);
-        return 1;
-    }
+	/* Battery saves are flushed by the core when the ROM is unloaded. */
+	if (!mCoreAutoloadSave(renderer->core)) {
+		fprintf(stderr, "Warning: could not open the ROM save file.\n");
+	}
+	if (!mSDLSWInit(renderer)) {
+		fprintf(stderr, "Could not initialize SDL renderer: %s\n", SDL_GetError());
+		renderer->core->unloadROM(renderer->core);
+		return 1;
+	}
 
-    if (!renderer.core->loadROM(renderer.core, rom)) {
-        printf("Failed to load ROM.\n");
-        renderer.core->deinit(renderer.core);
-        return 1;
-    }
-
-    renderer.core->reset(renderer.core);
-    mSDLRun(&renderer);
-
-    renderer.core->deinit(renderer.core);
-    SDL_DestroyTexture(renderer.texture);
-    SDL_DestroyRenderer(renderer.renderer);
-    SDL_DestroyWindow(renderer.window);
-    free(renderer.pixels);
-    SDL_Quit();
-
-    return 0;
+	struct mCoreThread thread = { .core = renderer->core };
+	thread.logger.logger = &_logger.d;
+	struct mSDLAudio audio = {
+		.samples = renderer->core->opts.audioBuffers,
+		.sampleRate = 44100,
+	};
+	bool didFail = !mCoreThreadStart(&thread);
+	if (!didFail) {
+		if (mSDLInitAudio(&audio, &thread)) {
+			if (!mSDLSWRunloop(renderer, &thread)) {
+				didFail = true;
+				fprintf(stderr, "Could not render video: %s\n", SDL_GetError());
+			}
+			if (mCoreThreadHasCrashed(&thread)) {
+				didFail = true;
+				fprintf(stderr, "The game crashed.\n");
+			}
+			/* Stop callbacks before destroying the thread's synchronization state. */
+			mSDLDeinitAudio(&audio);
+		} else {
+			didFail = true;
+			fprintf(stderr, "Could not initialize SDL audio: %s\n", SDL_GetError());
+		}
+		mCoreThreadEnd(&thread);
+		mCoreThreadJoin(&thread);
+	} else {
+		fprintf(stderr, "Could not start the emulator thread.\n");
+	}
+	renderer->core->unloadROM(renderer->core);
+	return didFail;
 }
