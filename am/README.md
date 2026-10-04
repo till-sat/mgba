@@ -91,7 +91,8 @@ make PLATFORM=spike test-media
 make PLATFORM=spike test
 ```
 
-The output is `build/spike/mgba.elf`. `ROM` defaults to `roms/dragonball.gba` and
+The output is `build/spike/mgba.elf`. `ROM` defaults to the game name `dragonball`,
+which resolves to `roms/dragonball.gba`, and
 is embedded into the executable. The default run opens an SDL window with
 audio and keyboard input, then runs until Q, Escape, or window close.
 `FRAMES=0` means unlimited and is the interactive default. A positive value

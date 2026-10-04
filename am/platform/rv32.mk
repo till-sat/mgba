@@ -59,7 +59,7 @@ $(BOOT_OBJECT): $(BOOT_SOURCE) $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config |
 	$(CC) $(PLATFORM_CFLAGS) -c "$<" -o "$@"
 
 $(BUILD_DIR)/.rom-config: FORCE | $(BUILD_DIR)
-	@printf '%s\n' '$(abspath $(ROM))' '$(ROM_EMBED_FLAGS)' > "$@.tmp"
+	@printf '%s\n' '$(abspath $(ROM_PATH))' '$(ROM_EMBED_FLAGS)' > "$@.tmp"
 	@cmp -s "$@.tmp" "$@" || cp "$@.tmp" "$@"
 	@rm -f "$@.tmp"
 
@@ -74,9 +74,9 @@ $(BUILD_DIR)/src/platform/am/embedded.o: src/platform/am/embedded.c $(BUILD_DIR)
 		-DAM_BENCHMARK=$(BENCHMARK) -DAM_WARMUP=$(WARMUP) \
 		$(PROJECT_CFLAGS) $(CFLAGS) $(LTO) -MMD -MP -c "$<" -o "$@"
 
-$(ROM_OBJECT): $(ROM) am/tools/embed_rom.py $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config $(BUILD_DIR)/.rom-config
+$(ROM_OBJECT): $(ROM_PATH) am/tools/embed_rom.py $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config $(BUILD_DIR)/.rom-config
 	@mkdir -p "$(@D)"
-	$(PYTHON) am/tools/embed_rom.py "$(ROM)" "$(BUILD_DIR)/rom.S" $(ROM_EMBED_FLAGS)
+	$(PYTHON) am/tools/embed_rom.py "$(ROM_PATH)" "$(BUILD_DIR)/rom.S" $(ROM_EMBED_FLAGS)
 	$(CC) $(PLATFORM_CFLAGS) -c "$(BUILD_DIR)/rom.S" -o "$@"
 
 RV32_FLOAT_SYMBOLS = ' (__[a-z0-9_]*(df|sf)[0-9]+|__float[a-z0-9_]*|__fix[a-z0-9_]*f[a-z0-9_]*|__extend[a-z0-9_]*|__trunc[a-z0-9_]*|(sin|cos|exp|log|floor|sqrt|hypot)f?)$$'

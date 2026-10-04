@@ -25,7 +25,9 @@ Each command builds the player when needed and starts the selected interactive
 path. Native and Spike default to `roms/dragonball.gba`. ysyxsoc defaults to
 the bundled 4 KiB test ROM `cinema/gba/obj/2d-wrap/test.gba`, which displays white
 and green blocks and reduces Flash boot loading time. These defaults are defined
-in the root `Makefile`. Append `ROM=/path/to/game.gba` to use another ROM.
+in the root `Makefile`. Set `ROM=game-name` to load `roms/game-name.gba`; the
+`.gba` suffix may be omitted. GB/GBC ROMs can include their suffix, for example
+`ROM=game.gb`. Explicit paths remain accepted for temporary test fixtures.
 
 ### Native + SDL
 
@@ -68,7 +70,7 @@ make PLATFORM=ysyxsoc \
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `PLATFORM` | Build target: `native`, `spike` or `ysyxsoc` | `native` |
-| `ROM` | GB/GBC/GBA ROM to load (embedded for bare-metal targets) | Native / Spike: `roms/dragonball.gba`; ysyxsoc: `cinema/gba/obj/2d-wrap/test.gba` |
+| `ROM` | ROM name under `roms/` (embedded for bare-metal targets); `.gba` is added when omitted | Native / Spike: `dragonball`; ysyxsoc: `cinema/gba/obj/2d-wrap/test.gba` |
 | `BUILD_DIR` | Build output directory | `build` or a platform-specific directory |
 
 ### Native

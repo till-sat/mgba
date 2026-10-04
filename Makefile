@@ -16,7 +16,21 @@ PLATFORM ?= native
 ifeq ($(PLATFORM),ysyxsoc)
 ROM ?= cinema/gba/obj/2d-wrap/test.gba
 else
-ROM ?= roms/dragonball.gba
+ROM ?= dragonball
+endif
+
+# User-facing ROM values are game names. Resolve a name to the fixed ROM
+# directory while retaining path values for temporary fixtures and platform
+# tests. An extension may be supplied for GB/GBC ROMs; GBA names default to
+# .gba.
+ROM_DIR ?= roms
+ROM_INPUT := $(ROM)
+ifneq ($(findstring /,$(ROM_INPUT)),)
+ROM_PATH := $(ROM_INPUT)
+else ifneq ($(suffix $(ROM_INPUT)),)
+ROM_PATH := $(ROM_DIR)/$(ROM_INPUT)
+else
+ROM_PATH := $(ROM_DIR)/$(ROM_INPUT).gba
 endif
 
 ifeq ($(filter $(PLATFORM),native spike verilator fpga ysyxsoc),)
@@ -205,7 +219,7 @@ $(TARGET): $(FRONTEND_OBJECTS) $(CORE_LIBRARY) $(AM_LIBRARY) $(BOOT_OBJECT) $(RO
 
 ifeq ($(PLATFORM),native)
 run: $(TARGET)
-	"$(abspath $(TARGET))" $(ARGS) "$(ROM)"
+	"$(abspath $(TARGET))" $(ARGS) "$(ROM_PATH)"
 
 $(BUILD_DIR)/am/test/native.o: Makefile $(BUILD_DIR)/.build-config | check-deps
 

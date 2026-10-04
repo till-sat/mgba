@@ -23,8 +23,9 @@
 每条命令都会在需要时构建播放器，然后启动对应的交互路径。Native 和 Spike
 默认使用 `roms/dragonball.gba`；ysyxsoc 默认使用仓库自带的 4 KiB 测试 ROM
 `cinema/gba/obj/2d-wrap/test.gba`，画面为白色和绿色方块，以缩短 Flash 启动
-加载时间。默认值定义在根目录的 `Makefile` 中。要使用其他 ROM，可以在
-命令末尾追加 `ROM=/path/to/game.gba`。
+加载时间。默认值定义在根目录的 `Makefile` 中。使用其他 GBA 游戏时只需传入
+游戏名，例如 `ROM=go` 会加载 `roms/go.gba`；GB/GBC 游戏可以保留扩展名，例
+如 `ROM=game.gb`。临时测试仍可传入完整路径。
 
 ### Native + SDL
 
@@ -66,7 +67,7 @@ make PLATFORM=ysyxsoc \
 | 变量 | 作用 | 默认值 |
 | --- | --- | --- |
 | `PLATFORM` | 构建目标：`native`、`spike` 或 `ysyxsoc` | `native` |
-| `ROM` | 要加载的 GB/GBC/GBA ROM，裸机平台会将其嵌入程序 | Native / Spike：`roms/dragonball.gba`；ysyxsoc：`cinema/gba/obj/2d-wrap/test.gba` |
+| `ROM` | `roms/` 下的游戏名，裸机平台会将 ROM 嵌入程序；省略扩展名时默认补 `.gba` | Native / Spike：`dragonball`；ysyxsoc：`cinema/gba/obj/2d-wrap/test.gba` |
 | `BUILD_DIR` | 构建输出目录 | `build` 或平台专用目录 |
 
 ### Native
