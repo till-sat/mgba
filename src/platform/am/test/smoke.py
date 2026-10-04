@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MPL-2.0
-"""Black-box tests for the SDL2 player; ROMs and saves live in a temporary directory."""
+"""Black-box tests for AM native; ROMs and saves live in a temporary directory."""
 
 import os
 from pathlib import Path
@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import zlib
 
 from PIL import Image, ImageChops
 
@@ -117,7 +118,13 @@ def main():
             assert 'runtime error:' not in result.stderr, result.stderr
             return result
 
-        for args, expected in [(['--help'], 0), ([], 1), (['one', 'two'], 1), (['missing.gb'], 1)]:
+        for args, expected in [(['--help'], 0), ([], 1), (['one', 'two'], 1), (['missing.gb'], 1),
+                               (['--headless', 'smoke-gb.gb'], 1),
+                               (['--frames', '0', 'smoke-gb.gb'], 1),
+                               (['--frames', '-1', 'smoke-gb.gb'], 1),
+                               (['--frames', 'bad', 'smoke-gb.gb'], 1),
+                               (['--frames', '4294967296', 'smoke-gb.gb'], 1),
+                               (['--frames'], 1)]:
             run(args, expected)
         (work / 'invalid.gb').write_bytes(b'not a ROM')
         run(['invalid.gb'], 1)
@@ -136,6 +143,17 @@ def main():
                 scaled = expected.convert('RGB').resize(actual.size, Image.Resampling.NEAREST)
                 assert ImageChops.difference(actual.convert('RGB'), scaled).getbbox() is None, name
             print(f'PASS: {name} matches reference pixels at 3x scale')
+
+            # No display/audio driver is usable here: headless must not open either.
+            with Image.open(ROOT / source / 'baseline_0000.png') as reference:
+                checksum = zlib.crc32(reference.convert('RGB').tobytes())
+            expected_report = f'Frames: 120; video: {width}x{height}; CRC32: {checksum:08X}'
+            for _ in range(2):
+                result = run(['--headless', '--frames', '120', name],
+                             SDL_VIDEODRIVER='no_such_driver', SDL_AUDIODRIVER='no_such_driver')
+                assert expected_report in result.stdout, (name, expected_report, result.stdout)
+                assert 'PROBE_RESIZABLE' not in result.stdout, result.stdout
+            print(f'PASS: {name} headless CRC matches reference pixels and repeats exactly')
 
         for size, offset in [((900, 480), (90, 0)), ((720, 600), (0, 60))]:
             run(['sprites.gba'], MGBA_TEST_SCREEN=str(work / 'resized.bmp'),

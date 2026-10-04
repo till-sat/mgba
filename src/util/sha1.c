@@ -176,7 +176,7 @@ void sha1Init(struct SHA1Context* context) {
 
 /* Run your data through this. */
 void sha1Update(struct SHA1Context* context, const void* data, size_t len) {
-	size_t i;
+	const uint8_t* input = data;
 	size_t j;
 
 	j = context->count[0];
@@ -186,16 +186,21 @@ void sha1Update(struct SHA1Context* context, const void* data, size_t len) {
 	context->count[1] += (len >> 29);
 	j = (j >> 3) & 63;
 	if ((j + len) > 63) {
-		memcpy(&context->buffer[j], data, (i = 64 - j));
+		size_t copy = 64 - j;
+		memcpy(&context->buffer[j], input, copy);
 		sha1Transform(context->state, context->buffer);
-		for (; i + 63 < len; i += 64) {
-			sha1Transform(context->state, &((uint8_t*) data)[i]);
+		input += copy;
+		len -= copy;
+		while (len >= 64) {
+			sha1Transform(context->state, input);
+			input += 64;
+			len -= 64;
 		}
 		j = 0;
-	} else {
-		i = 0;
 	}
-	memcpy(&context->buffer[j], &((uint8_t*) data)[i], len - i);
+	if (len) {
+		memcpy(&context->buffer[j], input, len);
+	}
 }
 
 /* Add padding and return the message digest. */

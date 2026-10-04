@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MPL-2.0 */
-/* Draw a gradient, play a square wave, count boots in SRAM, and record A/Right. */
+/* AM player fixture: gradient, square wave, SRAM boot counter, and A/Right. */
 .syntax unified
 .cpu arm7tdmi
 .arm

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MPL-2.0 */
-/* Interpose SDL calls to exercise the real player without a display or speakers. */
+/* Interpose native device calls to test the AM player without display or speakers. */
 #define _GNU_SOURCE
 #include <SDL.h>
 #include <dlfcn.h>
@@ -12,8 +12,6 @@ static int stage;
 static int captured;
 static unsigned long audioBytes;
 static unsigned long nonzero;
-static SDL_AudioCallback callback;
-static void* userdata;
 static SDL_Window* window;
 
 static int fail(const char* name) {
@@ -21,23 +19,14 @@ static int fail(const char* name) {
 	return value && !strcmp(value, name);
 }
 
-static void probeAudio(void* unused, Uint8* data, int len) {
-	(void) unused;
-	callback(userdata, data, len);
-	audioBytes += len;
-	for (int i = 0; i < len; ++i) {
-		nonzero += data[i] != 0;
+int SDL_QueueAudio(SDL_AudioDeviceID device, const void* data, Uint32 len) {
+	int (*real)(SDL_AudioDeviceID, const void*, Uint32) = dlsym(RTLD_NEXT, "SDL_QueueAudio");
+	int result = real(device, data, len);
+	if (!result) {
+		audioBytes += len;
+		for (Uint32 i = 0; i < len; ++i) nonzero += ((const Uint8*) data)[i] != 0;
 	}
-}
-
-SDL_AudioDeviceID SDL_OpenAudioDevice(const char* device, int capture, const SDL_AudioSpec* desired,
-                                     SDL_AudioSpec* obtained, int changes) {
-	SDL_AudioDeviceID (*real)(const char*, int, const SDL_AudioSpec*, SDL_AudioSpec*, int) = dlsym(RTLD_NEXT, "SDL_OpenAudioDevice");
-	SDL_AudioSpec spec = *desired;
-	callback = desired->callback;
-	userdata = desired->userdata;
-	spec.callback = probeAudio;
-	return real(device, capture, &spec, obtained, changes);
+	return result;
 }
 
 SDL_Window* SDL_CreateWindow(const char* title, int x, int y, int w, int h, Uint32 flags) {
@@ -71,6 +60,8 @@ int SDL_UpdateTexture(SDL_Texture* texture, const SDL_Rect* rect, const void* pi
 int SDL_PollEvent(SDL_Event* event) {
 	int (*real)(SDL_Event*) = dlsym(RTLD_NEXT, "SDL_PollEvent");
 	if (!started) {
+		/* Slow instruction simulators may spend seconds initializing the core. */
+		if (getenv("MGBA_TEST_AFTER_FRAME")) return real(event);
 		started = SDL_GetTicks();
 	}
 	Uint32 elapsed = SDL_GetTicks() - started;
@@ -107,6 +98,7 @@ int SDL_PollEvent(SDL_Event* event) {
 
 void SDL_RenderPresent(SDL_Renderer* renderer) {
 	void (*real)(SDL_Renderer*) = dlsym(RTLD_NEXT, "SDL_RenderPresent");
+	if (!started && getenv("MGBA_TEST_AFTER_FRAME")) started = SDL_GetTicks();
 	if (!captured && started && SDL_GetTicks() - started > 1450) {
 		int w, h;
 		SDL_GetRendererOutputSize(renderer, &w, &h);

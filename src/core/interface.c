@@ -136,7 +136,12 @@ static void _mRumbleIntegratorIntegrate(struct mRumble* rumble, uint32_t period)
 	if (integrator->state) {
 		integrator->timeOn += period - integrator->totalTime;
 	}
+#ifdef AM_BAREMETAL
+	/* Bare-metal targets do not expose a rumble actuator. */
+	integrator->setRumble(integrator, integrator->timeOn >= period ? 1.0f : 0.0f);
+#else
 	integrator->setRumble(integrator, fminf(integrator->timeOn / (float) period, 1.0f));
+#endif
 
 	integrator->totalTime = 0;
 	integrator->timeOn = 0;

@@ -160,6 +160,89 @@ static void _RegisterRamReset(struct GBA* gba) {
 	}
 }
 
+#ifdef AM_BAREMETAL
+/* Q8.8 sine table for the 8-bit BIOS angle format. */
+static int16_t _affineSin(unsigned phase) {
+	static const int16_t table[65] = {
+		0, 6, 13, 19, 25, 31, 38, 44, 50, 56, 62, 68, 74, 80, 86, 92,
+		98, 104, 109, 115, 121, 126, 132, 137, 142, 147, 152, 157, 162, 167,
+		172, 177, 181, 185, 190, 194, 198, 202, 206, 209, 213, 216, 220, 223,
+		226, 229, 231, 234, 237, 239, 241, 243, 245, 247, 248, 250, 251, 252,
+		253, 254, 255, 255, 256, 256, 256,
+	};
+	phase &= 255;
+	if (phase <= 64) return table[phase];
+	if (phase <= 128) return table[128 - phase];
+	if (phase <= 192) return -table[phase - 128];
+	return -table[256 - phase];
+}
+
+static void _affineRotation(unsigned phase, int32_t* sine, int32_t* cosine) {
+	*sine = _affineSin(phase);
+	*cosine = _affineSin(phase + 64);
+}
+
+static void _BgAffineSet(struct GBA* gba) {
+	struct ARMCore* cpu = gba->cpu;
+	int count = cpu->gprs[2];
+	int offset = cpu->gprs[0];
+	int destination = cpu->gprs[1];
+	enum mMemoryAccessSource oldAccess = cpu->memory.accessSource;
+	cpu->memory.accessSource = mACCESS_SYSTEM;
+	while (count--) {
+		int32_t ox = (int32_t) cpu->memory.load32(cpu, offset, 0);
+		int32_t oy = (int32_t) cpu->memory.load32(cpu, offset + 4, 0);
+		int32_t cx = (int16_t) cpu->memory.load16(cpu, offset + 8, 0);
+		int32_t cy = (int16_t) cpu->memory.load16(cpu, offset + 10, 0);
+		int32_t sx = (int16_t) cpu->memory.load16(cpu, offset + 12, 0);
+		int32_t sy = (int16_t) cpu->memory.load16(cpu, offset + 14, 0);
+		int32_t sine, cosine;
+		_affineRotation(cpu->memory.load16(cpu, offset + 16, 0) >> 8, &sine, &cosine);
+		int32_t a = (cosine * sx) >> 8;
+		int32_t b = -((sine * sx) >> 8);
+		int32_t c = (sine * sy) >> 8;
+		int32_t d = (cosine * sy) >> 8;
+		int32_t rx = ox - (int32_t) (((int64_t) a * cx + (int64_t) b * cy) >> 8);
+		int32_t ry = oy - (int32_t) (((int64_t) c * cx + (int64_t) d * cy) >> 8);
+		cpu->memory.store16(cpu, destination, a, 0);
+		cpu->memory.store16(cpu, destination + 2, b, 0);
+		cpu->memory.store16(cpu, destination + 4, c, 0);
+		cpu->memory.store16(cpu, destination + 6, d, 0);
+		cpu->memory.store32(cpu, destination + 8, rx, 0);
+		cpu->memory.store32(cpu, destination + 12, ry, 0);
+		offset += 20;
+		destination += 16;
+	}
+	cpu->memory.accessSource = oldAccess;
+}
+
+static void _ObjAffineSet(struct GBA* gba) {
+	struct ARMCore* cpu = gba->cpu;
+	int count = cpu->gprs[2];
+	int offset = cpu->gprs[0];
+	int destination = cpu->gprs[1];
+	int diff = cpu->gprs[3];
+	enum mMemoryAccessSource oldAccess = cpu->memory.accessSource;
+	cpu->memory.accessSource = mACCESS_SYSTEM;
+	while (count--) {
+		int32_t sx = (int16_t) cpu->memory.load16(cpu, offset, 0);
+		int32_t sy = (int16_t) cpu->memory.load16(cpu, offset + 2, 0);
+		int32_t sine, cosine;
+		_affineRotation(cpu->memory.load16(cpu, offset + 4, 0) >> 8, &sine, &cosine);
+		int32_t a = (cosine * sx) >> 8;
+		int32_t b = -((sine * sx) >> 8);
+		int32_t c = (sine * sy) >> 8;
+		int32_t d = (cosine * sy) >> 8;
+		cpu->memory.store16(cpu, destination, a, 0);
+		cpu->memory.store16(cpu, destination + diff, b, 0);
+		cpu->memory.store16(cpu, destination + diff * 2, c, 0);
+		cpu->memory.store16(cpu, destination + diff * 3, d, 0);
+		offset += 8;
+		destination += diff * 4;
+	}
+	cpu->memory.accessSource = oldAccess;
+}
+#else
 static void _BgAffineSet(struct GBA* gba) {
 	struct ARMCore* cpu = gba->cpu;
 	int i = cpu->gprs[2];
@@ -242,6 +325,8 @@ static void _ObjAffineSet(struct GBA* gba) {
 	cpu->memory.accessSource = oldAccess;
 }
 
+#endif
+
 static void _MidiKey2Freq(struct GBA* gba) {
 	struct ARMCore* cpu = gba->cpu;
 
@@ -253,7 +338,24 @@ static void _MidiKey2Freq(struct GBA* gba) {
 	cpu->memory.accessSource = oldAccess;
 	gba->memory.activeRegion = oldRegion;
 
+#ifdef AM_BAREMETAL
+	/* exp2((180 - key - fine / 256) / 12) in fixed point. */
+	static const uint32_t roots[17] = {
+		65536, 68431, 71435, 74551, 77805, 81192, 84711, 88367, 92162,
+		96102, 100191, 104431, 108829, 113391, 118123, 123033, 128000,
+	};
+	int32_t exponent = (180 - (int32_t) cpu->gprs[1]) * 256 - (int32_t) cpu->gprs[2];
+	int32_t fixed = exponent / 12;
+	int32_t whole = fixed >> 8;
+	unsigned fraction = (unsigned) fixed & 255;
+	unsigned slot = fraction >> 4;
+	unsigned remainder = fraction & 15;
+	uint64_t root = roots[slot] + ((uint64_t) (roots[slot + 1] - roots[slot]) * remainder >> 4);
+	uint64_t denominator = whole >= 0 ? root << whole : root >> -whole;
+	cpu->gprs[0] = denominator ? (uint32_t) (((uint64_t) key << 16) / denominator) : UINT32_MAX;
+#else
 	cpu->gprs[0] = key / exp2f((180.f - cpu->gprs[1] - cpu->gprs[2] / 256.f) / 12.f);
+#endif
 }
 
 static void _Div(struct GBA* gba, int32_t num, int32_t denom) {

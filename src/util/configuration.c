@@ -117,9 +117,16 @@ void ConfigurationSetUIntValue(struct Configuration* configuration, const char* 
 }
 
 void ConfigurationSetFloatValue(struct Configuration* configuration, const char* section, const char* key, float value) {
+#ifdef AM_BAREMETAL
+	UNUSED(configuration);
+	UNUSED(section);
+	UNUSED(key);
+	UNUSED(value);
+#else
 	char charValue[16];
 	ftostr_u(charValue, sizeof(charValue), value);
 	ConfigurationSetValue(configuration, section, key, charValue);
+#endif
 }
 
 void ConfigurationClearValue(struct Configuration* configuration, const char* section, const char* key) {

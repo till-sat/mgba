@@ -135,6 +135,12 @@ static bool _lookupUIntValue(const struct mCoreConfig* config, const char* key, 
 }
 
 static bool _lookupFloatValue(const struct mCoreConfig* config, const char* key, float* out) {
+#ifdef AM_BAREMETAL
+	UNUSED(config);
+	UNUSED(key);
+	UNUSED(out);
+	return false;
+#else
 	const char* charValue = _lookupValue(config, key);
 	if (!charValue) {
 		return false;
@@ -146,6 +152,7 @@ static bool _lookupFloatValue(const struct mCoreConfig* config, const char* key,
 	}
 	*out = value;
 	return true;
+#endif
 }
 
 void mCoreConfigInit(struct mCoreConfig* config, const char* port) {
@@ -301,7 +308,9 @@ void mCoreConfigPortableIniPath(char* out, size_t outLength) {
 	UNUSED(outLength);
 	out[0] = '\0';
 #else
-	getcwd(out, outLength);
+	if (!getcwd(out, outLength)) {
+		out[0] = '\0';
+	}
 #ifdef __APPLE__
 	CFBundleRef mainBundle = CFBundleGetMainBundle();
 	if (strcmp(out, "/") == 0 && mainBundle) {
@@ -394,7 +403,13 @@ void mCoreConfigSetUIntValue(struct mCoreConfig* config, const char* key, unsign
 }
 
 void mCoreConfigSetFloatValue(struct mCoreConfig* config, const char* key, float value) {
+#ifdef AM_BAREMETAL
+	UNUSED(config);
+	UNUSED(key);
+	UNUSED(value);
+#else
 	ConfigurationSetFloatValue(&config->configTable, config->port, key, value);
+#endif
 }
 
 void mCoreConfigSetDefaultValue(struct mCoreConfig* config, const char* key, const char* value) {
@@ -410,7 +425,13 @@ void mCoreConfigSetDefaultUIntValue(struct mCoreConfig* config, const char* key,
 }
 
 void mCoreConfigSetDefaultFloatValue(struct mCoreConfig* config, const char* key, float value) {
+#ifdef AM_BAREMETAL
+	UNUSED(config);
+	UNUSED(key);
+	UNUSED(value);
+#else
 	ConfigurationSetFloatValue(&config->defaultsTable, config->port, key, value);
+#endif
 }
 
 void mCoreConfigSetOverrideValue(struct mCoreConfig* config, const char* key, const char* value) {
@@ -426,7 +447,13 @@ void mCoreConfigSetOverrideUIntValue(struct mCoreConfig* config, const char* key
 }
 
 void mCoreConfigSetOverrideFloatValue(struct mCoreConfig* config, const char* key, float value) {
+#ifdef AM_BAREMETAL
+	UNUSED(config);
+	UNUSED(key);
+	UNUSED(value);
+#else
 	ConfigurationSetFloatValue(&config->overridesTable, config->port, key, value);
+#endif
 }
 
 void mCoreConfigCopyValue(struct mCoreConfig* config, const struct mCoreConfig* src, const char* key) {

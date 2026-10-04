@@ -8,6 +8,12 @@
 #include <float.h>
 
 int ftostr_l(char* restrict str, size_t size, float f, locale_t locale) {
+#ifdef AM_BAREMETAL
+	UNUSED(f);
+	UNUSED(locale);
+	if (size) str[0] = '\0';
+	return 0;
+#else
 #ifdef HAVE_SNPRINTF_L
 	return snprintf_l(str, size, locale, "%.*g", FLT_DIG, f);
 #elif defined(HAVE_USELOCALE)
@@ -24,10 +30,16 @@ int ftostr_l(char* restrict str, size_t size, float f, locale_t locale) {
 	UNUSED(locale);
 	return snprintf(str, size, "%.*g", FLT_DIG, f);
 #endif
+#endif
 }
 
 #ifndef HAVE_STRTOF_L
 float strtof_l(const char* restrict str, char** restrict end, locale_t locale) {
+#ifdef AM_BAREMETAL
+	UNUSED(locale);
+	if (end) *end = (char*) str;
+	return 0.0f;
+#else
 #ifdef HAVE_USELOCALE
 	locale_t old = uselocale(locale);
 	float res = strtof(str, end);
@@ -42,10 +54,14 @@ float strtof_l(const char* restrict str, char** restrict end, locale_t locale) {
 	UNUSED(locale);
 	return strtof(str, end);
 #endif
+#endif
 }
 #endif
 
 int ftostr_u(char* restrict str, size_t size, float f) {
+#ifdef AM_BAREMETAL
+	return ftostr_l(str, size, f, 0);
+#else
 #ifdef HAVE_LOCALE
 	locale_t l = newlocale(LC_NUMERIC_MASK, "C", 0);
 #else
@@ -56,9 +72,13 @@ int ftostr_u(char* restrict str, size_t size, float f) {
 	freelocale(l);
 #endif
 	return res;
+#endif
 }
 
 float strtof_u(const char* restrict str, char** restrict end) {
+#ifdef AM_BAREMETAL
+	return strtof_l(str, end, 0);
+#else
 #ifdef HAVE_LOCALE
 	locale_t l = newlocale(LC_NUMERIC_MASK, "C", 0);
 #else
@@ -69,6 +89,7 @@ float strtof_u(const char* restrict str, char** restrict end) {
 	freelocale(l);
 #endif
 	return res;
+#endif
 }
 
 #ifndef HAVE_LOCALTIME_R

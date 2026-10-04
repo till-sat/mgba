@@ -11,16 +11,29 @@
 .Nd minimal Game Boy, Game Boy Color and Game Boy Advance player
 .Sh SYNOPSIS
 .Nm mgba
+.Op Fl -frames Ar N
+.Op Fl -headless
 .Ar ROM
 .Nm mgba
 .Fl -help
 .Sh DESCRIPTION
 .Nm
-runs one uncompressed ROM using SDL2 video, audio, and fixed keyboard controls.
+runs one uncompressed ROM through the native AM platform.
+SDL2 provides video, queued audio, and keyboard-to-button mapping.
+The emulator runs one frame at a time on the application thread.
 No global configuration is read.
 Built-in BIOS emulation is used.
 The window opens at three times the native resolution and can be resized.
 The picture retains its aspect ratio with nearest-neighbor scaling and black borders.
+.Sh OPTIONS
+.Bl -tag -width "--headless"
+.It Fl -frames Ar N
+Run at most N frames without wall-clock pacing, fix emulated RTC time to
+2000-01-01 UTC, and print a CRC32 of the final frame's packed RGB bytes.
+.It Fl -headless
+Disable the display and audio output. Requires
+.Fl -frames .
+.El
 .Sh CONTROLS
 .Bl -tag -width Backspace
 .It Arrow keys

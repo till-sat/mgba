@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MPL-2.0
-# Standalone Linux player. Build: make -j4; run: make run
+# AM player. Build: make -j4; run: make run
 .DEFAULT_GOAL := all
 .DELETE_ON_ERROR:
 
@@ -10,16 +10,25 @@ PYTHON ?= python3
 PREFIX ?= /usr/local
 DESTDIR ?=
 CFLAGS ?= -O3 -DNDEBUG
-LTO ?= -flto
+LTO ?= -flto=auto
 ROM ?= roms/dragonball.gba
+ARGS ?=
+PLATFORM ?= native
+
+ifeq ($(filter $(PLATFORM),native spike),)
+$(error Unsupported PLATFORM '$(PLATFORM)'; choose native or spike)
+endif
 
 BUILD_DIR := build
 TARGET := $(BUILD_DIR)/mgba
 CORE_LIBRARY := $(BUILD_DIR)/libmgba.a
+AM_LIBRARY := $(BUILD_DIR)/libam.a
+ifeq ($(PLATFORM),native)
 SDL_CFLAGS := $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null)
 SDL_LIBS := $(shell $(PKG_CONFIG) --libs sdl2 2>/dev/null)
-PROJECT_CPPFLAGS := -D_GNU_SOURCE -Iinclude -Isrc -include mgba/flags.h
-PROJECT_CFLAGS := -std=c11 -fwrapv -pthread -Wall -Wextra \
+endif
+PROJECT_CPPFLAGS := -D_GNU_SOURCE -Iinclude -Isrc -Iam/include -include mgba/flags.h
+PROJECT_CFLAGS := -std=c11 -fwrapv -Wall -Wextra \
 	-Wno-missing-field-initializers -Werror=implicit-function-declaration \
 	-Werror=implicit-int -Werror=incompatible-pointer-types
 
@@ -42,7 +51,6 @@ CORE_SOURCES := \
 	src/core/rewind.c \
 	src/core/serialize.c \
 	src/core/sync.c \
-	src/core/thread.c \
 	src/core/tile-cache.c \
 	src/core/timing.c \
 	src/core/version.c \
@@ -125,22 +133,32 @@ CORE_SOURCES := \
 	src/util/vfs/vfs-fd.c \
 	src/util/vfs/vfs-mem.c
 
-SDL_SOURCES := \
-	src/platform/sdl/main.c \
-	src/platform/sdl/sdl-audio.c \
-	src/platform/sdl/sdl-events.c \
-	src/platform/sdl/sw-sdl2.c
+FRONTEND_SOURCES := src/platform/am/main.c src/platform/am/player.c
+AM_SOURCES := am/src/native/native.c
+AM_CPPFLAGS := $(SDL_CFLAGS)
+PLATFORM_LIBS := $(SDL_LIBS) -lm
+ifeq ($(PLATFORM),spike)
+include am/platform/spike.mk
+endif
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
-SDL_OBJECTS := $(SDL_SOURCES:%.c=$(BUILD_DIR)/%.o)
-OBJECTS := $(CORE_OBJECTS) $(SDL_OBJECTS)
+FRONTEND_OBJECTS := $(FRONTEND_SOURCES:%.c=$(BUILD_DIR)/%.o)
+AM_OBJECTS := $(AM_SOURCES:%.c=$(BUILD_DIR)/%.o)
+OBJECTS := $(CORE_OBJECTS) $(FRONTEND_OBJECTS) $(AM_OBJECTS)
 
-.PHONY: all check-deps run test clean install FORCE
+.PHONY: all check-deps run test test-am test-spike clean install FORCE
 all: $(TARGET)
+ifeq ($(PLATFORM),spike)
+all: check-rv32
+endif
 
 # Checks run only for builds; cleaning does not require installed dependencies.
 check-deps:
+ifeq ($(PLATFORM),native)
 	@test "$$(uname -s)" = Linux || { echo "This Makefile targets Linux." >&2; exit 1; }
 	@$(PKG_CONFIG) --exists sdl2 || { echo "SDL2 development files and pkg-config are required." >&2; exit 1; }
+else
+	@command -v $(CC) >/dev/null || { echo "The RV32 bare-metal toolchain is required." >&2; exit 1; }
+endif
 
 $(BUILD_DIR):
 	mkdir -p "$@"
@@ -149,31 +167,50 @@ $(BUILD_DIR):
 $(BUILD_DIR)/.build-config: FORCE | $(BUILD_DIR)
 	@printf '%s\n' '$(CC)' '$(AR)' '$(PROJECT_CPPFLAGS) $(CPPFLAGS)' \
 		'$(PROJECT_CFLAGS) $(CFLAGS) $(LTO)' '$(SDL_CFLAGS)' \
-		'$(LDFLAGS) $(LDLIBS) $(SDL_LIBS)' > "$@.tmp"
+		'$(LDFLAGS) $(LDLIBS) $(PLATFORM_LIBS)' '$(AM_CPPFLAGS)' > "$@.tmp"
 	@cmp -s "$@.tmp" "$@" || cp "$@.tmp" "$@"
 	@rm -f "$@.tmp"
 
-$(OBJECTS): Makefile $(BUILD_DIR)/.build-config | check-deps
-$(SDL_OBJECTS): private FRONTEND_CPPFLAGS := -DBUILD_SDL $(SDL_CFLAGS)
+$(OBJECTS): Makefile $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config | check-deps $(RUNTIME_READY)
+
+# The AM library has no mGBA headers, build flags, or core dependency.
+$(BUILD_DIR)/am/%.o: am/%.c
+	@mkdir -p "$(@D)"
+	$(CC) -Iam/include $(AM_CPPFLAGS) $(CPPFLAGS) $(PROJECT_CFLAGS) $(CFLAGS) $(LTO) \
+		-MMD -MP -c "$<" -o "$@"
 
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p "$(@D)"
-	$(CC) $(PROJECT_CPPFLAGS) $(CPPFLAGS) $(FRONTEND_CPPFLAGS) \
+	$(CC) $(PROJECT_CPPFLAGS) $(CPPFLAGS) \
 		$(PROJECT_CFLAGS) $(CFLAGS) $(LTO) -MMD -MP -c "$<" -o "$@"
 
 $(CORE_LIBRARY): $(CORE_OBJECTS)
 	@rm -f "$@"
 	$(AR) rcs "$@" $(CORE_OBJECTS)
 
-$(TARGET): $(SDL_OBJECTS) $(CORE_LIBRARY)
-	$(CC) $(CFLAGS) $(LTO) $(LDFLAGS) -o "$@" $(SDL_OBJECTS) \
-		$(CORE_LIBRARY) $(SDL_LIBS) -pthread -lm $(LDLIBS)
+$(AM_LIBRARY): $(AM_OBJECTS)
+	@rm -f "$@"
+	$(AR) rcs "$@" $(AM_OBJECTS)
 
+$(TARGET): $(FRONTEND_OBJECTS) $(CORE_LIBRARY) $(AM_LIBRARY) $(BOOT_OBJECT) $(ROM_OBJECT) $(LINK_SCRIPT) $(RUNTIME_READY)
+	$(CC) $(PLATFORM_CFLAGS) $(CFLAGS) $(LTO) $(LDFLAGS) $(PLATFORM_LDFLAGS) -o "$@" \
+		$(BOOT_OBJECT) $(ROM_OBJECT) $(FRONTEND_OBJECTS) \
+		-Wl,--start-group $(CORE_LIBRARY) $(AM_LIBRARY) $(PLATFORM_LIBS) $(LDLIBS) -Wl,--end-group
+
+ifeq ($(PLATFORM),native)
 run: $(TARGET)
-	"./$(TARGET)" "$(ROM)"
+	"$(abspath $(TARGET))" $(ARGS) "$(ROM)"
 
-test: $(TARGET)
-	$(PYTHON) -u src/platform/sdl/test/smoke.py $(TARGET)
+$(BUILD_DIR)/am/test/native.o: Makefile $(BUILD_DIR)/.build-config | check-deps
+
+$(BUILD_DIR)/am-native-test: $(BUILD_DIR)/am/test/native.o $(AM_LIBRARY)
+	$(CC) $(CFLAGS) $(LTO) $(LDFLAGS) -o "$@" $^ $(SDL_LIBS) $(LDLIBS)
+
+test-am: $(BUILD_DIR)/am-native-test
+	SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy "$(abspath $(BUILD_DIR)/am-native-test)"
+
+test: $(TARGET) test-am
+	$(PYTHON) -u src/platform/am/test/smoke.py $(TARGET)
 
 install: $(TARGET)
 	install -d "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(PREFIX)/share/man/man6" \
@@ -182,8 +219,15 @@ install: $(TARGET)
 	install -m 644 doc/mgba.6 "$(DESTDIR)$(PREFIX)/share/man/man6/mgba.6"
 	install -m 644 LICENSE README.md "$(DESTDIR)$(PREFIX)/share/doc/mgba/"
 	install -m 644 src/third-party/inih/LICENSE.txt "$(DESTDIR)$(PREFIX)/share/doc/mgba/inih-license.txt"
+else
+install:
+	@echo "Install is supported only for PLATFORM=native." >&2; exit 1
+endif
+
+test-spike:
+	+$(MAKE) PLATFORM=spike test
 
 clean:
 	rm -rf $(BUILD_DIR)
 
--include $(OBJECTS:.o=.d)
+-include $(OBJECTS:.o=.d) $(BUILD_DIR)/am/test/native.d $(BUILD_DIR)/am/test/riscv.d $(BUILD_DIR)/am/test/media.d
