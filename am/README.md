@@ -11,11 +11,20 @@ library has no dependency on mGBA. All repository text is English.
   video, and audio contracts.
 - `src/native/native.c`: Linux implementation using SDL2.
 - `src/protosoc/`: polled UART, CLINT timer, GPIO, and platform identification.
-- `src/riscv/`: RV32 startup, fatal traps, linker script, heap, and libc hooks.
-- `platform/spike.mk`: RV32 build and Spike run/test rules.
+- `src/ysyxsoc/`: ysyxSoC UART, CLINT, GPIO and startup for proto-core;
+  the optional RV32E target also retains its heap and VGA driver.
+- `src/riscv/`: RV32 startup, fatal traps, linker script, libc hooks, and the
+  shared simulation media driver (`sim-media.c`).
+- `platform/rv32.mk`: shared RV32 compiler, runtime, and ROM embedding rules.
+- `platform/spike.mk`: Spike run/test rules.
+- `platform/verilator.mk`: proto-soc NOR image packaging and RTL run/test rules.
+- `platform/ysyxsoc.mk`: ysyxSoC Flash packaging and proto-core RTL run/test
+  rules, with optional RV32E NPC compatibility.
+- `platform/rtl-media.mk`: shared RTL media and interactive acceptance rules.
+- `src/protosoc/ram-loader.c`: SRAM receiver for CRC-checked SDRAM applications.
 - `tools/`: pinned Newlib builder and ROM embedding.
-- `sim/`: Spike GPIO/SYSCTRL model and SDL media peripheral; see its README
-  for the simulation-only register contract.
+- `sim/`: Spike GPIO/SYSCTRL model, shared SDL media peripheral and optional
+  RTL AXI bridge; see its README for the simulation-only register contract.
 - `test/`: standalone AM and bare-metal runtime tests.
 - `../src/platform/am/player.c`: shared frame loop, button/pixel translation,
   audio resampling, pacing, and final frame checksum.
@@ -96,8 +105,9 @@ Both native and embedded entry points use the same emulator configuration and
 frame loop. Embedded saves use an expandable memory VFile and disappear on exit.
 Spike's media peripheral lives under `sim/`. Its MMIO registers and framebuffer
 at `0x40000000` are a simulation-only extension, not part of proto-soc v3.
-The AM driver accesses this extension only in an `AM_SPIKE` build with media
-requested. The hardware driver still needs actual display/audio device contracts.
+The AM driver accesses this extension only in an `AM_SIM_MEDIA` build with media
+requested. Spike and both interactive Verilator targets enable that flag; physical
+display/audio still require hardware contracts.
 
 The ELF uses RV32IM/ILP32 with Zicsr, Zifencei, and Zicbom enabled in the toolchain,
 matching the scalar baseline of quad-issue-rvv. It requires no F/D floating-point
@@ -134,9 +144,49 @@ and `lib/libriscv.so`. The device plugin is compiled against those headers and
 libraries. Spike plugin APIs can vary between revisions. Native remains the
 default; `PLATFORM=spike` isolates its objects under `build/spike/`.
 
-### Platform model and GPIO mapping
+## proto-core on ysyxSoC
 
-The driver follows our proto-soc address-map v3, defined in
+```sh
+make -j4 PLATFORM=ysyxsoc run
+make PLATFORM=ysyxsoc HEADLESS=1 AUDIO=0 FRAMES=2 ysyxsoc-image
+make PLATFORM=ysyxsoc test-interactive
+```
+
+The default target uses proto-core `quad-issue-rvv`, RV32IM/ILP32, and its
+existing ysyxSoC Verilator wrapper. The standard FSBL/SSBL image boots from
+Flash into 32 MiB SDRAM. This platform defaults to the bundled 4 KiB ROM
+`cinema/gba/obj/2d-wrap/test.gba` to reduce Flash boot loading time.
+The simulation media bridge provides video/audio,
+and keyboard input enters GPIO at `0x10002004`. The wrapper's CLINT counts
+CPU clocks; AM converts using `CPU_MHZ`, while interactive pacing uses host
+time. See [README.md](../README.md). `YSYXSOC_CORE=rv32e` retains the older
+headless compatibility target with its separate Newlib build and ABI.
+
+## proto-soc RTL boot and interaction
+
+`make PLATFORM=verilator run` boots the same player on proto-core
+`quad-issue-rvv` inside proto-soc and opens the SDL media devices. It defaults
+to unlimited interactive operation with `roms/dragonball.gba`. Use
+`HEADLESS=1 AUDIO=0 FRAMES=2` to check the reference pixels without output.
+`BRANCH=single-issue` selects the earlier baseline core.
+
+The normal Boot ROM and stage2 execute the NOR -> SRAM -> SDRAM sequence,
+including DMA copying and boot CRC checks. The application is linked at
+`0xa0000000`. The simulator's optional AXI media bridge forwards normal bus
+requests into the SoC and services `0x40000000` media accesses through DPI.
+All emulator instructions execute on RTL. SDL keyboard state drives GPIO
+input pins, and `ebreak` with status in `a0` terminates the simulator.
+
+`PROTOSOC`, `BRANCH`, `ICACHE`, `DCACHE`, and `MAX_CYCLES` configure the run.
+An unlimited interactive run uses `MAX_CYCLES=0`; bounded runs default to
+500 million cycles, and exhaustion is a failure. `make test-interactive`
+checks SDL pixels against native/reference images, actual game response to
+press/release, nonzero PCM, and window-close exit on both RTL platforms.
+See [README.md](../README.md) for exact coverage and commands.
+
+## Platform model and GPIO mapping
+
+The proto-soc driver follows our proto-soc address-map v3, defined in
 `/home/tillsat/proto-core/soc/sw/include/soc_map.h` and
 `/home/tillsat/proto-core/soc/docs/address-map.md`. It does not use ysyxSoC.
 
@@ -175,21 +225,21 @@ physical wiring, and debounce are not implemented. The plugin
 is a functional model of the interfaces used by this program, not a complete
 proto-soc simulation.
 
-### Validation and remaining hardware work
+## Validation and remaining hardware work
 
-`test-runtime` checks startup, allocation/reallocation, integer formatting,
+On `PLATFORM=spike`, `test-runtime` checks startup, allocation/reallocation, integer formatting,
 UART output, timer progress, and GPIO input. The image check rejects any
 software floating-point helper symbols.
 `test-media` runs a separate RV32 program against SDL dummy devices and verifies
 exact video pixels, row stride, 3x scaling, dimension changes, stereo PCM samples,
 all ten keyboard/GPIO bits, simultaneous presses, focus release, and quit.
-`test` includes both and compares native and Spike after 120 frames for the GB, GBC, and GBA fixtures,
+The Spike `test` target includes both and compares native and Spike after 120 frames for the GB, GBC, and GBA fixtures,
 checks failure exit status, and rejects an invalid embedded ROM. It uses fresh
 temporary save storage. Logs are stored in `build/spike/test-logs/`.
 
-The final hardware target is quad-issue-rvv connected to our own proto-soc.
-Spike does not instantiate or communicate with that RTL. Remaining work includes
-the actual BootROM/NOR/SDRAM loading path, RTL execution, cache/device ordering
-validation, board button wiring, persistent saves, and display/audio hardware.
-RVV optimization and real-time performance measurements come after a verified
-scalar run on the target.
+The Verilator target adds proto-core execution through the real
+BootROM/NOR/SDRAM loading path. Spike does not instantiate or communicate with
+that RTL. Headless mGBA execution has also passed on physical single-issue
+DE0-CV and quad-rvv ZCU102 boards for the documented benchmark. Remaining work
+includes physical button wiring, persistent saves, display/audio hardware,
+broader game compatibility, RVV optimization, and reaching real-time performance.

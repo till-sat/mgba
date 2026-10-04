@@ -124,6 +124,10 @@ def main():
                                (['--frames', '-1', 'smoke-gb.gb'], 1),
                                (['--frames', 'bad', 'smoke-gb.gb'], 1),
                                (['--frames', '4294967296', 'smoke-gb.gb'], 1),
+                               (['--benchmark', '0', 'smoke-gb.gb'], 1),
+                               (['--benchmark', '1', '--frames', '1', 'smoke-gb.gb'], 1),
+                               (['--warmup', '1', 'smoke-gb.gb'], 1),
+                               (['--benchmark', '1', '--warmup', '-1', 'smoke-gb.gb'], 1),
                                (['--frames'], 1)]:
             run(args, expected)
         (work / 'invalid.gb').write_bytes(b'not a ROM')
@@ -154,6 +158,19 @@ def main():
                 assert expected_report in result.stdout, (name, expected_report, result.stdout)
                 assert 'PROBE_RESIZABLE' not in result.stdout, result.stdout
             print(f'PASS: {name} headless CRC matches reference pixels and repeats exactly')
+
+        # Frame one is blank; the reference appears on frame two. This checks
+        # that warmup really executes but is excluded from the measured count.
+        for warmup in (0, 1):
+            baseline = run(['--headless', '--frames', str(warmup + 1), 'sprites.gba'])
+            measured = run(['--benchmark', '1', '--warmup', str(warmup), 'sprites.gba'],
+                           SDL_VIDEODRIVER='no_such_driver', SDL_AUDIODRIVER='no_such_driver')
+            expected_crc = re.search(r'CRC32: ([0-9A-F]{8})', baseline.stdout)[1]
+            assert f'Frames: 1; video: 240x160; CRC32: {expected_crc}' in measured.stdout, measured.stdout
+            timing = re.search(r'Benchmark: warmup=(\d+); frames=1; elapsed_us=(\d+); FPS=(\d+)\.(\d{3})', measured.stdout)
+            assert timing and int(timing[1]) == warmup and int(timing[2]) > 0, measured.stdout
+            assert int(timing[3]) * 1000 + int(timing[4]) == 1000000000 // int(timing[2]), measured.stdout
+        print('PASS: benchmark warmup, software-rendered pixels, frame count and FPS calculation')
 
         for size, offset in [((900, 480), (90, 0)), ((720, 600), (0, 60))]:
             run(['sprites.gba'], MGBA_TEST_SCREEN=str(work / 'resized.bmp'),

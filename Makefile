@@ -11,12 +11,16 @@ PREFIX ?= /usr/local
 DESTDIR ?=
 CFLAGS ?= -O3 -DNDEBUG
 LTO ?= -flto=auto
-ROM ?= roms/dragonball.gba
 ARGS ?=
 PLATFORM ?= native
+ifeq ($(PLATFORM),ysyxsoc)
+ROM ?= cinema/gba/obj/2d-wrap/test.gba
+else
+ROM ?= roms/dragonball.gba
+endif
 
-ifeq ($(filter $(PLATFORM),native spike),)
-$(error Unsupported PLATFORM '$(PLATFORM)'; choose native or spike)
+ifeq ($(filter $(PLATFORM),native spike verilator fpga ysyxsoc),)
+$(error Unsupported PLATFORM '$(PLATFORM)'; choose native, spike, verilator, fpga or ysyxsoc)
 endif
 
 BUILD_DIR := build
@@ -134,20 +138,22 @@ CORE_SOURCES := \
 	src/util/vfs/vfs-mem.c
 
 FRONTEND_SOURCES := src/platform/am/main.c src/platform/am/player.c
+ifeq ($(PLATFORM),native)
 AM_SOURCES := am/src/native/native.c
+endif
 AM_CPPFLAGS := $(SDL_CFLAGS)
 PLATFORM_LIBS := $(SDL_LIBS) -lm
-ifeq ($(PLATFORM),spike)
-include am/platform/spike.mk
+ifneq ($(PLATFORM),native)
+include am/platform/$(PLATFORM).mk
 endif
 CORE_OBJECTS := $(CORE_SOURCES:%.c=$(BUILD_DIR)/%.o)
 FRONTEND_OBJECTS := $(FRONTEND_SOURCES:%.c=$(BUILD_DIR)/%.o)
 AM_OBJECTS := $(AM_SOURCES:%.c=$(BUILD_DIR)/%.o)
 OBJECTS := $(CORE_OBJECTS) $(FRONTEND_OBJECTS) $(AM_OBJECTS)
 
-.PHONY: all check-deps run test test-am test-spike clean install FORCE
+.PHONY: all check-deps run test test-am test-spike test-verilator test-ysyxsoc clean install FORCE
 all: $(TARGET)
-ifeq ($(PLATFORM),spike)
+ifneq ($(PLATFORM),native)
 all: check-rv32
 endif
 
@@ -226,6 +232,28 @@ endif
 
 test-spike:
 	+$(MAKE) PLATFORM=spike test
+
+test-verilator:
+	+$(MAKE) PLATFORM=verilator test
+
+ifneq ($(PLATFORM),ysyxsoc)
+test-ysyxsoc:
+	+$(MAKE) PLATFORM=ysyxsoc test
+endif
+
+ifeq ($(PLATFORM),native)
+.PHONY: test-interactive test-media-bus
+test-interactive: test test-media-bus
+	+$(MAKE) PLATFORM=spike test-interactive
+	+$(MAKE) PLATFORM=verilator test-interactive
+	+$(MAKE) PLATFORM=ysyxsoc test-interactive
+
+test-media-bus:
+	verilator --cc --exe --build -j 4 --top-module axi_media_bridge -Wno-fatal \
+		--Mdir "$(abspath $(BUILD_DIR)/media-bus)" am/sim/axi_media_bridge.sv \
+		"$(abspath am/test/rtl-media-bus.cpp)" -o bus-test
+	"$(abspath $(BUILD_DIR)/media-bus/bus-test)"
+endif
 
 clean:
 	rm -rf $(BUILD_DIR)

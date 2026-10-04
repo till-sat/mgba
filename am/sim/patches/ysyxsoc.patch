@@ -1,0 +1,183 @@
+--- a/soc/ysyxsoc/npc.v
++++ b/soc/ysyxsoc/npc.v
+@@ -244,6 +244,21 @@
+         .halted       (halted)
+     );
+ 
++`ifdef AM_SIM_MEDIA
++`define AM_MEDIA_UP(x) b_``x
++`define AM_MEDIA_DOWN(x) c_``x
++`define AM_MEDIA_CLOCK clock
++`define AM_MEDIA_RESET reset
++`include "rtl-connect.vh"
++`undef AM_MEDIA_UP
++`undef AM_MEDIA_DOWN
++`undef AM_MEDIA_CLOCK
++`undef AM_MEDIA_RESET
++`define AM_BUS(x) b_``x
++`else
++`define AM_BUS(x) c_``x
++`endif
++
+     // ------------------------------------------------------------------
+     // Read channel: CLINT reads are answered locally, everything else is
+     // forwarded. The downsizer has one read in flight, so a CLINT response
+@@ -399,37 +414,37 @@
+         .s_rlast   (w_rlast),
+         .s_rid     (w_rid),
+ 
+-        .m_awvalid (c_awvalid),
+-        .m_awready (c_awready),
+-        .m_awaddr  (c_awaddr),
+-        .m_awlen   (c_awlen),
+-        .m_awsize  (c_awsize),
+-        .m_awburst (c_awburst),
+-        .m_awprot  (c_awprot),
+-        .m_awid    (c_awid),
+-        .m_wvalid  (c_wvalid),
+-        .m_wready  (c_wready),
+-        .m_wdata   (c_wdata),
+-        .m_wstrb   (c_wstrb),
+-        .m_wlast   (c_wlast),
+-        .m_bvalid  (c_bvalid),
+-        .m_bready  (c_bready),
+-        .m_bresp   (c_bresp),
+-        .m_bid     (c_bid),
+-        .m_arvalid (c_arvalid),
+-        .m_arready (c_arready),
+-        .m_araddr  (c_araddr),
+-        .m_arlen   (c_arlen),
+-        .m_arsize  (c_arsize),
+-        .m_arburst (c_arburst),
+-        .m_arprot  (c_arprot),
+-        .m_arid    (c_arid),
+-        .m_rvalid  (c_rvalid),
+-        .m_rready  (c_rready),
+-        .m_rdata   (c_rdata),
+-        .m_rresp   (c_rresp),
+-        .m_rlast   (c_rlast),
+-        .m_rid     (c_rid)
++        .m_awvalid (`AM_BUS(awvalid)),
++        .m_awready (`AM_BUS(awready)),
++        .m_awaddr  (`AM_BUS(awaddr)),
++        .m_awlen   (`AM_BUS(awlen)),
++        .m_awsize  (`AM_BUS(awsize)),
++        .m_awburst (`AM_BUS(awburst)),
++        .m_awprot  (`AM_BUS(awprot)),
++        .m_awid    (`AM_BUS(awid)),
++        .m_wvalid  (`AM_BUS(wvalid)),
++        .m_wready  (`AM_BUS(wready)),
++        .m_wdata   (`AM_BUS(wdata)),
++        .m_wstrb   (`AM_BUS(wstrb)),
++        .m_wlast   (`AM_BUS(wlast)),
++        .m_bvalid  (`AM_BUS(bvalid)),
++        .m_bready  (`AM_BUS(bready)),
++        .m_bresp   (`AM_BUS(bresp)),
++        .m_bid     (`AM_BUS(bid)),
++        .m_arvalid (`AM_BUS(arvalid)),
++        .m_arready (`AM_BUS(arready)),
++        .m_araddr  (`AM_BUS(araddr)),
++        .m_arlen   (`AM_BUS(arlen)),
++        .m_arsize  (`AM_BUS(arsize)),
++        .m_arburst (`AM_BUS(arburst)),
++        .m_arprot  (`AM_BUS(arprot)),
++        .m_arid    (`AM_BUS(arid)),
++        .m_rvalid  (`AM_BUS(rvalid)),
++        .m_rready  (`AM_BUS(rready)),
++        .m_rdata   (`AM_BUS(rdata)),
++        .m_rresp   (`AM_BUS(rresp)),
++        .m_rlast   (`AM_BUS(rlast)),
++        .m_rid     (`AM_BUS(rid))
+     );
+ 
+ `ifndef SYNTHESIS
+@@ -522,4 +537,5 @@
+                     io_slave_araddr, io_slave_arid, io_slave_arlen, io_slave_arsize,
+                     io_slave_arburst, io_slave_rready};
+ 
++`undef AM_BUS
+ endmodule
+--- a/soc/ysyxsoc/main.cpp
++++ b/soc/ysyxsoc/main.cpp
+@@ -9,6 +9,9 @@
+ #include <cstring>
+ #include <cstdint>
+ #include <chrono>
++#ifdef AM_SIM_MEDIA
++#include "rtl-media.h"
++#endif
+ #include "VysyxSoCFull.h"
+ #include "VysyxSoCFull___024root.h"
+ 
+@@ -61,8 +64,15 @@
+     // sample the pre-edge state (handshakes of the coming edge), then clock
+     int mtime_reads = 0;
+     auto tick = [&]() {
++#ifdef AM_SIM_MEDIA
++        top->externalPins_gpio_in = am_rtl_buttons();
++#endif
+         top->clock = 0; top->eval();
+-        if (CPU(dbg_mtime_rd)) {
++        if (
++#ifdef AM_SIM_MEDIA
++            trace &&
++#endif
++            CPU(dbg_mtime_rd)) {
+             mtime_reads++;
+             printf("[soc] mtime read %d at cycle %llu, minstret %llu\n", mtime_reads,
+                    (unsigned long long)CPU(dbg_mcycle), (unsigned long long)CPU(dbg_minstret));
+@@ -85,7 +95,10 @@
+     auto t0 = std::chrono::steady_clock::now();
+     cycles = 0;
+     bool halted = false;
+-    while (cycles < max_cycles) {
++    while (!max_cycles || cycles < max_cycles) {
++        #ifdef AM_SIM_MEDIA
++        if ((cycles & 1023) == 0) am_rtl_tick();
++        #endif
+         tick();
+         cycles++;
+         if (CPU(dbg_halted)) { halted = true; break; }
+--- a/soc/ysyxsoc/Makefile
++++ b/soc/ysyxsoc/Makefile
+@@ -42,7 +42,8 @@
+ SRCS_WRAP := $(abspath npc.v clint_axi.v ../axi_downsizer.v)
+ CSRCS     := $(abspath main.cpp)
+ 
+-VFLAGS := --cc --exe --build -j 0 -O3 --x-assign fast --x-initial fast --noassert \
++JOBS ?= 4
++VFLAGS := --cc --exe --build -j $(JOBS) -O3 --x-assign fast --x-initial fast --noassert \
+           --timescale "1ns/1ns" --no-timing -Wno-fatal \
+           -Wno-DECLFILENAME -Wno-ASSIGNDLY -Wno-PINCONNECTEMPTY -Wno-UNUSED \
+           -Wno-UNDRIVEN -Wno-SYNCASYNCNET -Wno-DEFPARAM -Wno-WIDTHTRUNC \
+@@ -55,7 +56,12 @@
+ # or when the tree is at another path (the generated .d files carry
+ # absolute paths: a container mounting it elsewhere would otherwise reuse
+ # them and fail)
+-CFG := $(EXTRA_VFLAGS)_tcm$(ITCM)-$(DTCM)_ic$(ICACHE)-$(ICACHE_WAYS)-$(ICACHE_LINE)_dc$(DCACHE)-$(DCACHE_WAYS)-$(DCACHE_LINE)_r$(R_TIMES_S)_$(ROOT)_$(YSYXSOC)
++# Optional host-backed AM media, for Verilator only.
++ifneq ($(AM_MEDIA_ROOT),)
++include $(AM_MEDIA_ROOT)/am/sim/rtl-build.mk
++endif
++
++CFG := $(AM_MEDIA_ROOT)_$(AM_MEDIA_NATIVE)_$(EXTRA_VFLAGS)_tcm$(ITCM)-$(DTCM)_ic$(ICACHE)-$(ICACHE_WAYS)-$(ICACHE_LINE)_dc$(DCACHE)-$(DCACHE_WAYS)-$(DCACHE_LINE)_r$(R_TIMES_S)_$(ROOT)_$(YSYXSOC)
+ CFG_STAMP := $(BUILD)/.cfg
+ $(shell [ "$$(cat $(CFG_STAMP) 2>/dev/null)" = "$(CFG)" ] || { rm -rf $(BUILD); mkdir -p $(BUILD); echo "$(CFG)" > $(CFG_STAMP); })
+ $(CFG_STAMP):
+@@ -63,13 +69,13 @@
+ 
+ .DEFAULT_GOAL := coremark
+ 
+-$(BIN): $(SRCS_TOP) $(SRCS_WRAP) $(CSRCS) $(YSYXSOC)/build/ysyxSoCFull.v $(CFG_STAMP)
++$(BIN): $(AM_MEDIA_DEPS) $(SRCS_TOP) $(SRCS_WRAP) $(CSRCS) $(YSYXSOC)/build/ysyxSoCFull.v $(CFG_STAMP)
+ 	@mkdir -p $(BUILD)
+-	verilator $(VFLAGS) -Mdir $(BUILD) -CFLAGS "-O2 -DR_TIMES_S=$(R_TIMES_S)" \
++	verilator $(VFLAGS) -Mdir $(BUILD) -CFLAGS "-O2 -DR_TIMES_S=$(R_TIMES_S) $(AM_MEDIA_CFLAGS)" -LDFLAGS "$(AM_MEDIA_LIBS)" \
+ 	    +define+ITCM_AW=$(ITCM_AW) +define+DTCM_AW=$(DTCM_AW) \
+ 	    +define+ICACHE_KB=$(ICACHE) +define+ICACHE_WAYS=$(ICACHE_WAYS) +define+ICACHE_LINE_BYTES=$(ICACHE_LINE) \
+ 	    +define+DCACHE_KB=$(DCACHE) +define+DCACHE_WAYS=$(DCACHE_WAYS) +define+DCACHE_LINE_BYTES=$(DCACHE_LINE) \
+-	    $(SRCS_WRAP) $(SRCS_TOP) $(SRCS_SOC) $(CSRCS) -o Vsoc
++	    $(SRCS_WRAP) $(SRCS_TOP) $(SRCS_SOC) $(CSRCS) $(AM_MEDIA_SRCS) -o Vsoc
+ 
+ build: $(BIN)
+ 

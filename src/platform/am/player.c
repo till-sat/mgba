@@ -1,6 +1,9 @@
 /* Copyright (c) 2013-2026 Jeffrey Pfau
  * SPDX-License-Identifier: MPL-2.0 */
 #include <am.h>
+#ifdef AM_PROFILE_SAMPLING
+#include <am-profile.h>
+#endif
 
 #include <mgba/core/core.h>
 #include <mgba/core/log.h>
@@ -157,7 +160,8 @@ static bool copy_video(struct player* player, unsigned* width, unsigned* height)
 	return true;
 }
 
-int mAMRun(struct mCore* core, bool headless, bool audio, unsigned frame_limit) {
+static int run(struct mCore* core, bool headless, bool audio, unsigned frame_limit,
+               bool benchmark, unsigned warmup) {
 	struct player state = { .core = core };
 	struct player* player = &state;
 	struct mStandardLogger logger;
@@ -204,10 +208,26 @@ int mAMRun(struct mCore* core, bool headless, bool audio, unsigned frame_limit) 
 		core->rtc.value = 946684800; /* 2000-01-01 UTC. */
 	}
 	core->reset(core);
-	unsigned frames = 0, width = 0, height = 0;
+	unsigned frames = 0, warmed = 0, width = 0, height = 0;
 	uint64_t deadline = am_uptime_us(), remainder = 0;
+	uint64_t measured_start = 0, elapsed = 0;
+	if (benchmark) {
+		core->setKeys(core, 0);
+		printf("Benchmark start: warmup=%u; frames=%u; software rendering; no output; keys=0\n", warmup, frame_limit);
+		fflush(NULL);
+
+#ifdef AM_PROFILE_SAMPLING
+		am_profile_prepare();
+#endif
+	}
 	result = 0;
-	while (poll_input(player) && (!frame_limit || frames < frame_limit)) {
+	while ((benchmark || poll_input(player)) && (warmed < warmup || !frame_limit || frames < frame_limit)) {
+		if (benchmark && warmed == warmup && !frames) {
+			measured_start = am_uptime_us();
+#ifdef AM_PROFILE_SAMPLING
+			am_profile_start();
+#endif
+		}
 		core->runFrame(core);
 		if (player->stopped) break;
 		if (!copy_video(player, &width, &height)) {
@@ -224,7 +244,8 @@ int mAMRun(struct mCore* core, bool headless, bool audio, unsigned frame_limit) 
 			result = 1;
 			break;
 		}
-		++frames;
+		if (warmed < warmup) ++warmed;
+		else ++frames;
 		if (!frame_limit) {
 			uint64_t period = (uint64_t) core->frameCycles(core) * 1000000 + remainder;
 			deadline += period / core->frequency(core);
@@ -233,6 +254,12 @@ int mAMRun(struct mCore* core, bool headless, bool audio, unsigned frame_limit) 
 			if (deadline > now) am_sleep_us(deadline - now);
 			else if (now - deadline > 100000) deadline = now;
 		}
+	}
+	if (benchmark) {
+#ifdef AM_PROFILE_SAMPLING
+		am_profile_stop();
+#endif
+		elapsed = am_uptime_us() - measured_start;
 	}
 	if (player->crashed) {
 		fprintf(stderr, "The game crashed.\n");
@@ -247,6 +274,19 @@ int mAMRun(struct mCore* core, bool headless, bool audio, unsigned frame_limit) 
 		}
 		printf("Frames: %u; video: %ux%u; CRC32: %08" PRIX32 "\n", frames, width, height, checksum);
 	}
+	if (benchmark && !result) {
+		if (frames != frame_limit || !elapsed) {
+			fprintf(stderr, "Incomplete benchmark or unavailable timer.\n");
+			result = 1;
+		} else {
+			uint64_t fps_milli = (uint64_t) frames * 1000000000 / elapsed;
+			printf("Benchmark: warmup=%u; frames=%u; elapsed_us=%" PRIu64 "; FPS=%" PRIu64 ".%03" PRIu64 "\n",
+			       warmup, frames, elapsed, fps_milli / 1000, fps_milli % 1000);
+		}
+	}
+#ifdef AM_PROFILE_SAMPLING
+	if (benchmark) am_profile_report();
+#endif
 	core->clearCoreCallbacks(core);
 #ifndef AM_BAREMETAL
 	mAudioResamplerDeinit(&player->resampler);
@@ -259,6 +299,15 @@ done:
 	mLogSetDefaultLogger(NULL);
 	mStandardLoggerDeinit(&logger);
 	return result;
+}
+
+int mAMRun(struct mCore* core, bool headless, bool audio, unsigned frame_limit) {
+	return run(core, headless, audio, frame_limit, false, 0);
+}
+
+int mAMBenchmark(struct mCore* core, unsigned warmup, unsigned frames) {
+	if (!frames) return 1;
+	return run(core, true, false, frames, true, warmup);
 }
 
 void mAMConfigure(struct mCore* core) {

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MPL-2.0 */
 #include <am.h>
-#include "../protosoc/platform.h"
+#include "platform.h"
 #include <errno.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -32,7 +32,7 @@ ssize_t _write(int fd, const void* data, size_t size) {
 
 ssize_t _read(int fd, void* data, size_t size) {
 	if (fd != 0) { errno = EBADF; return -1; }
-	volatile uint8_t* uart = (volatile uint8_t*) AM_SOC_UART;
+	volatile uint8_t* uart = (volatile uint8_t*) AM_YSYXSOC_UART;
 	size_t count = 0;
 	while (count < size && (uart[5] & 1)) ((uint8_t*) data)[count++] = uart[0];
 	if (!count && size) { errno = EAGAIN; return -1; }
@@ -59,30 +59,15 @@ int _gettimeofday(struct timeval* value, void* timezone) {
 	return 0;
 }
 
-#ifdef AM_SPIKE
-/* Spike HTIF is used only for completion, never for files or proxy syscalls. */
-__attribute__((section(".htif"), aligned(64))) volatile uint64_t tohost;
-__attribute__((section(".htif"), aligned(64))) volatile uint64_t fromhost;
-#endif
-
 void am_platform_exit(int code) {
-#ifdef AM_SPIKE
-	tohost = ((uint64_t) (unsigned) code << 1) | 1;
-#elif defined(AM_FPGA)
-	/* exit() may already have closed stdout in Newlib's stdio cleanup. */
 	char report[40];
 	int length = snprintf(report, sizeof(report), "AM exit: %d\n", code);
 	for (int i = 0; i < length; ++i) am_platform_putch(report[i]);
-	while (!(*(volatile uint8_t*) (AM_SOC_UART + 5) & 0x40)) {}
-	__asm__ volatile("fence iorw, iorw; fence.i" ::: "memory");
-	((void (*)(void)) (uintptr_t) 0x20000004u)();
-#else
-	/* SIM_HALT reports a0 to the Verilator host. */
 	register int status __asm__("a0") = code;
 	__asm__ volatile("ebreak" : : "r"(status) : "memory");
-#endif
 	for (;;) __asm__ volatile("wfi");
 }
+
 __attribute__((noreturn)) void _exit(int code) { am_platform_exit(code); }
 
 __attribute__((noreturn)) void am_trap_fatal(uint32_t cause, uint32_t pc, uint32_t value) {

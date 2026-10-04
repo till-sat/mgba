@@ -3,7 +3,7 @@
 .\" This Source Code Form is subject to the terms of the Mozilla Public
 .\" License, v. 2.0. If a copy of the MPL was not distributed with this
 .\" file, you can obtain one at https://mozilla.org/MPL/2.0/.
-.Dd October 1, 2026
+.Dd October 2, 2026
 .Dt MGBA 6
 .Os
 .Sh NAME
@@ -13,6 +13,10 @@
 .Nm mgba
 .Op Fl -frames Ar N
 .Op Fl -headless
+.Ar ROM
+.Nm mgba
+.Fl -benchmark Ar N
+.Op Fl -warmup Ar N
 .Ar ROM
 .Nm mgba
 .Fl -help
@@ -33,6 +37,17 @@ Run at most N frames without wall-clock pacing, fix emulated RTC time to
 .It Fl -headless
 Disable the display and audio output. Requires
 .Fl -frames .
+.It Fl -benchmark Ar N
+Measure N frames without display, audio output, pacing, or game input.
+Software rendering and core audio generation remain enabled.
+Print elapsed microseconds, frames per second, and the final frame CRC32.
+Initialization, warmup, and checksum calculation are excluded from timing.
+Cannot be combined with
+.Fl -frames .
+.It Fl -warmup Ar N
+Run N frames before starting the benchmark timer (default 30; zero is valid).
+Requires
+.Fl -benchmark .
 .El
 .Sh CONTROLS
 .Bl -tag -width Backspace

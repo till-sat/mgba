@@ -1,0 +1,119 @@
+--- a/rtl/protosoc.v
++++ b/rtl/protosoc.v
+@@ -332,6 +332,21 @@
+     wire [ 1:0] d_awburst, d_bresp;
+     wire [ 3:0] d_wstrb;
+ 
++`ifdef AM_SIM_MEDIA
++`define AM_MEDIA_UP(x) c_``x
++`define AM_MEDIA_DOWN(x) b_``x
++`define AM_MEDIA_CLOCK clk
++`define AM_MEDIA_RESET rst
++`include "rtl-connect.vh"
++`undef AM_MEDIA_UP
++`undef AM_MEDIA_DOWN
++`undef AM_MEDIA_CLOCK
++`undef AM_MEDIA_RESET
++`define AM_BUS(x) b_``x
++`else
++`define AM_BUS(x) c_``x
++`endif
++
+     // ------------------------------------------------------------------
+     // interconnect: slaves 0 CLINT, 1 PLIC, 2 SRAM, 3 APB, 4 FLASH, 5 SDRAM,
+     // 6 the core's TCMs through their external port, 7 immutable boot ROM
+@@ -360,15 +375,15 @@
+     ) u_xbar (
+         .clk (clk), .rst (rst),
+ 
+-        .s0_awvalid (c_awvalid), .s0_awready (c_awready), .s0_awaddr (c_awaddr),
+-        .s0_awlen (c_awlen), .s0_awsize (c_awsize), .s0_awburst (c_awburst), .s0_awid (c_awid),
+-        .s0_wvalid (c_wvalid), .s0_wready (c_wready), .s0_wdata (c_wdata), .s0_wstrb (c_wstrb),
+-        .s0_wlast (c_wlast),
+-        .s0_bvalid (c_bvalid), .s0_bready (c_bready), .s0_bresp (c_bresp), .s0_bid (c_bid),
+-        .s0_arvalid (c_arvalid), .s0_arready (c_arready), .s0_araddr (c_araddr),
+-        .s0_arlen (c_arlen), .s0_arsize (c_arsize), .s0_arburst (c_arburst), .s0_arid (c_arid),
+-        .s0_rvalid (c_rvalid), .s0_rready (c_rready), .s0_rdata (c_rdata), .s0_rresp (c_rresp),
+-        .s0_rlast (c_rlast), .s0_rid (c_rid),
++        .s0_awvalid (`AM_BUS(awvalid)), .s0_awready (`AM_BUS(awready)), .s0_awaddr (`AM_BUS(awaddr)),
++        .s0_awlen (`AM_BUS(awlen)), .s0_awsize (`AM_BUS(awsize)), .s0_awburst (`AM_BUS(awburst)), .s0_awid (`AM_BUS(awid)),
++        .s0_wvalid (`AM_BUS(wvalid)), .s0_wready (`AM_BUS(wready)), .s0_wdata (`AM_BUS(wdata)), .s0_wstrb (`AM_BUS(wstrb)),
++        .s0_wlast (`AM_BUS(wlast)),
++        .s0_bvalid (`AM_BUS(bvalid)), .s0_bready (`AM_BUS(bready)), .s0_bresp (`AM_BUS(bresp)), .s0_bid (`AM_BUS(bid)),
++        .s0_arvalid (`AM_BUS(arvalid)), .s0_arready (`AM_BUS(arready)), .s0_araddr (`AM_BUS(araddr)),
++        .s0_arlen (`AM_BUS(arlen)), .s0_arsize (`AM_BUS(arsize)), .s0_arburst (`AM_BUS(arburst)), .s0_arid (`AM_BUS(arid)),
++        .s0_rvalid (`AM_BUS(rvalid)), .s0_rready (`AM_BUS(rready)), .s0_rdata (`AM_BUS(rdata)), .s0_rresp (`AM_BUS(rresp)),
++        .s0_rlast (`AM_BUS(rlast)), .s0_rid (`AM_BUS(rid)),
+ 
+         .s1_awvalid (d_awvalid), .s1_awready (d_awready), .s1_awaddr (d_awaddr),
+         .s1_awlen (d_awlen), .s1_awsize (d_awsize), .s1_awburst (d_awburst), .s1_awid (d_awid[3:0]),
+@@ -738,4 +753,5 @@
+ 
+ `endif
+ 
++`undef AM_BUS
+ endmodule
+--- a/sim/main.cpp
++++ b/sim/main.cpp
+@@ -6,6 +6,9 @@
+ #include <cstring>
+ #include <cstdint>
+ #include <chrono>
++#ifdef AM_SIM_MEDIA
++#include "rtl-media.h"
++#endif
+ #include <deque>
+ #include <string>
+ #include <algorithm>
+@@ -179,7 +182,11 @@
+         top->sdram_dq_in = sdram.dq_in;
+ #endif
+         top->eval();
++#ifdef AM_SIM_MEDIA
++        top->gpio_in = am_rtl_buttons() | (force_recovery ? 0x8000 : 0);
++#else
+         top->gpio_in = top->gpio_out | (force_recovery ? 0x8000 : 0);
++#endif
+         // open drain: the line is low only while the master pulls it down
+         top->i2c_scl_in = !top->i2c_scl_oe;
+         top->i2c_sda_in = !top->i2c_sda_oe;
+@@ -225,7 +232,10 @@
+     auto t0 = std::chrono::steady_clock::now();
+     cycles = 0;
+     bool halted = false;
+-    while (cycles < max_cycles) {
++    while (!max_cycles || cycles < max_cycles) {
++        #ifdef AM_SIM_MEDIA
++        if ((cycles & 1023) == 0) am_rtl_tick();
++        #endif
+         tick();
+         cycles++;
+         if (top->halted) { halted = true; break; }
+--- a/sim/Makefile
++++ b/sim/Makefile
+@@ -106,16 +106,21 @@
+ 
+ # rebuild from scratch when the configuration or the core tree changes (a
+ # SIMBUILD shared by two branches must not keep the other branch's model)
+-CFG := $(EXTRA_VFLAGS)_$(subst ",,$(subst ',,$(GPARAMS)))_$(CORE)
++# Optional host-backed AM media, for Verilator only.
++ifneq ($(AM_MEDIA_ROOT),)
++include $(AM_MEDIA_ROOT)/am/sim/rtl-build.mk
++endif
++
++CFG := $(AM_MEDIA_ROOT)_$(AM_MEDIA_NATIVE)_$(EXTRA_VFLAGS)_$(subst ",,$(subst ',,$(GPARAMS)))_$(CORE)
+ CFG_STAMP := $(BUILD)/.cfg
+ $(shell [ "$$(cat $(CFG_STAMP) 2>/dev/null)" = "$(CFG)" ] || { rm -rf $(BUILD); mkdir -p $(BUILD); echo "$(CFG)" > $(CFG_STAMP); })
+ 
+ .DEFAULT_GOAL := build
+ 
+-$(BIN): $(SRCS_TOP) $(SRCS_SOC) $(CSRCS) $(HERE)/w25q128_model.h $(HERE)/sdram_model.h $(HERE)/prof.h $(BOOT_HEX) $(CFG_STAMP)
++$(BIN): $(AM_MEDIA_DEPS) $(SRCS_TOP) $(SRCS_SOC) $(CSRCS) $(HERE)/w25q128_model.h $(HERE)/sdram_model.h $(HERE)/prof.h $(BOOT_HEX) $(CFG_STAMP)
+ 	@mkdir -p $(BUILD)
+-	verilator $(VFLAGS) $(GPARAMS) -Mdir $(BUILD) -CFLAGS "-O2 -DPROTOSOC_ROM_AW=$(FLASH_AW) -DPROTOSOC_CLK_HZ=$(CLK_HZ) -DPROTOSOC_SDRAM_CTRL=$(SDRAM_CTRL)" \
+-	    $(SRCS_SOC) $(SRCS_TOP) $(CSRCS) -o Vsoc
++	verilator $(VFLAGS) $(GPARAMS) -Mdir $(BUILD) -CFLAGS "-O2 -DPROTOSOC_ROM_AW=$(FLASH_AW) -DPROTOSOC_CLK_HZ=$(CLK_HZ) -DPROTOSOC_SDRAM_CTRL=$(SDRAM_CTRL) $(AM_MEDIA_CFLAGS)" -LDFLAGS "$(AM_MEDIA_LIBS)" \
++	    $(SRCS_SOC) $(SRCS_TOP) $(CSRCS) $(AM_MEDIA_SRCS) -o Vsoc
+ 
+ $(BOOT_HEX): $(wildcard $(SOC)/sw/boot/*.[chS] $(SOC)/sw/boot/*.ld $(SOC)/sw/include/*.h) $(SOC)/sw/boot/Makefile $(SOC)/sw/tools/boot_image.py
+ 	@$(MAKE) --no-print-directory -C $(SOC)/sw/boot

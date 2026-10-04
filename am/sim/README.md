@@ -1,15 +1,20 @@
 # Simulated peripherals
 
-This directory adds interactive peripherals to the local Spike build. It does
-not instantiate proto-soc RTL or change that repository's address map.
+This directory supplies interactive simulation peripherals to Spike and the
+two proto-core Verilator targets. The media addresses are a simulation extension,
+separate from either SoC hardware map.
 
 - `protosoc.cc`: polled GPIO and SYSCTRL subset of proto-soc v3.
 - `media.cc`: framebuffer, PCM output, quit, and host pacing device.
 - `media.h`: register definitions shared by the host model and guest driver.
+- `media-device.h`: reusable host implementation with SDL output and input.
+- `axi_media_bridge.sv`: optional AXI bridge after the core's bus downsizer.
+- `rtl-media.cc`: DPI functions connecting AXI accesses to the host device.
+- `rtl-connect.vh`, `rtl-build.mk`: shared simulator integration hooks.
 
 The host side reuses `am/src/native/native.c` for SDL display, keyboard events,
 and audio queueing. It never calls the emulator: mGBA continues to execute as
-RV32 instructions inside Spike. The guest sends pixels and samples using MMIO.
+RV32 instructions inside Spike or on the RTL CPU. The guest sends pixels and samples using MMIO.
 The model polls SDL between instruction batches to keep the window responsive.
 Keyboard state is exposed through the existing GPIO input register. Closing
 the window sets a separate quit register, letting the guest exit through HTIF.
@@ -56,3 +61,17 @@ Interactive pacing uses host time through this extension. Headless checks keep
 using CLINT virtual time and do not open SDL devices. Neither clock measures
 quad-issue-rvv hardware performance. Actual board display, audio, and persistent
 save storage need their own hardware contracts and drivers.
+
+## RTL integration
+
+Both simulator builds enable `AM_SIM_MEDIA` and include the bridge only when
+`AM_MEDIA_ROOT` points to this checkout. Ordinary reads/writes continue into
+proto-soc or ysyxSoC. Media reads/writes are aligned full-word MMIO operations;
+unsupported sizes, bursts, addresses or write strobes return AXI SLVERR.
+The bridge handles separate AW/W handshakes and holds responses under backpressure.
+
+The host calls SDL only for device operations and event polling, never to run
+mGBA. The guest reads buttons from each SoC's actual GPIO RTL. The ysyxSoC
+VGA stub remains unused; display and sound use the explicit media extension.
+Integration patches for the matching local SoC wrappers are in `patches/`.
+See [README.md](../../README.md) for setup and validation.

@@ -1,12 +1,20 @@
 /* SPDX-License-Identifier: MPL-2.0 */
 #include "player.h"
 #include <mgba-util/vfs.h>
+#include <string.h>
 
 extern const unsigned char _rom_start[], _rom_end[];
+#ifdef AM_ROM_OMIT_FF_TAIL
+extern unsigned char _rom_tail_start[];
+#endif
 _Static_assert(AM_FRAME_LIMIT >= 0, "AM_FRAME_LIMIT must be nonnegative");
 _Static_assert(!AM_HEADLESS || AM_FRAME_LIMIT > 0, "Headless runs require a positive frame limit");
 
 int main(void) {
+#ifdef AM_ROM_OMIT_FF_TAIL
+	/* Restore the omitted Flash padding before mGBA maps and checksums the ROM. */
+	memset(_rom_tail_start, 0xff, (uintptr_t) _rom_end - (uintptr_t) _rom_tail_start);
+#endif
 	size_t rom_size = (uintptr_t) _rom_end - (uintptr_t) _rom_start;
 	struct VFile* rom = VFileFromConstMemory(_rom_start, rom_size);
 	struct mCore* core = rom ? mCoreFindVF(rom) : NULL;

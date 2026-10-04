@@ -27,7 +27,11 @@ int SDL_QueueAudio(SDL_AudioDeviceID device, const void* data, Uint32 len) {
 	const int16_t* samples = data;
 	for (unsigned i = 0; i < len / 4; ++i) {
 		int16_t left = (int) ((audio_frames + i) % 2048) * 31 - 32000;
-		if (samples[i * 2] != left || samples[i * 2 + 1] != -left) failed = 1;
+		if (samples[i * 2] != left || samples[i * 2 + 1] != -left) {
+			if (!failed) fprintf(stderr, "MEDIA_AUDIO_MISMATCH frame=%u expected=%d/%d actual=%d/%d\n",
+			                    audio_frames + i, left, -left, samples[i * 2], samples[i * 2 + 1]);
+			failed = 1;
+		}
 	}
 	audio_frames += len / 4;
 	return real(device, data, len);
@@ -50,7 +54,11 @@ void SDL_RenderPresent(SDL_Renderer* renderer) {
 				for (int x = 0; x < w; ++x) {
 					unsigned sx = x / 3, sy = y / 3;
 					uint32_t expected = (sx << 16) | (sy << 8) | (sx ^ sy);
-					if ((row[x] & 0xffffff) != expected) failed = 1;
+					if ((row[x] & 0xffffff) != expected) {
+						if (!failed) fprintf(stderr, "MEDIA_PIXEL_MISMATCH frame=%u x=%d y=%d expected=%06x actual=%06x\n",
+						                    frames, x, y, expected, row[x] & 0xffffff);
+						failed = 1;
+					}
 				}
 			}
 		}

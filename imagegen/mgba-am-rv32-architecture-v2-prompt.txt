@@ -1,0 +1,71 @@
+Use case: infographic-diagram
+Asset type: project documentation architecture diagram
+Primary request: Create a technically accurate architecture schematic explaining how mGBA is connected to an AM abstraction layer and an RV32 bare-metal logic platform. The diagram is for Chinese-speaking engineers and must clearly show the runtime data paths and the build/platform boundary.
+
+Scene/backdrop: white background, no decorative background, clean engineering infographic, landscape 3:2 composition, strong alignment and generous whitespace.
+
+Composition/framing: left-to-right flow with mGBA and the shared AM player in the center, native SDL path on the upper right, RV32/proto-soc path on the lower right. Put input arrows flowing back toward mGBA and video/audio arrows flowing rightward. Use solid arrows for runtime data and dashed arrows for build/platform dependencies. Use distinct but restrained colors: dark blue for emulator/core, teal for AM API, orange for RV32/bare-metal, purple for host simulation/SDL.
+
+Text (verbatim, render exactly and keep labels large and readable):
+Title: "mGBA 接入 AM 与 RV32 逻辑平台"
+Left input boxes:
+"ROM 文件 + .sav"
+"嵌入 ROM + RAM 存档"
+Center boxes:
+"mGBA 核心"
+"GB / GBC / GBA 仿真"
+"共享 AM 播放器
+src/platform/am/player.c"
+"AM 公共接口
+am/include/am.h"
+AM interface labels:
+"逻辑按键"
+"RGB 视频 0x00RRGGBB"
+"立体声 S16 音频"
+"单调时钟 / sleep"
+Upper-right native path:
+"Native 后端
+am/src/native/native.c"
+"SDL2 窗口 / 音频队列 / 键盘"
+Lower-right RV32 path:
+"RV32IM 裸机后端
+am/src/protosoc/io.c"
+"MMIO：GPIO / CLINT / UART / SYSCTRL"
+"启动、堆、Newlib
+am/src/riscv/start.S + runtime.c + link.ld"
+"嵌入 ROM"
+Simulation branch:
+"Spike + 模拟 proto-soc"
+"模拟 Media MMIO
+am/sim/media.cc"
+"宿主 SDL2 显示 / 音频"
+Side note box:
+"GBA 裸机专项"
+"BIOS Affine：浮点 sin/cos → Q8.8 查表"
+"MidiKey2Freq：exp2f → 定点查表插值"
+"关闭线程、匿名 mmap、浮点 helper"
+Bottom legend:
+"运行时数据流"
+"构建/平台依赖"
+
+Required connections:
+1. "ROM 文件 + .sav" points to a native entry box, and "嵌入 ROM + RAM 存档" points to an embedded entry box; both converge on "共享 AM 播放器".
+2. "共享 AM 播放器" calls "AM 公共接口".
+3. AM logical buttons go into the mGBA core; mGBA video and audio go out through AM.
+4. AM public interface branches to the Native backend and the RV32IM bare-metal backend.
+5. Native backend connects to SDL2 window/audio/keyboard; keyboard input returns as logical buttons.
+6. RV32 backend connects to MMIO registers and to the Spike plus simulated media branch; simulated media connects to host SDL2 display/audio, and keyboard input returns through GPIO.
+7. Show the GBA bare-metal side note connected with a dashed line to "mGBA 核心" and "RV32IM 裸机后端".
+8. Include a small bottom-right boundary note: "当前 Spike 用模拟外设验证；真实板卡显示、音频、持久存储仍需硬件驱动".
+
+Style/medium: polished technical systems diagram, flat vector-like infographic rendered as a raster image, crisp rounded rectangles, thin consistent arrows, readable sans-serif typography, no 3D, no photorealism.
+
+Constraints: preserve all specified labels exactly; no code screenshots; no source files, tools, frameworks, peripherals, or components that are not listed; do not imply that Spike executes RTL; clearly distinguish native SDL from simulated media MMIO; ensure arrows are unambiguous.
+
+Avoid: tiny text, illegible labels, dense paragraphs, decorative icons, game characters, logos, watermarks, random acronyms, invented buses or devices, cloud infrastructure, Linux kernel boxes, ysyxSoC boxes, RTL execution claims.
+
+Correction requirements for this version:
+- Use a pure white background with no gradient, glow, vignette, or dark corners. Use dark navy text for the title so it has strong contrast.
+- Do not omit any requested box. In the lower-right RV32 section, show three separate readable boxes: "启动、堆、Newlib\nam/src/riscv/start.S + runtime.c + link.ld", "嵌入 ROM", and "MMIO：GPIO / CLINT / UART / SYSCTRL".
+- Keep the lower-right chain explicit: RV32IM 裸机后端 -> MMIO and startup/runtime; RV32IM 裸机后端 -> Spike + 模拟 proto-soc -> 模拟 Media MMIO -> 宿主 SDL2 显示 / 音频.
+- Keep all arrows and labels readable at normal viewing size. Do not replace text with decorative symbols.
