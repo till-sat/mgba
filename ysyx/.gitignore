@@ -1,0 +1,4 @@
+build/
+src/frame-config.h
+src/rom-path.stamp
+src/rom.S
