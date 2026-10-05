@@ -12,6 +12,7 @@ NAME := mgba
 ARCH ?= riscv32-ysyxsoc
 ROM ?= $(ROOT)/cinema/gba/obj/2d-wrap/test.gba
 FRAMES ?= 2
+RUNNER_THREADED ?= 0
 FRAME_CONFIG := src/frame-config.h
 ROM_CONFIG := src/rom-path.stamp
 
@@ -40,11 +41,15 @@ CFLAGS += -D_GNU_SOURCE -DAM_BAREMETAL -DNDEBUG \
           -include $(CURDIR)/include/ysyx-config.h \
           -Wno-unused-parameter -Wno-sign-compare -Wno-format -Wno-nonnull -Wno-nonnull-compare
 
+ifeq ($(RUNNER_THREADED),1)
+CFLAGS += -DMGBA_RUNNER_THREADED
+endif
+
 .PHONY: FORCE test
 FORCE:
 
 $(FRAME_CONFIG): FORCE
-	@{ echo '/* generated: make FRAMES=$(FRAMES) */'; echo '#define AM_FRAME_LIMIT $(FRAMES)'; } > $@.tmp
+	@{ echo '/* generated: make FRAMES=$(FRAMES) RUNNER_THREADED=$(RUNNER_THREADED) */'; echo '#define AM_FRAME_LIMIT $(FRAMES)'; } > $@.tmp
 	@cmp -s $@.tmp $@ 2>/dev/null || cp $@.tmp $@
 	@rm -f $@.tmp
 

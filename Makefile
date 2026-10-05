@@ -11,6 +11,7 @@ PREFIX ?= /usr/local
 DESTDIR ?=
 CFLAGS ?= -O3 -DNDEBUG
 LTO ?= -flto=auto
+RUNNER_THREADED ?= 0
 ARGS ?=
 PLATFORM ?= native
 ifeq ($(PLATFORM),ysyxsoc)
@@ -49,6 +50,10 @@ PROJECT_CPPFLAGS := -D_GNU_SOURCE -Iinclude -Isrc -Iam/include -include mgba/fla
 PROJECT_CFLAGS := -std=c11 -fwrapv -Wall -Wextra \
 	-Wno-missing-field-initializers -Werror=implicit-function-declaration \
 	-Werror=implicit-int -Werror=incompatible-pointer-types
+
+ifeq ($(RUNNER_THREADED),1)
+PROJECT_CPPFLAGS += -DMGBA_RUNNER_THREADED
+endif
 
 # Keep this list explicit: only the standalone player's core is built.
 CORE_SOURCES := \
@@ -246,6 +251,10 @@ endif
 
 test-spike:
 	+$(MAKE) PLATFORM=spike test
+
+.PHONY: test-threaded
+test-threaded:
+	$(PYTHON) -u am/test/thumb-threaded.py
 
 test-verilator:
 	+$(MAKE) PLATFORM=verilator test

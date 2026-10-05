@@ -242,9 +242,13 @@ void ARMRun(struct ARMCore* cpu) {
 
 void ARMRunLoop(struct ARMCore* cpu) {
 	if (cpu->executionMode == MODE_THUMB) {
+#ifdef MGBA_RUNNER_THREADED
+		ARMRunThumbThreaded(cpu);
+#else
 		while (cpu->cycles < cpu->nextEvent) {
 			ThumbStep(cpu);
 		}
+#endif
 	} else {
 		while (cpu->cycles < cpu->nextEvent) {
 			ARMStep(cpu);
