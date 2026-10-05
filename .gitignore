@@ -1,6 +1,9 @@
 # Build output
 /build/
 
+# Generated images and prompts
+/imagegen/
+
 # Editor and Python temporary files
 *.user*
 *~
