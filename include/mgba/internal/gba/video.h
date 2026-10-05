@@ -221,6 +221,7 @@ struct GBAVideo {
 
 	int vcount;
 	unsigned stallMask;
+	unsigned stallAddressLimit;
 
 	uint16_t palette[512];
 	uint16_t* vram;

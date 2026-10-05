@@ -576,7 +576,7 @@ uint32_t GBALoad16(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 		} else {
 			LOAD_16(value, address & 0x0001FFFE, gba->video.vram);
 		}
-		if (gba->video.stallMask && (address & 0x0001FFFF) < ((GBARegisterDISPCNTGetMode(gba->memory.io[GBA_REG(DISPCNT)]) >= 3) ? 0x00014000 : 0x00010000)) {
+		if (gba->video.stallMask && (address & 0x0001FFFF) < gba->video.stallAddressLimit) {
 			wait += GBAMemoryStallVRAM(gba, wait, 0);
 		}
 		break;
@@ -643,8 +643,10 @@ uint32_t GBALoad16(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 		*cycleCounter += wait;
 	}
 	// Unaligned 16-bit loads are "unpredictable", but the GBA rotates them, so we have to, too.
-	int rotate = (address & 1) << 3;
-	return ROR(value, rotate);
+	if (address & 1) {
+		return ROR(value, 8);
+	}
+	return value;
 }
 
 uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {

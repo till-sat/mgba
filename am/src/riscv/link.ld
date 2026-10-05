@@ -8,7 +8,12 @@ PHDRS {
     data PT_LOAD FLAGS(6);
 }
 SECTIONS {
-    .text : { KEEP(*(.text.entry)) *(.text .text.*) } > ram :text
+    .text : {
+        _text_start = .;
+        KEEP(*(.text.entry))
+        *(.text .text.*)
+        _text_end = .;
+    } > ram :text
     .rodata : { *(.rodata .rodata.*) } > ram :rodata
     .data : {
         *(.data .data.*)

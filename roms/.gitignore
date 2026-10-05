@@ -1,1 +1,3 @@
 *.sav
+# Local ROM images are not repository sources. Tracked ROMs remain tracked.
+*.gba

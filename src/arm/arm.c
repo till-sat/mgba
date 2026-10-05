@@ -226,6 +226,15 @@ static inline void ThumbStep(struct ARMCore* cpu) {
 	instruction(cpu, opcode);
 }
 
+static inline void ThumbStepCached(struct ARMCore* cpu, const uint32_t* activeRegion, uint32_t activeMask) {
+	uint32_t opcode = cpu->prefetch[0];
+	cpu->prefetch[0] = cpu->prefetch[1];
+	cpu->gprs[ARM_PC] += WORD_SIZE_THUMB;
+	LOAD_16(cpu->prefetch[1], cpu->gprs[ARM_PC] & activeMask, activeRegion);
+	ThumbInstruction instruction = _thumbTable[opcode >> 6];
+	instruction(cpu, opcode);
+}
+
 void ARMRun(struct ARMCore* cpu) {
 	while (cpu->cycles >= cpu->nextEvent) {
 		cpu->irqh.processEvents(cpu);
@@ -242,8 +251,17 @@ void ARMRun(struct ARMCore* cpu) {
 
 void ARMRunLoop(struct ARMCore* cpu) {
 	if (cpu->executionMode == MODE_THUMB) {
+		/* Sequential Thumb fetches stay in the same mapped region. Branches
+		 * update PC and refresh this pair before the next instruction. */
+		const uint32_t* activeRegion = cpu->memory.activeRegion;
+		uint32_t activeMask = cpu->memory.activeMask;
 		while (cpu->cycles < cpu->nextEvent) {
-			ThumbStep(cpu);
+			uint32_t nextPC = cpu->gprs[ARM_PC] + WORD_SIZE_THUMB;
+			ThumbStepCached(cpu, activeRegion, activeMask);
+			if (cpu->gprs[ARM_PC] != nextPC) {
+				activeRegion = cpu->memory.activeRegion;
+				activeMask = cpu->memory.activeMask;
+			}
 		}
 	} else {
 		while (cpu->cycles < cpu->nextEvent) {

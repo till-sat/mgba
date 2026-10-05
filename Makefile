@@ -33,8 +33,8 @@ else
 ROM_PATH := $(ROM_DIR)/$(ROM_INPUT).gba
 endif
 
-ifeq ($(filter $(PLATFORM),native spike verilator fpga ysyxsoc),)
-$(error Unsupported PLATFORM '$(PLATFORM)'; choose native, spike, verilator, fpga or ysyxsoc)
+ifeq ($(filter $(PLATFORM),native spike spike_zve32x verilator fpga ysyxsoc),)
+$(error Unsupported PLATFORM '$(PLATFORM)'; choose native, spike, spike_zve32x, verilator, fpga or ysyxsoc)
 endif
 
 BUILD_DIR := build

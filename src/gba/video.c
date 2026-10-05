@@ -37,6 +37,10 @@ static void _startHblank(struct mTiming*, void* context, uint32_t cyclesLate);
 static void _startHdraw(struct mTiming*, void* context, uint32_t cyclesLate);
 static unsigned _calculateStallMask(struct GBA* gba, unsigned dispcnt);
 
+static unsigned _calculateStallAddressLimit(unsigned dispcnt) {
+	return GBARegisterDISPCNTGetMode(dispcnt) >= 3 ? 0x00014000 : 0x00010000;
+}
+
 MGBA_EXPORT const int GBAVideoObjSizes[16][2] = {
 	{ 8, 8 },
 	{ 16, 16 },
@@ -59,6 +63,8 @@ MGBA_EXPORT const int GBAVideoObjSizes[16][2] = {
 void GBAVideoInit(struct GBAVideo* video) {
 	video->renderer = NULL;
 	video->vram = anonymousMemoryMap(GBA_SIZE_VRAM);
+	video->stallMask = 0;
+	video->stallAddressLimit = 0;
 	video->frameskip = 0;
 	video->event.name = "GBA Video";
 	video->event.callback = NULL;
@@ -83,6 +89,7 @@ void GBAVideoReset(struct GBAVideo* video) {
 	video->frameCounter = 0;
 	video->frameskipCounter = 0;
 	video->stallMask = 0;
+	video->stallAddressLimit = 0;
 
 	memset(video->palette, 0, sizeof(video->palette));
 	memset(video->oam.raw, 0, sizeof(video->oam.raw));
@@ -159,6 +166,7 @@ void _startHdraw(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 	if (video->vcount < GBA_VIDEO_VERTICAL_PIXELS) {
 		unsigned dispcnt = video->p->memory.io[GBA_REG(DISPCNT)];
 		video->stallMask = _calculateStallMask(video->p, dispcnt);
+		video->stallAddressLimit = _calculateStallAddressLimit(dispcnt);
 	}
 
 	GBARegisterDISPSTAT dispstat = video->p->memory.io[GBA_REG(DISPSTAT)];
@@ -224,6 +232,7 @@ void _startHblank(struct mTiming* timing, void* context, uint32_t cyclesLate) {
 		GBARaiseIRQ(video->p, GBA_IRQ_HBLANK, cyclesLate - 6); // TODO: Where does this fudge factor come from?
 	}
 	video->stallMask = 0;
+	video->stallAddressLimit = 0;
 	video->p->memory.io[GBA_REG(DISPSTAT)] = dispstat;
 }
 
@@ -468,6 +477,7 @@ void GBAVideoDeserialize(struct GBAVideo* video, const struct GBASerializedState
 	LOAD_32(video->frameCounter, 0, &state->video.frameCounter);
 
 	video->stallMask = 0;
+	video->stallAddressLimit = 0;
 	int32_t flags;
 	LOAD_32(flags, 0, &state->video.flags);
 	GBARegisterDISPSTAT dispstat = state->io[GBA_REG(DISPSTAT)];
@@ -485,6 +495,7 @@ void GBAVideoDeserialize(struct GBAVideo* video, const struct GBASerializedState
 	case 2:
 		video->event.callback = _startHblank;
 		video->stallMask = _calculateStallMask(video->p, state->io[GBA_REG(DISPCNT)]);
+		video->stallAddressLimit = _calculateStallAddressLimit(state->io[GBA_REG(DISPCNT)]);
 		break;
 	case 3:
 		video->event.callback = _startHdraw;

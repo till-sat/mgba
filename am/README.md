@@ -91,6 +91,18 @@ make PLATFORM=spike test-media
 make PLATFORM=spike test
 ```
 
+The integer-vector Spike target uses a separate platform name and build
+directory:
+
+```sh
+make -j4 PLATFORM=spike_zve32x
+make PLATFORM=spike_zve32x run
+make PLATFORM=spike_zve32x test
+```
+
+`PLATFORM=spike_zve32x` selects `rv32im_zicsr_zifencei_zicbom_zve32x`,
+`/home/tillsat/tools/spike-zve32x`, and `build/spike_zve32x/` automatically.
+
 The output is `build/spike/mgba.elf`. `ROM` defaults to the game name `dragonball`,
 which resolves to `roms/dragonball.gba`, and
 is embedded into the executable. The default run opens an SDL window with
@@ -144,6 +156,8 @@ used by proto-core. It must contain `bin/spike`, `include/riscv/abstract_device.
 and `lib/libriscv.so`. The device plugin is compiled against those headers and
 libraries. Spike plugin APIs can vary between revisions. Native remains the
 default; `PLATFORM=spike` isolates its objects under `build/spike/`.
+The `spike_zve32x` platform uses the separately built Spike installation and
+isolates its objects under `build/spike_zve32x/`.
 
 ## proto-core on ysyxSoC
 

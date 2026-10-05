@@ -145,18 +145,67 @@ static bool submit_audio(struct player* player, bool paced) {
 	return true;
 }
 
+#if defined(__riscv_vector) && !defined(COLOR_16_BIT)
+/* AM's default 32-bit framebuffer is XBGR8. Keep this conversion in the
+ * vector unit when the selected ISA provides RVV. */
+static void copy_video_rvv(const mColor* source, uint32_t* destination,
+                           unsigned stride, unsigned width, unsigned height) ATTRIBUTE_NOINLINE;
+static void copy_video_rvv(const mColor* source, uint32_t* destination,
+                           unsigned stride, unsigned width, unsigned height) {
+	for (unsigned y = 0; y < height; ++y) {
+		unsigned remaining = width;
+		while (remaining) {
+			size_t vl;
+			uintptr_t greenMask = 0xFF00;
+			uintptr_t blueMask = 0xFF;
+			__asm__ volatile(
+				"vsetvli %[vl], %[remaining], e32, m1, ta, ma\n\t"
+				"vle32.v v0, (%[source])\n\t"
+				"vsll.vi v1, v0, 16\n\t"
+				"vand.vx v2, v0, %[greenMask]\n\t"
+				"vsrl.vi v3, v0, 16\n\t"
+				"vand.vx v3, v3, %[blueMask]\n\t"
+				"vor.vv v1, v1, v2\n\t"
+				"vor.vv v1, v1, v3\n\t"
+				"vse32.v v1, (%[destination])"
+				: [vl] "=&r" (vl)
+				: [remaining] "r" (remaining), [source] "r" (source),
+				  [destination] "r" (destination), [greenMask] "r" (greenMask),
+				  [blueMask] "r" (blueMask)
+				: "memory", "v0", "v1", "v2", "v3");
+			source += vl;
+			destination += vl;
+			remaining -= vl;
+		}
+		source += stride - width;
+	}
+}
+#endif
+
 static bool copy_video(struct player* player, unsigned* width, unsigned* height) {
 	player->core->currentVideoSize(player->core, width, height);
 	if (!*width || !*height || *width > player->stride || *height > player->rows) {
 		fprintf(stderr, "Invalid core video dimensions.\n");
 		return false;
 	}
+#if defined(__riscv_vector) && !defined(COLOR_16_BIT)
+	copy_video_rvv(player->video, player->rgb, player->stride, *width, *height);
+#else
+	/* Avoid the per-pixel mColorConvert call for the common XBGR8 format. */
 	for (unsigned y = 0; y < *height; ++y) {
+		mColor* source = player->video + y * player->stride;
+		uint32_t* destination = player->rgb + y * *width;
 		for (unsigned x = 0; x < *width; ++x) {
-			mColor color = player->video[y * player->stride + x];
-			player->rgb[y * *width + x] = mColorConvert(color, mCOLOR_NATIVE, mCOLOR_RGB8);
+#ifdef COLOR_16_BIT
+			destination[x] = mColorConvert(source[x], mCOLOR_NATIVE, mCOLOR_RGB8);
+#else
+			uint32_t color = source[x];
+			destination[x] = ((color & 0x000000FFu) << 16) |
+				                 (color & 0x0000FF00u) | ((color >> 16) & 0x000000FFu);
+#endif
 		}
 	}
+#endif
 	return true;
 }
 

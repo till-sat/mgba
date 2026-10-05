@@ -13,3 +13,7 @@ __pycache__/
 # Runtime saves
 *.sav
 *.ss0
+
+# The ysyxSoC application is maintained on its own branch. Keep its local
+# checkout and generated files out of the main working tree.
+/ysyx/

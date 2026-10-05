@@ -28,6 +28,12 @@ ROM_EMBED_CPPFLAGS ?=
 
 PLATFORM_CFLAGS := -march=$(RISCV_ISA) -mabi=$(RISCV_ABI) -mstrict-align -mcmodel=medany \
                    -msmall-data-limit=0 -ffreestanding -ffunction-sections -fdata-sections
+ifneq ($(findstring zve,$(RISCV_ISA)),)
+PLATFORM_CFLAGS += -DAM_RVV
+endif
+ifneq ($(findstring rv32gcv,$(RISCV_ISA)),)
+PLATFORM_CFLAGS += -DAM_RVV
+endif
 PROJECT_CFLAGS += $(PLATFORM_CFLAGS)
 # The RV32 Newlib headers use long-based fixed-width integer typedefs; the
 # upstream core has established int format strings for these values.

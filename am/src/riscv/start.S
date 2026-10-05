@@ -4,6 +4,11 @@
 _start:
     csrw mie, zero
     csrw mstatus, zero
+#ifdef AM_RVV
+    /* Enable vector state before Newlib or the application executes RVV. */
+    li t0, 0x600
+    csrs mstatus, t0
+#endif
     .option push
     .option norelax
     la gp, __global_pointer$
