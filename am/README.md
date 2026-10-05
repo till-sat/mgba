@@ -122,6 +122,38 @@ The AM driver accesses this extension only in an `AM_SIM_MEDIA` build with media
 requested. Spike and both interactive Verilator targets enable that flag; physical
 display/audio still require hardware contracts.
 
+### Threaded Thumb interpreter
+
+The threaded loop is experimental and remains disabled by default. It improves
+the measured FPGA opening despite regressing Spike wall time. Retired
+instruction counts alone do not establish an elapsed-time improvement.
+
+`RUNNER_THREADED=1` tests a compact Thumb interpreter loop that dispatches with
+GNU C computed gotos instead of calling a handler for each opcode. It expands
+the same instruction definitions as single stepping, retains memory callbacks
+and event accounting, and applies to all ROMs without collecting a trace. ARM
+mode continues through the existing interpreter. GCC or Clang is required.
+
+```sh
+make PLATFORM=spike RUNNER_THREADED=1 BUILD_DIR=build/spike-threaded \
+  HEADLESS=1 BENCHMARK=1 WARMUP=30 FRAMES=120 run
+```
+
+The same switch builds for `PLATFORM=fpga`; it does not introduce any
+Spike-specific execution shortcuts. On the 50 MHz ZCU102 quad-issue-rvv core,
+two alternating runs per build measured 7.579 FPS for the scalar interpreter
+and 8.530 FPS for the threaded loop (about 12.5% faster), with matching frame
+CRC `3642819F`. Both builds used
+scalar RISC-V instructions, fresh saves, 30 warmup frames and 120 measured
+Dragonball opening frames, with software rendering and no media output.
+The loop also passes interpreter differential tests. This result covers one
+opening sequence; performance across ROMs and gameplay remains unverified.
+Use `RUNNER_THREADED=1` explicitly to try it; the default interpreter remains
+available for comparison.
+
+Validate pipeline state, event exits, code patches, branches, mode changes and
+fetch wrapping against original single stepping with `make test-threaded`.
+
 The ELF uses RV32IM/ILP32 with Zicsr, Zifencei, and Zicbom enabled in the toolchain,
 matching the scalar baseline of quad-issue-rvv. It requires no F/D floating-point
 extension, A atomics, C compressed instructions, or RVV. AM-reachable audio and

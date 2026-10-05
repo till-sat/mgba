@@ -251,6 +251,9 @@ void ARMRun(struct ARMCore* cpu) {
 
 void ARMRunLoop(struct ARMCore* cpu) {
 	if (cpu->executionMode == MODE_THUMB) {
+#ifdef MGBA_RUNNER_THREADED
+		ARMRunThumbThreaded(cpu);
+#else
 		/* Sequential Thumb fetches stay in the same mapped region. Branches
 		 * update PC and refresh this pair before the next instruction. */
 		const uint32_t* activeRegion = cpu->memory.activeRegion;
@@ -263,6 +266,7 @@ void ARMRunLoop(struct ARMCore* cpu) {
 				activeMask = cpu->memory.activeMask;
 			}
 		}
+#endif
 	} else {
 		while (cpu->cycles < cpu->nextEvent) {
 			ARMStep(cpu);

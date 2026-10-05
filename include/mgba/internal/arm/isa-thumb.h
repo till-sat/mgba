@@ -14,6 +14,9 @@ struct ARMCore;
 
 typedef void (*ThumbInstruction)(struct ARMCore*, unsigned opcode);
 extern const ThumbInstruction _thumbTable[0x400];
+#ifdef MGBA_RUNNER_THREADED
+void ARMRunThumbThreaded(struct ARMCore* cpu);
+#endif
 
 CXX_GUARD_END
 
