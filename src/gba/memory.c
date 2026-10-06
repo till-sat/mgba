@@ -532,7 +532,7 @@ uint32_t GBALoad32(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 	return ROR(value, rotate);
 }
 
-uint32_t GBALoad16(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
+static ATTRIBUTE_NOINLINE uint32_t _load16Slow(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 	struct GBA* gba = (struct GBA*) cpu->master;
 	struct GBAMemory* memory = &gba->memory;
 	uint32_t value = 0;
@@ -649,7 +649,70 @@ uint32_t GBALoad16(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 	return value;
 }
 
-uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
+static inline int32_t _memoryStallSingle(struct ARMCore* cpu, int32_t seqCycles) {
+	struct GBA* gba = (struct GBA*) cpu->master;
+	uint32_t pc = cpu->gprs[ARM_PC];
+	uint32_t dist = gba->memory.lastPrefetchedPc - pc;
+	gba->memory.lastPrefetchedPc = pc + (dist < 16 ? dist & ~1U : 0);
+	return seqCycles - cpu->memory.activeNonseqCycles16;
+}
+
+static ATTRIBUTE_NOINLINE uint32_t _load16IO(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
+	struct GBA* gba = (struct GBA*) cpu->master;
+	uint32_t value = GBAIORead(gba, address & (OFFSET_MASK - 1));
+	if (cycleCounter) {
+		int wait = GBAMemoryStall(cpu, 2);
+		*cycleCounter += wait;
+	}
+	return address & 1 ? ROR(value, 8) : value;
+}
+
+uint32_t GBALoad16(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
+	uint32_t region = address >> BASE_OFFSET;
+	/* DISPCNT, STEREOCNT, DISPSTAT and VCOUNT have no read callback. Like
+	 * GBAIORead, reading them must still cancel pending idle-loop removal. */
+	bool videoIO = region == GBA_REGION_IO && (address & OFFSET_MASK) < GBA_REG_BG0CNT;
+	if (region == GBA_REGION_EWRAM || region == GBA_REGION_IWRAM || videoIO) {
+		struct GBA* gba = (struct GBA*) cpu->master;
+		struct GBAMemory* memory = &gba->memory;
+		bool prefetch = (region == GBA_REGION_IWRAM || videoIO) && cycleCounter && memory->activeRegion >= GBA_REGION_ROM0 && memory->prefetch;
+		int32_t s = 0;
+		if (prefetch) {
+			s = cpu->memory.activeSeqCycles16;
+			/* One ROM prefetch covers these two-cycle reads at normal ROM
+			 * waitstates. Fall back before changing state otherwise. */
+			if (s + 1 < 2) {
+				return _load16Slow(cpu, address, cycleCounter);
+			}
+		}
+		uint32_t value;
+		if (videoIO) {
+			gba->haltPending = false;
+			value = memory->io[(address & OFFSET_MASK) >> 1];
+		} else if (region == GBA_REGION_EWRAM) {
+			LOAD_16(value, address & (GBA_SIZE_EWRAM - 2), memory->wram);
+		} else {
+			LOAD_16(value, address & (GBA_SIZE_IWRAM - 2), memory->iwram);
+		}
+		if (cycleCounter) {
+			int wait = prefetch ? _memoryStallSingle(cpu, s) : 2;
+			if (region == GBA_REGION_EWRAM) {
+				wait += memory->waitstatesNonseq16[GBA_REGION_EWRAM];
+				wait = GBAMemoryStall(cpu, wait);
+			}
+			*cycleCounter += wait;
+		}
+		return address & 1 ? ROR(value, 8) : value;
+	}
+	/* Isolate the IO callback so ordinary RAM reads do not need its saved
+	 * registers. Both paths retain the two-cycle access and prefetch effects. */
+	if (region == GBA_REGION_IO) {
+		return _load16IO(cpu, address, cycleCounter);
+	}
+	return _load16Slow(cpu, address, cycleCounter);
+}
+
+static ATTRIBUTE_NOINLINE uint32_t _load8Slow(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 	struct GBA* gba = (struct GBA*) cpu->master;
 	struct GBAMemory* memory = &gba->memory;
 	uint32_t value = 0;
@@ -756,6 +819,29 @@ uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 		*cycleCounter += wait;
 	}
 	return value;
+}
+
+uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
+	uint32_t region = address >> BASE_OFFSET;
+	if (region == GBA_REGION_EWRAM || region == GBA_REGION_IWRAM) {
+		struct GBA* gba = (struct GBA*) cpu->master;
+		struct GBAMemory* memory = &gba->memory;
+		uint32_t value;
+		int wait = 0;
+		if (region == GBA_REGION_EWRAM) {
+			value = ((uint8_t*) memory->wram)[address & (GBA_SIZE_EWRAM - 1)];
+			wait = memory->waitstatesNonseq16[GBA_REGION_EWRAM];
+		} else {
+			value = ((uint8_t*) memory->iwram)[address & (GBA_SIZE_IWRAM - 1)];
+		}
+		if (cycleCounter) {
+			wait += 2;
+			if (address < GBA_BASE_ROM0) wait = GBAMemoryStall(cpu, wait);
+			*cycleCounter += wait;
+		}
+		return value;
+	}
+	return _load8Slow(cpu, address, cycleCounter);
 }
 
 #define STORE_EWRAM \
@@ -876,12 +962,11 @@ void GBAStore32(struct ARMCore* cpu, uint32_t address, int32_t value, int* cycle
 	}
 }
 
-void GBAStore16(struct ARMCore* cpu, uint32_t address, int16_t value, int* cycleCounter) {
+static ATTRIBUTE_NOINLINE void _store16Slow(struct ARMCore* cpu, uint32_t address, int16_t value, int* cycleCounter) {
 	struct GBA* gba = (struct GBA*) cpu->master;
 	struct GBAMemory* memory = &gba->memory;
 	int wait = 0;
 	int16_t oldValue;
-
 	switch (address >> BASE_OFFSET) {
 	case GBA_REGION_EWRAM:
 		STORE_16(value, address & (GBA_SIZE_EWRAM - 2), memory->wram);
@@ -1019,6 +1104,28 @@ void GBAStore16(struct ARMCore* cpu, uint32_t address, int16_t value, int* cycle
 		}
 		*cycleCounter += wait;
 	}
+}
+
+void GBAStore16(struct ARMCore* cpu, uint32_t address, int16_t value, int* cycleCounter) {
+	uint32_t region = address >> BASE_OFFSET;
+	if (region == GBA_REGION_EWRAM || region == GBA_REGION_IWRAM) {
+		struct GBA* gba = (struct GBA*) cpu->master;
+		struct GBAMemory* memory = &gba->memory;
+		int wait = 0;
+		if (region == GBA_REGION_EWRAM) {
+			STORE_16(value, address & (GBA_SIZE_EWRAM - 2), memory->wram);
+			wait = memory->waitstatesNonseq16[GBA_REGION_EWRAM];
+		} else {
+			STORE_16(value, address & (GBA_SIZE_IWRAM - 2), memory->iwram);
+		}
+		if (cycleCounter) {
+			++wait;
+			if (address < GBA_BASE_ROM0) wait = GBAMemoryStall(cpu, wait);
+			*cycleCounter += wait;
+		}
+		return;
+	}
+	_store16Slow(cpu, address, value, cycleCounter);
 }
 
 void GBAStore8(struct ARMCore* cpu, uint32_t address, int8_t value, int* cycleCounter) {

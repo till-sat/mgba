@@ -862,11 +862,17 @@ static void _GBACoreRunFrame(struct mCore* core) {
 	uint32_t frameCounter = gba->video.frameCounter;
 	uint32_t startCycle = mTimingCurrentTime(&gba->timing);
 	while (gba->video.frameCounter == frameCounter && mTimingCurrentTime(&gba->timing) - startCycle < VIDEO_TOTAL_LENGTH + VIDEO_HORIZONTAL_LENGTH) {
+#ifdef MGBA_GBA_IDLE_SKIP
+		if (gba->idleLoop != GBA_IDLE_LOOP_NONE) GBASkipIdleLoop(gba);
+#endif
 		ARMRunLoop(core->cpu);
 	}
 }
 
 static void _GBACoreRunLoop(struct mCore* core) {
+#ifdef MGBA_GBA_IDLE_SKIP
+	if (((struct GBA*) core->board)->idleLoop != GBA_IDLE_LOOP_NONE) GBASkipIdleLoop(core->board);
+#endif
 	ARMRunLoop(core->cpu);
 }
 

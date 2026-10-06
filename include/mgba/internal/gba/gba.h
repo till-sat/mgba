@@ -143,6 +143,9 @@ struct GBACartridge {
 };
 
 void GBACreate(struct GBA* gba);
+/* Returns skipped guest cycles. May execute a bounded prefix with the normal
+ * handlers even when returning zero; leaves event processing to ARMRunLoop. */
+uint32_t GBASkipIdleLoop(struct GBA* gba);
 void GBADestroy(struct GBA* gba);
 
 void GBAReset(struct ARMCore* cpu);

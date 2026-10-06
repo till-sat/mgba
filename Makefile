@@ -12,6 +12,7 @@ DESTDIR ?=
 CFLAGS ?= -O3 -DNDEBUG
 LTO ?= -flto=auto
 RUNNER_THREADED ?= 0
+GBA_IDLE_SKIP ?= 0
 ARGS ?=
 PLATFORM ?= native
 ifeq ($(PLATFORM),ysyxsoc)
@@ -53,6 +54,9 @@ PROJECT_CFLAGS := -std=c11 -fwrapv -Wall -Wextra \
 
 ifeq ($(RUNNER_THREADED),1)
 PROJECT_CPPFLAGS += -DMGBA_RUNNER_THREADED
+endif
+ifeq ($(GBA_IDLE_SKIP),1)
+PROJECT_CPPFLAGS += -DMGBA_GBA_IDLE_SKIP
 endif
 
 # Keep this list explicit: only the standalone player's core is built.
@@ -113,6 +117,7 @@ CORE_SOURCES := \
 	src/gba/gba.c \
 	src/gba/hle-bios.c \
 	src/gba/io.c \
+	src/gba/idle.c \
 	src/gba/memory.c \
 	src/gba/overrides.c \
 	src/gba/renderers/cache-set.c \
@@ -255,6 +260,28 @@ test-spike:
 .PHONY: test-threaded
 test-threaded:
 	$(PYTHON) -u am/test/thumb-threaded.py
+
+ifeq ($(PLATFORM),native)
+$(BUILD_DIR)/gba-memory-test: am/test/gba-memory.c src/gba/memory.c $(CORE_LIBRARY) Makefile $(BUILD_DIR)/.build-config
+	$(CC) $(PROJECT_CPPFLAGS) $(CPPFLAGS) $(PROJECT_CFLAGS) $(CFLAGS) $(LTO) \
+		-MMD -MP -MF "$@.d" -MT "$@" $< $(CORE_LIBRARY) $(LDFLAGS) $(LDLIBS) -lm -o "$@"
+
+-include $(BUILD_DIR)/gba-memory-test.d
+
+.PHONY: test-gba-memory
+test-gba-memory: $(BUILD_DIR)/gba-memory-test
+	"$(abspath $<)"
+
+$(BUILD_DIR)/gba-idle-test: am/test/gba-idle.c $(CORE_LIBRARY) Makefile $(BUILD_DIR)/.build-config
+	$(CC) $(PROJECT_CPPFLAGS) $(CPPFLAGS) $(PROJECT_CFLAGS) $(CFLAGS) $(LTO) \
+		-MMD -MP -MF "$@.d" -MT "$@" $< $(CORE_LIBRARY) $(LDFLAGS) $(LDLIBS) -lm -o "$@"
+
+-include $(BUILD_DIR)/gba-idle-test.d
+
+.PHONY: test-gba-idle
+test-gba-idle: $(BUILD_DIR)/gba-idle-test
+	"$(abspath $<)"
+endif
 
 test-verilator:
 	+$(MAKE) PLATFORM=verilator test
