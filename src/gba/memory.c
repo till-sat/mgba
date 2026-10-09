@@ -28,7 +28,6 @@ static int16_t  _agbPrintLoad(struct GBA* gba, uint32_t address);
 static uint8_t _deadbeef[4] = { 0x10, 0xB7, 0x10, 0xE7 }; // Illegal instruction on both ARM and Thumb
 static const uint32_t _agbPrintFunc = 0x4770DFFA; // swi 0xFA; bx lr
 
-static void GBASetActiveRegion(struct ARMCore* cpu, uint32_t region);
 static int32_t GBAMemoryStall(struct ARMCore* cpu, int32_t wait);
 static int32_t GBAMemoryStallVRAM(struct GBA* gba, int32_t wait, int extra);
 
@@ -244,7 +243,7 @@ static void _analyzeForIdleLoop(struct GBA* gba, struct ARMCore* cpu, uint32_t a
 	}
 }
 
-static void GBASetActiveRegion(struct ARMCore* cpu, uint32_t address) {
+void GBASetActiveRegion(struct ARMCore* cpu, uint32_t address) {
 	struct GBA* gba = (struct GBA*) cpu->master;
 	struct GBAMemory* memory = &gba->memory;
 

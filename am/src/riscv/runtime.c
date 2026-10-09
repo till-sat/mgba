@@ -66,13 +66,13 @@ __attribute__((section(".htif"), aligned(64))) volatile uint64_t fromhost;
 #endif
 
 void am_platform_exit(int code) {
-#ifdef AM_SPIKE
-	tohost = ((uint64_t) (unsigned) code << 1) | 1;
-#elif defined(AM_FPGA)
 	/* exit() may already have closed stdout in Newlib's stdio cleanup. */
 	char report[40];
 	int length = snprintf(report, sizeof(report), "AM exit: %d\n", code);
 	for (int i = 0; i < length; ++i) am_platform_putch(report[i]);
+#ifdef AM_SPIKE
+	tohost = ((uint64_t) (unsigned) code << 1) | 1;
+#elif defined(AM_FPGA)
 	while (!(*(volatile uint8_t*) (AM_SOC_UART + 5) & 0x40)) {}
 	__asm__ volatile("fence iorw, iorw; fence.i" ::: "memory");
 	((void (*)(void)) (uintptr_t) 0x20000004u)();

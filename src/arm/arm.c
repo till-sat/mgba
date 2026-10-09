@@ -8,6 +8,9 @@
 #include <mgba/internal/arm/isa-arm.h>
 #include <mgba/internal/arm/isa-inlines.h>
 #include <mgba/internal/arm/isa-thumb.h>
+#ifdef MGBA_RV32
+#include <mgba/internal/arm/rv32.h>
+#endif
 
 void ARMSetPrivilegeMode(struct ARMCore* cpu, enum PrivilegeMode mode) {
 	if (mode == cpu->privilegeMode) {
@@ -56,6 +59,9 @@ void ARMInit(struct ARMCore* cpu) {
 }
 
 void ARMDeinit(struct ARMCore* cpu) {
+#ifdef MGBA_RV32
+	RV32Invalidate(cpu);
+#endif
 	if (cpu->master->deinit) {
 		cpu->master->deinit(cpu->master);
 	}
@@ -88,6 +94,9 @@ void ARMHotplugDetach(struct ARMCore* cpu, size_t slot) {
 }
 
 void ARMReset(struct ARMCore* cpu) {
+#ifdef MGBA_RV32
+	RV32Invalidate(cpu);
+#endif
 	int i;
 	for (i = 0; i < 16; ++i) {
 		cpu->gprs[i] = 0;
@@ -249,7 +258,13 @@ void ARMRun(struct ARMCore* cpu) {
 	}
 }
 
-void ARMRunLoop(struct ARMCore* cpu) {
+static inline void _ARMRunLoopARM(struct ARMCore* cpu) {
+	while (cpu->cycles < cpu->nextEvent) {
+		ARMStep(cpu);
+	}
+}
+
+void ARMRunLoopLegacy(struct ARMCore* cpu) {
 	if (cpu->executionMode == MODE_THUMB) {
 #ifdef MGBA_RUNNER_THREADED
 		ARMRunThumbThreaded(cpu);
@@ -268,11 +283,24 @@ void ARMRunLoop(struct ARMCore* cpu) {
 		}
 #endif
 	} else {
-		while (cpu->cycles < cpu->nextEvent) {
-			ARMStep(cpu);
-		}
+		_ARMRunLoopARM(cpu);
 	}
 	cpu->irqh.processEvents(cpu);
+}
+
+void ARMRunLoop(struct ARMCore* cpu) {
+#ifdef MGBA_RV32
+	/* Unsupported ARM mappings keep their loop here, avoiding a round trip
+	 * through the JIT for RAM or BIOS code. */
+	if (cpu->executionMode == MODE_ARM && !RV32CanRun(cpu)) {
+		_ARMRunLoopARM(cpu);
+		cpu->irqh.processEvents(cpu);
+	} else {
+		RV32RunLoop(cpu);
+	}
+#else
+	ARMRunLoopLegacy(cpu);
+#endif
 }
 
 void ARMRunFake(struct ARMCore* cpu, uint32_t opcode) {

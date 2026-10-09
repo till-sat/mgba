@@ -26,6 +26,7 @@ library has no dependency on mGBA. All repository text is English.
 - `sim/`: Spike GPIO/SYSCTRL model, shared SDL media peripheral and optional
   RTL AXI bridge; see its README for the simulation-only register contract.
 - `test/`: standalone AM and bare-metal runtime tests.
+- `bench/peanut/`: independent, pinned Pico-GB core for Native/Spike/FPGA comparisons.
 - `../src/platform/am/player.c`: shared frame loop, button/pixel translation,
   audio resampling, pacing, and final frame checksum.
 - `../src/platform/am/main.c`: native command line, file ROMs, persistent saves.
@@ -80,6 +81,18 @@ match. The checksum covers rendered output, not the complete emulator state or
 CPU timing. Headless runs still emulate audio, but discard it without playback.
 
 ## RV32 on Spike
+
+The independent core has a separate interactive entry, using this same AM media
+device for its window, keyboard and PCM output:
+
+```sh
+make -j6 PLATFORM=spike GBN_RV32=1 run-gba-next
+```
+
+It defaults to `ROM=dragonball`, also supports `spike_zve32x`, and keeps saves in
+RAM. `GBN_PLAYER_AUDIO=0` disables playback and `GBN_PLAYER_FRAMES=N` bounds the
+run. `run-gba-next-bench` has no media output; the commands below use the original
+mGBA player. Details: [independent core](../doc/gba-next.md).
 
 ```sh
 make -j4 PLATFORM=spike
@@ -290,3 +303,125 @@ that RTL. Headless mGBA execution has also passed on physical single-issue
 DE0-CV and quad-rvv ZCU102 boards for the documented benchmark. Remaining work
 includes physical button wiring, persistent saves, display/audio hardware,
 broader game compatibility, RVV optimization, and reaching real-time performance.
+
+
+## Scanline RGB output
+
+`AM_SCANLINE_RGB=1` (default) lets the GBA software renderer maintain the
+player's `0x00RRGGBB` buffer as it writes changed scanlines. Unchanged rows keep
+their previous RGB pixels. This avoids converting the entire framebuffer
+again after every frame, without skipping emulation or rendering work.
+The core's native framebuffer and `getPixels`/`putPixels` format are preserved;
+pixel restoration, forced blank, green swap and renderer initialization also
+update the RGB buffer. GB/GBC and unsupported renderers use the usual frontend
+conversion. `AM_SCANLINE_RGB=0` disables attachment for comparison.
+
+`make PLATFORM=native test-gba-rgb RGB_TEST_ROMS='path/to/game.gba'` checks
+the full RGB pixel values, strides, rendering modes and buffer lifecycle, then
+compares 150 frames of native pixels, audio and serialized state for each ROM.
+`make PLATFORM=spike test-gba-rgb` runs the synthetic cases as RV32 code.
+
+## GBA runner diagnostics
+
+For GBA runner diagnostics, `RV32_RUNNER=1 RV32_STATS=1` enables compilation,
+cache lookup, native edge and return counters. The player resets counts after
+warmup and prints them after timing. Per-PC records retain whether an address
+was compiled during warmup, while measured counts start at zero. The bounded
+table reports overflow. Native helper counters add instructions, and overlap
+classification scans cached metadata, so diagnostic FPS is not release FPS.
+Keep `RV32_STATS=0` (the default) for physical performance comparisons.
+
+With `RV32_RUNNER=1`, `RV32_TRACE_POLL=1` (default) also detects fixed points
+across multiple native Thumb blocks. It compares registers at backward edges,
+invalidates the snapshot on RAM writes that change bytes, and disables the
+proof after external callbacks. Only complete repetitions before the next
+event are coalesced; events require a fresh proof. This can accelerate loops
+containing idempotent RAM stores as well as reads. Set `RV32_TRACE_POLL=0` for
+an independent comparison. The extra checks can slow workloads without useful
+fixed points; see [the runner measurements](../doc/rv32-runner.md).
+
+## Pico-GB comparison benchmark
+
+`bench/peanut` builds the unmodified Peanut-GB header shipped by
+[YouMakeTech/Pico-GB](https://github.com/YouMakeTech/Pico-GB) at commit
+`68dbc8707cb17973afc6860e542c474992a61eee`. Upstream licenses remain in the
+vendored headers; source URLs and SHA256 hashes are in `vendor/source.json`.
+This separate executable does not replace mGBA's GB or GBA core.
+
+Run from the repository root after preparing the RV32 runtime with
+`make PLATFORM=spike runtime`:
+
+```sh
+make -f am/bench/peanut/Makefile PLATFORM=native
+build/rv32/gb-comparison/peanut-native/peanut.elf
+make -f am/bench/peanut/Makefile PLATFORM=spike
+make -f am/bench/peanut/Makefile PLATFORM=fpga
+```
+
+The default fixture is the existing `cinema/gb/acid/dmg-acid2/test.gb`, with
+30 warmup and 120 measured frames. `ROM`, `WARMUP`, `FRAMES`, and `BUILD_DIR`
+select other fixtures and independent output directories. `INPUT=0` holds
+all buttons released. `INPUT=1` presses Start at frames 60–64, then cycles
+Left/Up/Down/Right for five frames every twenty frames starting at frame 100;
+use `WARMUP=120 FRAMES=600` to measure the played section. Native optionally
+writes the final little-endian RGB565 framebuffer to `PEANUT_FRAMEBUFFER`.
+
+The played-game comparison uses the author's public
+[2048.gb](https://sanqui.rustedlogic.net/etc/2048.gb) from
+[Sanqui/2048-gb](https://github.com/Sanqui/2048-gb), SHA256
+`3ea2376b15b34bd26b10e6b31d2753bf8b086098dbdb5ee84d9c0f03d66d3d7f`.
+With that file saved locally, build each platform into its own directory:
+
+```sh
+make -f am/bench/peanut/Makefile PLATFORM=fpga ROM=/path/to/2048.gb \
+  INPUT=1 WARMUP=120 FRAMES=600 BUILD_DIR=build/rv32/gb-comparison/2048-play-fpga
+```
+
+The benchmark includes CPU emulation, every rendered scanline, and RGB565
+conversion. APU emulation, physical display/audio output, frame skipping,
+and interlacing are disabled. Its results are not directly comparable to
+Pico's advertised audio-enabled FPS or mGBA's audio-emulating benchmark.
+Native and Spike are correctness references, not FPGA speed estimates.
+Compare the final framebuffer, WRAM, VRAM, PC, and rendered-line count:
+
+```sh
+python3 am/tools/gb_benchmark_report.py --native native.log --spike spike.log \
+  --board board-1.log board-2.log --out results.json
+```
+
+For a board already waiting in UART recovery, use `am/tools/run_fpga.py`
+with the existing RAM loader and the benchmark's `peanut.bin`. Select the
+board's actual UART port and a baud rate supported by its clock; the
+validated 50 MHz ZCU102 uses `/dev/ttyUSB2` and `1041667` baud.
+
+`MEMORY_PROBE=1` adds diagnostic kernels before the untimed GB warmup.
+The first kernel fits in the existing 64-byte parked ITCM/DTCM and compares
+warm cached DDR accesses with TCM accesses. Further kernels vary data and
+instruction working-set sizes independently, keeping retired instruction
+counts fixed within each experiment. They overwrite the first 44 ITCM
+bytes and 64 DTCM bytes; use only a DDR-linked benchmark whose TCMs are
+unused. The kernels validate their results and do not measure application
+cache-miss rates. Their latency ratios must not be used as game speedup
+predictions.
+
+### Diagnostic hardware counters
+
+`PERF_COUNTERS=1` on `PLATFORM=fpga` requires the diagnostic
+`quad-issue-rvv-perf` bitstream. It probes the event selectors, prepares the
+counters before warmup, then starts and freezes all 29 counters around the
+measured frames. A missing PMU or inconsistent cycle partitions fails the run.
+Use `PROFILE=0`; the default `PERF_COUNTERS=0` build has no PMU instructions.
+
+```
+make -j8 PLATFORM=fpga BUILD_DIR=build/rv32/hardware-perf/dragon-fpga \
+  RV32_RUNNER=1 RUNNER_THREADED=1 GBA_IDLE_SKIP=1 \
+  ROM=dragonball WARMUP=30 FRAMES=120 PERF_COUNTERS=1 all
+```
+
+These counters report issue width, exclusive priority categories for the
+first blocked instruction, and overlapping bus/branch/unit observations.
+Bus waits are not cache-miss counts, issued instructions can later be killed,
+and a priority category does not establish a unique cause. Diagnostic FPS
+must be labelled separately from the ordinary release measurement. The event
+map and RTL test commands are in the diagnostic core's
+`docs/perf-counters.md`; the frontend definitions are in `am/include/am-perf.h`.

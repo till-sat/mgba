@@ -542,6 +542,16 @@ static void _GBACoreSetVideoBuffer(struct mCore* core, mColor* buffer, size_t st
 	gbacore->renderer.outputBuffer = buffer;
 	gbacore->renderer.outputBufferStride = stride;
 	memset(gbacore->renderer.scanlineDirty, 0xFFFFFFFF, sizeof(gbacore->renderer.scanlineDirty));
+	GBAVideoSoftwareRendererSetRGBBuffer(&gbacore->renderer, gbacore->renderer.rgbBuffer,
+	                                   gbacore->renderer.rgbBufferStride);
+}
+
+bool GBACoreSetVideoRGBBuffer(struct mCore* core, uint32_t* buffer, size_t stride) {
+	if (!core || core->setVideoBuffer != _GBACoreSetVideoBuffer) return false;
+	struct GBACore* gbacore = (struct GBACore*) core;
+	struct GBA* gba = core->board;
+	if (buffer && gba->video.renderer != &gbacore->renderer.d) return false;
+	return GBAVideoSoftwareRendererSetRGBBuffer(&gbacore->renderer, buffer, stride);
 }
 
 static void _GBACoreSetVideoGLTex(struct mCore* core, unsigned texid) {

@@ -210,6 +210,7 @@ void ARMRaiseUndefined(struct ARMCore*);
 
 void ARMRun(struct ARMCore* cpu);
 void ARMRunLoop(struct ARMCore* cpu);
+void ARMRunLoopLegacy(struct ARMCore* cpu);
 void ARMRunFake(struct ARMCore* cpu, uint32_t opcode);
 
 CXX_GUARD_END

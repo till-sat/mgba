@@ -19,6 +19,24 @@ game real-time performance.
 
 For the Chinese version, see [README_zh.md](README_zh.md).
 
+## rv32 branch: independent core window
+
+```sh
+make -j6 PLATFORM=spike GBN_RV32=1 run-gba-next
+```
+
+This runs the independent core, RV32 native backend and current PPU with a window,
+keyboard input and audio. The default ROM is `roms/dragonball.gba`; use `ROM=go`
+to select another game. `PLATFORM=spike_zve32x` is also supported.
+Controls: arrows, Z/X for A/B, A/S for L/R, Enter for Start, Backspace for Select,
+and Escape or window close to quit. `GBN_PLAYER_AUDIO=0` disables audio output;
+`GBN_PLAYER_FRAMES=N` limits complete frames (default 0 runs until closed).
+Saves currently live in RAM and are discarded on exit.
+
+`run-gba-next-bench` remains the headless fixed-work benchmark. The `run` commands
+below use the original mGBA player. See [doc/gba-next.md](doc/gba-next.md) for the
+independent core's implementation and validation status.
+
 ## Minimal commands
 
 Each command builds the player when needed and starts the selected interactive
@@ -72,6 +90,14 @@ make PLATFORM=ysyxsoc \
 | `PLATFORM` | Build target: `native`, `spike` or `ysyxsoc` | `native` |
 | `ROM` | ROM name under `roms/` (embedded for bare-metal targets); `.gba` is added when omitted | Native / Spike: `dragonball`; ysyxsoc: `cinema/gba/obj/2d-wrap/test.gba` |
 | `BUILD_DIR` | Build output directory | `build` or a platform-specific directory |
+| `RV32_RUNNER` | Experimental ARM/Thumb-to-RV32 block translator on RV32 targets | `0` |
+
+The experimental translator, its validation commands and instruction-count results are described in [doc/rv32-runner.md](doc/rv32-runner.md).
+
+Proto-soc benchmarks (`fpga`, `spike`, `spike_zve32x`, `verilator`) also report
+cycles and retired instructions after warmup. `PROFILE=1` enables PC sampling,
+including generated RV32 blocks; see the same document for collection and
+reporting commands. Spike timing and IPC are functional simulation values.
 
 ### Native
 

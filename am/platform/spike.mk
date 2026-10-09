@@ -41,6 +41,90 @@ test-runtime: $(BUILD_DIR)/runtime-test.elf $(SPIKE_PLUGIN)
 
 test-am: test-runtime
 
+$(BUILD_DIR)/am/test/profile.o: Makefile $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config | $(RUNTIME_READY)
+$(BUILD_DIR)/profile-test.elf: $(BUILD_DIR)/am/test/profile.o $(AM_LIBRARY) $(BOOT_OBJECT) $(LINK_SCRIPT) $(RUNTIME_READY)
+	$(CC) $(PLATFORM_CFLAGS) $(CFLAGS) $(LTO) $(LDFLAGS) $(PLATFORM_LDFLAGS) -o "$@" \
+		$(BOOT_OBJECT) $(BUILD_DIR)/am/test/profile.o \
+		-Wl,--start-group $(AM_LIBRARY) $(PLATFORM_LIBS) -Wl,--end-group
+
+.PHONY: test-profile
+test-profile: $(BUILD_DIR)/profile-test.elf $(SPIKE_PLUGIN)
+	timeout 30 $(SPIKE_COMMAND) --device=am_protosoc,0 "$<"
+	$(PYTHON) am/test/profile-report.py
+
+-include $(BUILD_DIR)/am/test/profile.d
+
+$(BUILD_DIR)/am/test/rv32.o: am/test/rv32.c Makefile $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config | $(RUNTIME_READY)
+	@mkdir -p "$(@D)"
+	$(CC) $(PROJECT_CPPFLAGS) $(CPPFLAGS) $(PROJECT_CFLAGS) $(CFLAGS) $(LTO) -MMD -MP -c "$<" -o "$@"
+$(BUILD_DIR)/rv32-test.elf: $(BUILD_DIR)/am/test/rv32.o $(CORE_LIBRARY) $(AM_LIBRARY) $(BOOT_OBJECT) $(LINK_SCRIPT) $(RUNTIME_READY)
+	$(CC) $(PLATFORM_CFLAGS) $(CFLAGS) $(LTO) $(LDFLAGS) $(PLATFORM_LDFLAGS) -o "$@" \
+		$(BOOT_OBJECT) $(BUILD_DIR)/am/test/rv32.o \
+		-Wl,--start-group $(CORE_LIBRARY) $(AM_LIBRARY) $(PLATFORM_LIBS) -Wl,--end-group
+
+.PHONY: test-rv32
+test-rv32: $(BUILD_DIR)/rv32-test.elf $(SPIKE_PLUGIN)
+	timeout 180 $(SPIKE_COMMAND) --device=am_protosoc,0 "$<"
+
+-include $(BUILD_DIR)/am/test/rv32.d
+
+$(BUILD_DIR)/am/test/gba-rgb.o: am/test/gba-rgb.c Makefile $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config | $(RUNTIME_READY)
+	@mkdir -p "$(@D)"
+	$(CC) $(PROJECT_CPPFLAGS) $(CPPFLAGS) $(PROJECT_CFLAGS) $(CFLAGS) $(LTO) -MMD -MP -c "$<" -o "$@"
+$(BUILD_DIR)/gba-rgb-test.elf: $(BUILD_DIR)/am/test/gba-rgb.o $(CORE_LIBRARY) $(AM_LIBRARY) $(BOOT_OBJECT) $(LINK_SCRIPT) $(RUNTIME_READY)
+	$(CC) $(PLATFORM_CFLAGS) $(CFLAGS) $(LTO) $(LDFLAGS) $(PLATFORM_LDFLAGS) -o "$@" \
+		$(BOOT_OBJECT) $(BUILD_DIR)/am/test/gba-rgb.o \
+		-Wl,--start-group $(CORE_LIBRARY) $(AM_LIBRARY) $(PLATFORM_LIBS) -Wl,--end-group
+
+.PHONY: test-gba-rgb
+test-gba-rgb: $(BUILD_DIR)/gba-rgb-test.elf $(SPIKE_PLUGIN)
+	timeout 60 $(SPIKE_COMMAND) --device=am_protosoc,0 "$<"
+
+-include $(BUILD_DIR)/am/test/gba-rgb.d
+
+$(BUILD_DIR)/am/test/gba-next.o: am/test/gba-next.c Makefile $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config | $(RUNTIME_READY)
+	@mkdir -p "$(@D)"
+	$(CC) $(PROJECT_CPPFLAGS) $(CPPFLAGS) $(PROJECT_CFLAGS) $(CFLAGS) $(LTO) -MMD -MP -c "$<" -o "$@"
+$(BUILD_DIR)/gba-next-test.elf: $(BUILD_DIR)/am/test/gba-next.o $(GBN_LIBRARY) $(CORE_LIBRARY) $(AM_LIBRARY) $(BOOT_OBJECT) $(LINK_SCRIPT) $(RUNTIME_READY)
+	$(CC) $(PLATFORM_CFLAGS) $(CFLAGS) $(LTO) $(LDFLAGS) $(PLATFORM_LDFLAGS) -o "$@" \
+		$(BOOT_OBJECT) $(BUILD_DIR)/am/test/gba-next.o \
+		-Wl,--start-group $(GBN_LIBRARY) $(CORE_LIBRARY) $(AM_LIBRARY) $(PLATFORM_LIBS) -Wl,--end-group
+
+.PHONY: test-gba-next
+test-gba-next: $(BUILD_DIR)/gba-next-test.elf $(SPIKE_PLUGIN)
+	timeout 180 $(SPIKE_COMMAND) --device=am_protosoc,0 "$<"
+
+-include $(BUILD_DIR)/am/test/gba-next.d
+
+$(BUILD_DIR)/am/test/gba-next-rv32.o: am/test/gba-next-rv32.c Makefile $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config | $(RUNTIME_READY)
+	@mkdir -p "$(@D)"
+	$(CC) $(GBN_CPPFLAGS) -Iam/include $(PROJECT_CFLAGS) $(CPPFLAGS) $(CFLAGS) $(LTO) -MMD -MP -c "$<" -o "$@"
+
+$(BUILD_DIR)/gba-next-rv32-test.elf: $(BUILD_DIR)/am/test/gba-next-rv32.o $(GBN_LIBRARY) $(AM_LIBRARY) $(BOOT_OBJECT) $(LINK_SCRIPT) $(RUNTIME_READY)
+	$(CC) $(PROJECT_CFLAGS) $(CFLAGS) $(LTO) $(PLATFORM_LDFLAGS) $(LDFLAGS) -o "$@" \
+		$(BOOT_OBJECT) $(BUILD_DIR)/am/test/gba-next-rv32.o \
+		-Wl,--start-group $(GBN_LIBRARY) $(AM_LIBRARY) $(PLATFORM_LIBS) -Wl,--end-group
+
+.PHONY: test-gba-next-rv32
+test-gba-next-rv32: $(BUILD_DIR)/gba-next-rv32-test.elf $(SPIKE_PLUGIN)
+	timeout 300 $(SPIKE_COMMAND) --device=am_protosoc,0 "$<"
+
+-include $(BUILD_DIR)/am/test/gba-next-rv32.d
+
+$(BUILD_DIR)/am/test/gba-next-ppu.o: am/test/gba-next-ppu.c Makefile $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config | $(RUNTIME_READY)
+	@mkdir -p "$(@D)"
+	$(CC) $(PROJECT_CPPFLAGS) $(CPPFLAGS) $(PROJECT_CFLAGS) $(CFLAGS) $(LTO) -MMD -MP -c "$<" -o "$@"
+$(BUILD_DIR)/gba-next-ppu-test.elf: $(BUILD_DIR)/am/test/gba-next-ppu.o $(GBN_LIBRARY) $(CORE_LIBRARY) $(AM_LIBRARY) $(BOOT_OBJECT) $(LINK_SCRIPT) $(RUNTIME_READY)
+	$(CC) $(PLATFORM_CFLAGS) $(CFLAGS) $(LTO) $(LDFLAGS) $(PLATFORM_LDFLAGS) -o "$@" \
+		$(BOOT_OBJECT) $(BUILD_DIR)/am/test/gba-next-ppu.o \
+		-Wl,--start-group $(GBN_LIBRARY) $(CORE_LIBRARY) $(AM_LIBRARY) $(PLATFORM_LIBS) -Wl,--end-group
+
+.PHONY: test-gba-next-ppu
+test-gba-next-ppu: $(BUILD_DIR)/gba-next-ppu-test.elf $(SPIKE_PLUGIN)
+	timeout 180 $(SPIKE_COMMAND) --device=am_protosoc,0 "$<"
+
+-include $(BUILD_DIR)/am/test/gba-next-ppu.d
+
 $(BUILD_DIR)/am/test/media.o: Makefile $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config | $(RUNTIME_READY)
 $(BUILD_DIR)/media-test.elf: $(BUILD_DIR)/am/test/media.o $(AM_LIBRARY) $(BOOT_OBJECT) $(LINK_SCRIPT) $(RUNTIME_READY)
 	$(CC) $(PLATFORM_CFLAGS) $(CFLAGS) $(LTO) $(LDFLAGS) $(PLATFORM_LDFLAGS) -o "$@" \

@@ -150,6 +150,9 @@ uint32_t GBALoad32(struct ARMCore* cpu, uint32_t address, int* cycleCounter);
 uint32_t GBALoad16(struct ARMCore* cpu, uint32_t address, int* cycleCounter);
 uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter);
 
+/* Also identifies the standard mapping callback for guarded native blocks. */
+void GBASetActiveRegion(struct ARMCore* cpu, uint32_t address);
+
 uint32_t GBALoadBad(struct ARMCore* cpu);
 
 void GBAStore32(struct ARMCore* cpu, uint32_t address, int32_t value, int* cycleCounter);

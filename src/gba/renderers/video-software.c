@@ -50,6 +50,32 @@ static void _updateFlags(struct GBAVideoSoftwareRenderer* renderer, struct GBAVi
 static void _breakWindow(struct GBAVideoSoftwareRenderer* softwareRenderer, struct WindowN* win);
 static void _breakWindowInner(struct GBAVideoSoftwareRenderer* softwareRenderer, struct WindowN* win);
 
+static uint32_t _rgbColor(mColor color) {
+#ifdef COLOR_16_BIT
+	return mColorConvert(color, mCOLOR_NATIVE, mCOLOR_RGB8);
+#else
+	return ((color & 0xFF) << 16) | (color & 0xFF00) | ((color >> 16) & 0xFF);
+#endif
+}
+
+static void _updateRGBRow(struct GBAVideoSoftwareRenderer* renderer, unsigned y) {
+	if (!renderer->rgbBuffer) return;
+	const mColor* source = renderer->outputBuffer + renderer->outputBufferStride * y;
+	uint32_t* destination = renderer->rgbBuffer + renderer->rgbBufferStride * y;
+	for (unsigned x = 0; x < GBA_VIDEO_HORIZONTAL_PIXELS; ++x) destination[x] = _rgbColor(source[x]);
+}
+
+bool GBAVideoSoftwareRendererSetRGBBuffer(struct GBAVideoSoftwareRenderer* renderer,
+                                         uint32_t* buffer, size_t stride) {
+	if (buffer && (!renderer->outputBuffer || stride < GBA_VIDEO_HORIZONTAL_PIXELS)) return false;
+	renderer->rgbBuffer = buffer;
+	renderer->rgbBufferStride = stride;
+	if (buffer) {
+		for (unsigned y = 0; y < GBA_VIDEO_VERTICAL_PIXELS; ++y) _updateRGBRow(renderer, y);
+	}
+	return true;
+}
+
 void GBAVideoSoftwareRendererCreate(struct GBAVideoSoftwareRenderer* renderer) {
 	memset(renderer, 0, sizeof(*renderer));
 	renderer->d.init = GBAVideoSoftwareRendererInit;
@@ -102,6 +128,7 @@ static void GBAVideoSoftwareRendererInit(struct GBAVideoRenderer* renderer) {
 		for (x = 0; x < GBA_VIDEO_HORIZONTAL_PIXELS; ++x) {
 			row[x] = M_COLOR_WHITE;
 		}
+		_updateRGBRow(softwareRenderer, y);
 	}
 }
 
@@ -616,6 +643,7 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 		for (x = 0; x < GBA_VIDEO_HORIZONTAL_PIXELS; ++x) {
 			row[x] = M_COLOR_WHITE;
 		}
+		_updateRGBRow(softwareRenderer, y);
 		return;
 	}
 
@@ -717,6 +745,14 @@ static void GBAVideoSoftwareRendererDrawScanline(struct GBAVideoRenderer* render
 			row[x + 3] |= softwareRenderer->row[x + 2] & M_COLOR_GREEN;
 
 		}
+		_updateRGBRow(softwareRenderer, y);
+	} else if (softwareRenderer->rgbBuffer) {
+		uint32_t* rgb = softwareRenderer->rgbBuffer + softwareRenderer->rgbBufferStride * y;
+		for (x = 0; x < GBA_VIDEO_HORIZONTAL_PIXELS; ++x) {
+			mColor color = softwareRenderer->row[x];
+			row[x] = color;
+			rgb[x] = _rgbColor(color);
+		}
 	} else {
 #ifdef COLOR_16_BIT
 		for (x = 0; x < GBA_VIDEO_HORIZONTAL_PIXELS; x += 4) {
@@ -785,6 +821,7 @@ static void GBAVideoSoftwareRendererPutPixels(struct GBAVideoRenderer* renderer,
 	unsigned i;
 	for (i = 0; i < GBA_VIDEO_VERTICAL_PIXELS; ++i) {
 		memmove(&softwareRenderer->outputBuffer[softwareRenderer->outputBufferStride * i], &colorPixels[stride * i], GBA_VIDEO_HORIZONTAL_PIXELS * BYTES_PER_PIXEL);
+		_updateRGBRow(softwareRenderer, i);
 	}
 }
 

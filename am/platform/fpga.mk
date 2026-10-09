@@ -9,12 +9,6 @@ FRAMES ?= 120
 WARMUP ?= 30
 include am/platform/rv32.mk
 
-PROFILE ?= 0
-ifeq ($(PROFILE),1)
-PROJECT_CPPFLAGS += -DAM_PROFILE_SAMPLING
-AM_SOURCES += am/src/protosoc/profile.c
-endif
-
 ifneq ($(HEADLESS):$(AUDIO):$(BENCHMARK),1:0:1)
 $(error PLATFORM=fpga requires HEADLESS=1 AUDIO=0 BENCHMARK=1)
 endif

@@ -1,13 +1,25 @@
 /* Copyright (c) 2013-2026 Jeffrey Pfau
  * SPDX-License-Identifier: MPL-2.0 */
 #include <am.h>
+#ifdef AM_BENCH_COUNTERS
+#include <am-counters.h>
+#endif
+#ifdef AM_PERF_COUNTERS
+#include <am-perf.h>
+#endif
 #ifdef AM_PROFILE_SAMPLING
 #include <am-profile.h>
+#endif
+#if defined(MGBA_RV32) && (defined(AM_PROFILE_SAMPLING) || defined(MGBA_RV32_STATS))
+#include <mgba/internal/arm/rv32.h>
 #endif
 
 #include <mgba/core/core.h>
 #include <mgba/core/log.h>
 #include <mgba/core/version.h>
+#ifdef MGBA_AM_SCANLINE_RGB
+#include <mgba/gba/core.h>
+#endif
 #include <mgba/internal/gba/input.h>
 #include <mgba-util/audio-buffer.h>
 #ifndef AM_BAREMETAL
@@ -37,6 +49,7 @@ struct player {
 	struct mAudioResampler resampler;
 #endif
 	bool audio_ready;
+	bool rgb_ready;
 };
 
 #ifdef AM_BAREMETAL
@@ -188,6 +201,7 @@ static bool copy_video(struct player* player, unsigned* width, unsigned* height)
 		fprintf(stderr, "Invalid core video dimensions.\n");
 		return false;
 	}
+	if (player->rgb_ready) return true;
 #if defined(__riscv_vector) && !defined(COLOR_16_BIT)
 	copy_video_rvv(player->video, player->rgb, player->stride, *width, *height);
 #else
@@ -208,6 +222,17 @@ static bool copy_video(struct player* player, unsigned* width, unsigned* height)
 #endif
 	return true;
 }
+
+#if defined(AM_PROFILE_SAMPLING) && defined(MGBA_RV32)
+static bool resolve_generated(uintptr_t pc, struct am_profile_location* location, void* cpu) {
+	struct RV32CodeLocation native;
+	if (!RV32ResolveCode(cpu, pc, &native)) return false;
+	*location = (struct am_profile_location) {
+		.kind = native.kind, .address = native.address, .offset = native.offset,
+	};
+	return true;
+}
+#endif
 
 static int run(struct mCore* core, bool headless, bool audio, unsigned frame_limit,
                bool benchmark, unsigned warmup) {
@@ -257,24 +282,53 @@ static int run(struct mCore* core, bool headless, bool audio, unsigned frame_lim
 		core->rtc.value = 946684800; /* 2000-01-01 UTC. */
 	}
 	core->reset(core);
+#ifdef MGBA_AM_SCANLINE_RGB
+	if (core->platform(core) == mPLATFORM_GBA) {
+		player->rgb_ready = GBACoreSetVideoRGBBuffer(core, player->rgb, player->stride);
+	}
+#endif
 	unsigned frames = 0, warmed = 0, width = 0, height = 0;
 	uint64_t deadline = am_uptime_us(), remainder = 0;
 	uint64_t measured_start = 0, elapsed = 0;
+#ifdef AM_BENCH_COUNTERS
+	uint64_t measured_cycles = 0, measured_retired = 0;
+#endif
 	if (benchmark) {
 		core->setKeys(core, 0);
 		printf("Benchmark start: warmup=%u; frames=%u; software rendering; no output; keys=0\n", warmup, frame_limit);
 		fflush(NULL);
 
+#ifdef AM_PERF_COUNTERS
+		if (!am_perf_prepare()) {
+			fprintf(stderr, "Diagnostic PMU is unavailable or has a different event map.\n");
+			result = 1;
+			goto cleanup;
+		}
+#endif
+
 #ifdef AM_PROFILE_SAMPLING
+#ifdef MGBA_RV32
+		if (core->platform(core) == mPLATFORM_GBA) am_profile_set_resolver(resolve_generated, core->cpu);
+#endif
 		am_profile_prepare();
 #endif
 	}
 	result = 0;
 	while ((benchmark || poll_input(player)) && (warmed < warmup || !frame_limit || frames < frame_limit)) {
 		if (benchmark && warmed == warmup && !frames) {
+#ifdef MGBA_RV32_STATS
+			RV32StatsReset();
+#endif
 			measured_start = am_uptime_us();
+#ifdef AM_BENCH_COUNTERS
+			measured_cycles = am_counter_cycles();
+			measured_retired = am_counter_retired();
+#endif
 #ifdef AM_PROFILE_SAMPLING
 			am_profile_start();
+#endif
+#ifdef AM_PERF_COUNTERS
+			am_perf_start();
 #endif
 		}
 		core->runFrame(core);
@@ -305,9 +359,18 @@ static int run(struct mCore* core, bool headless, bool audio, unsigned frame_lim
 		}
 	}
 	if (benchmark) {
+#ifdef AM_PERF_COUNTERS
+		am_perf_stop();
+#endif
 #ifdef AM_PROFILE_SAMPLING
 		am_profile_stop();
 #endif
+		if (warmed == warmup) {
+#ifdef AM_BENCH_COUNTERS
+			measured_retired = am_counter_retired() - measured_retired;
+			measured_cycles = am_counter_cycles() - measured_cycles;
+#endif
+		}
 		elapsed = am_uptime_us() - measured_start;
 	}
 	if (player->crashed) {
@@ -331,10 +394,27 @@ static int run(struct mCore* core, bool headless, bool audio, unsigned frame_lim
 			uint64_t fps_milli = (uint64_t) frames * 1000000000 / elapsed;
 			printf("Benchmark: warmup=%u; frames=%u; elapsed_us=%" PRIu64 "; FPS=%" PRIu64 ".%03" PRIu64 "\n",
 			       warmup, frames, elapsed, fps_milli / 1000, fps_milli % 1000);
+#ifdef AM_BENCH_COUNTERS
+			printf("Counters: cycles=%" PRIu64 "; instret=%" PRIu64 "; sampling=%u\n",
+			       measured_cycles, measured_retired,
+#ifdef AM_PROFILE_SAMPLING
+			       1u
+#else
+			       0u
+#endif
+			);
+#endif
 		}
 	}
 #ifdef AM_PROFILE_SAMPLING
 	if (benchmark) am_profile_report();
+#endif
+#ifdef MGBA_RV32_STATS
+	if (benchmark) RV32StatsReport();
+#endif
+#ifdef AM_PERF_COUNTERS
+	if (benchmark && !result && !am_perf_report()) result = 1;
+cleanup:
 #endif
 	core->clearCoreCallbacks(core);
 #ifndef AM_BAREMETAL
@@ -342,6 +422,10 @@ static int run(struct mCore* core, bool headless, bool audio, unsigned frame_lim
 #endif
 	mAudioBufferDeinit(&player->audio);
 done:
+	/* The core outlives this frontend's buffers. */
+#ifdef MGBA_AM_SCANLINE_RGB
+	if (player->rgb_ready) GBACoreSetVideoRGBBuffer(core, NULL, 0);
+#endif
 	am_shutdown();
 	free(player->rgb);
 	free(player->video);

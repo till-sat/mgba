@@ -12,6 +12,11 @@ CXX_GUARD_START
 
 struct mCore;
 struct mCore* GBACoreCreate(void);
+/* Attach a persistent 240x160 0x00RRGGBB mirror to the active software renderer.
+ * Native getPixels/putPixels keep their format. Call after reset; a NULL buffer
+ * detaches. Returns false for other renderers or a stride smaller than 240.
+ * The caller owns the storage, which must not overlap the native video buffer. */
+bool GBACoreSetVideoRGBBuffer(struct mCore*, uint32_t* buffer, size_t stride);
 #ifndef MINIMAL_CORE
 struct mCore* GBAVideoLogPlayerCreate(void);
 #endif

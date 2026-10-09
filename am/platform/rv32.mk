@@ -16,7 +16,11 @@ NEWLIB_ROOT ?= $(abspath build/newlib)
 NEWLIB_PREFIX := $(NEWLIB_ROOT)/install/riscv64-unknown-elf
 RUNTIME_READY := $(NEWLIB_ROOT)/.ready
 RISCV_ISA ?= rv32im_zicsr_zifencei_zicbom
+# Ordinary C/LTO can stay scalar while explicit kernels use the runtime ISA.
+RISCV_C_ISA ?= $(RISCV_ISA)
 RISCV_ABI ?= ilp32
+# A scalar libc may be shared by scalar/vector application comparisons.
+NEWLIB_ISA ?= $(RISCV_ISA)
 HEADLESS ?= 0
 AUDIO ?= 1
 FRAMES ?= $(if $(filter 1,$(HEADLESS)),120,0)
@@ -26,7 +30,7 @@ WARMUP ?= 30
 ROM_EMBED_FLAGS ?=
 ROM_EMBED_CPPFLAGS ?=
 
-PLATFORM_CFLAGS := -march=$(RISCV_ISA) -mabi=$(RISCV_ABI) -mstrict-align -mcmodel=medany \
+PLATFORM_CFLAGS := -march=$(RISCV_C_ISA) -mabi=$(RISCV_ABI) -mstrict-align -mcmodel=medany \
                    -msmall-data-limit=0 -ffreestanding -ffunction-sections -fdata-sections
 ifneq ($(findstring zve,$(RISCV_ISA)),)
 PLATFORM_CFLAGS += -DAM_RVV
@@ -47,6 +51,23 @@ PLATFORM_LIBS := -L$(NEWLIB_PREFIX)/lib -lc -lgcc
 CORE_SOURCES := $(filter-out src/core/directories.c src/util/vfs/vfs-dirent.c src/util/vfs/vfs-fd.c src/util/audio-resampler.c src/util/interpolator.c,$(CORE_SOURCES))
 FRONTEND_SOURCES := src/platform/am/embedded.c src/platform/am/player.c
 AM_SOURCES ?= am/src/protosoc/io.c am/src/riscv/runtime.c
+PROFILE ?= 0
+PERF_COUNTERS ?= 0
+ifeq ($(PERF_COUNTERS),1)
+ifneq ($(PLATFORM):$(BENCHMARK):$(PROFILE),fpga:1:0)
+$(error PERF_COUNTERS=1 requires PLATFORM=fpga BENCHMARK=1 PROFILE=0 and the diagnostic PMU bitstream)
+endif
+PROJECT_CPPFLAGS += -DAM_PERF_COUNTERS
+endif
+ifneq ($(filter $(PLATFORM),fpga spike spike_zve32x verilator),)
+PROJECT_CPPFLAGS += -DAM_BENCH_COUNTERS
+ifeq ($(PROFILE),1)
+PROJECT_CPPFLAGS += -DAM_PROFILE_SAMPLING
+AM_SOURCES += am/src/protosoc/profile.c
+endif
+else ifeq ($(PROFILE),1)
+$(error PROFILE=1 requires a proto-soc platform: fpga, spike, spike_zve32x or verilator)
+endif
 ifneq ($(findstring -DAM_SIM_MEDIA,$(AM_RUNNER_FLAGS)),)
 AM_SOURCES += am/src/riscv/sim-media.c
 endif
@@ -54,11 +75,24 @@ BOOT_SOURCE ?= am/src/riscv/start.S
 BOOT_OBJECT := $(BUILD_DIR)/am/src/riscv/start.o
 ROM_OBJECT := $(BUILD_DIR)/rom.o
 
+$(BUILD_DIR)/am/bench/gba-next-ppu.o: am/bench/gba-next-ppu.c Makefile $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config | $(RUNTIME_READY)
+	@mkdir -p "$(@D)"
+	$(CC) $(GBN_CPPFLAGS) -Isrc -Iam/include $(PROJECT_CFLAGS) $(CPPFLAGS) $(CFLAGS) $(LTO) -MMD -MP -c "$<" -o "$@"
+
+$(BUILD_DIR)/gba-next-ppu-bench.elf: $(BUILD_DIR)/am/bench/gba-next-ppu.o $(GBN_LIBRARY) $(AM_LIBRARY) $(BOOT_OBJECT) $(LINK_SCRIPT) $(RUNTIME_READY)
+	$(CC) $(PROJECT_CFLAGS) $(CFLAGS) $(LTO) $(PLATFORM_LDFLAGS) $(LDFLAGS) -o "$@" \
+		$(BOOT_OBJECT) $(BUILD_DIR)/am/bench/gba-next-ppu.o \
+		-Wl,--start-group $(GBN_LIBRARY) $(AM_LIBRARY) $(PLATFORM_LIBS) -Wl,--end-group
+
+.PHONY: gba-next-ppu-bench
+gba-next-ppu-bench: $(BUILD_DIR)/gba-next-ppu-bench.elf
+-include $(BUILD_DIR)/am/bench/gba-next-ppu.d
+
 .PHONY: runtime check-rv32 test-runtime test-media
 runtime: $(RUNTIME_READY)
 $(RUNTIME_READY): am/tools/build_newlib.py FORCE
 	$(PYTHON) am/tools/build_newlib.py --root "$(NEWLIB_ROOT)" --cross "$(CROSS)" \
-		--march "$(RISCV_ISA)" --mabi "$(RISCV_ABI)"
+		--march "$(NEWLIB_ISA)" --mabi "$(RISCV_ABI)"
 
 $(BOOT_OBJECT): $(BOOT_SOURCE) $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config | $(RUNTIME_READY)
 	@mkdir -p "$(@D)"

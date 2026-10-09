@@ -84,6 +84,8 @@ struct GBAVideoSoftwareRenderer {
 
 	mColor* outputBuffer;
 	int outputBufferStride;
+	uint32_t* rgbBuffer;
+	size_t rgbBufferStride;
 
 	uint32_t* temporaryBuffer;
 
@@ -154,6 +156,9 @@ struct GBAVideoSoftwareRenderer {
 };
 
 void GBAVideoSoftwareRendererCreate(struct GBAVideoSoftwareRenderer* renderer);
+/* Optional 0x00RRGGBB mirror, updated with the native output. Storage must
+ * remain valid and must not overlap the native output buffer. NULL detaches. */
+bool GBAVideoSoftwareRendererSetRGBBuffer(struct GBAVideoSoftwareRenderer*, uint32_t*, size_t stride);
 
 CXX_GUARD_START
 

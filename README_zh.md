@@ -18,6 +18,22 @@
 
 英文版本见 [README.md](README.md)。
 
+## rv32 分支：独立新内核的窗口入口
+
+```sh
+make -j6 PLATFORM=spike GBN_RV32=1 run-gba-next
+```
+
+默认运行 `roms/dragonball.gba`，`ROM=go` 可换游戏；也支持
+`PLATFORM=spike_zve32x`。此入口运行独立新内核、RV32 原生后端和最新 PPU，
+显示窗口并接收键盘、播放声音。方向键移动，Z/X 为 A/B，A/S 为 L/R，
+Enter 为 Start，Backspace 为 Select，Esc 或关闭窗口退出。
+`GBN_PLAYER_AUDIO=0` 关闭声音输出；`GBN_PLAYER_FRAMES=N` 限制完整帧数，
+默认 0 持续运行。当前存档仅在内存中，退出不保存。
+
+`run-gba-next-bench` 是无窗口的固定工作量测试入口；下文的 `run` 仍运行
+原来的 mGBA 播放器。新内核的范围和验证见 [doc/gba-next.md](doc/gba-next.md)。
+
 ## 最小运行命令
 
 每条命令都会在需要时构建播放器，然后启动对应的交互路径。Native 和 Spike
@@ -69,6 +85,13 @@ make PLATFORM=ysyxsoc \
 | `PLATFORM` | 构建目标：`native`、`spike` 或 `ysyxsoc` | `native` |
 | `ROM` | `roms/` 下的游戏名，裸机平台会将 ROM 嵌入程序；省略扩展名时默认补 `.gba` | Native / Spike：`dragonball`；ysyxsoc：`cinema/gba/obj/2d-wrap/test.gba` |
 | `BUILD_DIR` | 构建输出目录 | `build` 或平台专用目录 |
+| `RV32_RUNNER` | RV32 平台上的实验性 ARM/Thumb 基本块翻译器 | `0` |
+
+翻译器的实现范围、验证命令和指令数对照见 [doc/rv32-runner.md](doc/rv32-runner.md)。
+
+proto-soc 平台（`fpga`、`spike`、`spike_zve32x`、`verilator`）的 benchmark
+还会报告预热后的周期数和退休指令数。`PROFILE=1` 开启 PC 采样，能识别动态生成的
+RV32 基本块；采集和报告命令见上述文档。Spike 的时间和 IPC 仅是功能仿真值。
 
 ### Native
 

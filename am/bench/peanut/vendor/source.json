@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/YouMakeTech/Pico-GB",
+  "revision": "68dbc8707cb17973afc6860e542c474992a61eee",
+  "files": {
+    "peanut_gb.h": {
+      "source": "https://raw.githubusercontent.com/YouMakeTech/Pico-GB/68dbc8707cb17973afc6860e542c474992a61eee/inc/peanut_gb.h",
+      "sha256": "36b51903f3ed31f474da22fb70149224ab022e1bd185f75949bb68335ac274b4"
+    },
+    "hedley.h": {
+      "source": "https://raw.githubusercontent.com/YouMakeTech/Pico-GB/68dbc8707cb17973afc6860e542c474992a61eee/inc/hedley.h",
+      "sha256": "bd34d1b49da7968fe03e412d0f13b0505d248c4294bea57c1974fc93146fabf4"
+    }
+  }
+}
