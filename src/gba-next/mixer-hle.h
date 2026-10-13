@@ -184,4 +184,113 @@ static __attribute__((noinline)) uint32_t mixer_hle(struct Gbn* m) {
 	else { m->cpu.pipe[0] = fetch(m, m->cpu.pc, 4); m->cpu.pipe[1] = fetch(m, m->cpu.pc + 4, 4); }
 	return retired;
 }
+#if GBN_RV32_FAST & 524288
+/* The same mixer's fixed-frequency loop (one source byte per sample, no
+ * interpolation):
+ *   head: LDR r6,[r5]; LDR r7,[r5,#0x630]
+ *   head + 8: LDRSB r0,[r3],#1; MUL/BIC/ADD ROR into r6 and r7; ADDS r5;
+ *             BLO head + 8; STR r7; STR r6 post-indexed; SUBS r8,#4; BGT head
+ * run like mixer_hle, sample by sample. */
+static const uint32_t mixer_fix_ops[15] = {
+    0xe5956000u, 0xe5957630u, 0xe0d300d1u, 0xe001009au, 0xe3c118ffu, 0xe0816466u, 0xe001009bu,
+    0xe3c118ffu, 0xe0817467u, 0xe2955101u, 0x3afffff6u, 0xe5857630u, 0xe4856004u, 0xe2588004u, 0xcafffff0u
+};
+static bool mixer_fix_at(const struct Gbn* m, uint32_t pc) {
+	if (pc >> 24 != 3 || (pc & 3) || !m->iwram) return false;
+	uint32_t offset = pc & (GBN_IWRAM_SIZE - 1);
+	if (offset > GBN_IWRAM_SIZE - sizeof(mixer_fix_ops)) return false;
+	return !memcmp(m->iwram + offset, mixer_fix_ops, sizeof(mixer_fix_ops));
+}
+
+static __attribute__((noinline)) uint32_t mixer_fix_hle(struct Gbn* m) {
+	uint32_t pc = m->cpu.pc, head;
+	if (m->cpu.pipe[0] == mixer_fix_ops[0]) head = pc;
+	else if (m->cpu.pipe[0] == mixer_fix_ops[2]) head = pc - 8;
+	else return 0;
+	if (m->code_wait || m->code_word_wait || !m->rom || !mixer_fix_at(m, head)) return 0;
+	if (m->cpu.pipe[1] != (pc == head ? mixer_fix_ops[1] : mixer_fix_ops[3])) return 0;
+	uint32_t* r = m->cpu.r;
+	uint32_t r5 = r[5], r8 = r[8], src = r[3];
+	if ((r[10] | r[11]) & 0xff00ffffu) return 0;
+	if ((r5 & 3) || (r5 >> 24 & 63) != 3) return 0;
+	unsigned k = r5 >> 30, region = src >> 24;
+	if ((pc == head && k) || region < 8 || region > 13) return 0;
+	uint32_t base = r5 & 0x3fffffffu, code = head & (GBN_IWRAM_SIZE - 1);
+	uint32_t words = (int32_t) r8 > 0 ? ((r8 + 3) >> 2) + 1 : 1;
+	for (unsigned side = 0; side < 2; ++side) {
+		uint32_t from = (base + side * 0x630) & (GBN_IWRAM_SIZE - 1), to = from + 4 * words;
+		if ((from < code + sizeof(mixer_fix_ops) && code < to) ||
+		    (to > GBN_IWRAM_SIZE && code < to - GBN_IWRAM_SIZE)) return 0;
+	}
+	uint32_t deadline = m->now + GBN_MAX_DELAY;
+	int next = gbn_cpu_event(m);
+	if (next >= 0) deadline = m->events[next].when;
+	uint32_t q = src & 0x01ffffffu, q0 = q, limit = (q & ~0xffffffu) + 0x1000000u;
+	if (limit > m->rom_size) limit = m->rom_size;
+	const uint8_t* rom = m->rom;
+	uint8_t* iwram = m->iwram;
+	uint32_t load_cost = m->rom_nonseq[(region - 8) >> 1] + 2u;
+	int32_t vr = (int32_t) (r[10] >> 16), vl = (int32_t) (r[11] >> 16);
+	uint32_t now = m->now, retired = 0, word_r = 0, word_l = 0, add_r = 0, add_l = 0;
+	uint32_t old8 = r8, last = r[0];
+	bool at_head = pc == head, ended = false, any = false;
+	if (!at_head) {
+		unsigned sh = 8 * k;
+		word_r = sh ? r[6] << sh | r[6] >> (32 - sh) : r[6];
+		word_l = sh ? r[7] << sh | r[7] >> (32 - sh) : r[7];
+	}
+	while ((int32_t) (now - deadline) < 0 && q < limit) {
+		uint32_t cost = 12 + load_cost, count = 9;
+		if (at_head) {
+			uint32_t o = base & (GBN_IWRAM_SIZE - 1);
+			word_r = *(const uint32_t*) __builtin_assume_aligned(iwram + o, 4);
+			word_l = *(const uint32_t*) __builtin_assume_aligned(iwram + ((o + 0x630) & (GBN_IWRAM_SIZE - 1)), 4);
+			cost += 6; count += 2;
+		}
+		int32_t v = (int8_t) rom[q++];
+		add_r |= (uint32_t) (uint8_t) (vr * v >> 8) << 8 * k;
+		add_l |= (uint32_t) (uint8_t) (vl * v >> 8) << 8 * k;
+		last = (uint32_t) v; at_head = false; any = true;
+		if (++k == 4) {
+			uint32_t o = base & (GBN_IWRAM_SIZE - 1);
+			word_r = mixer_bytes(word_r, add_r); word_l = mixer_bytes(word_l, add_l);
+			*(uint32_t*) __builtin_assume_aligned(iwram + ((o + 0x630) & (GBN_IWRAM_SIZE - 1)), 4) = word_l;
+			*(uint32_t*) __builtin_assume_aligned(iwram + o, 4) = word_r;
+			add_r = add_l = 0; k = 0;
+			base += 4; old8 = r8; r8 -= 4;
+			bool more = (int32_t) r8 > 0;
+			cost += 4 + (more ? 2 : 0); count += 4;
+			at_head = true;
+			if (!more) ended = true;
+		}
+		now += cost; retired += count;
+		if (ended) break;
+	}
+	if (!any) return 0;
+	uint32_t flags = m->cpu.cpsr & 0x0fffffffu;
+	if (k) {
+		unsigned sh = 8 * k;
+		uint32_t a = mixer_bytes(word_r, add_r), b = mixer_bytes(word_l, add_l);
+		r[6] = a >> sh | a << (32 - sh); r[7] = b >> sh | b << (32 - sh);
+		r[5] = base | k << 30;
+		flags |= (k >= 2 ? 0x80000000u : 0) | (k == 2 ? 0x10000000u : 0);
+		m->cpu.shifter_carry = 0;
+		m->cpu.pc = head + 8;
+	} else {
+		r[6] = word_r; r[7] = word_l; r[5] = base;
+		flags |= (r8 & 0x80000000u) | (r8 ? 0 : 0x40000000u) | (old8 >= 4 ? 0x20000000u : 0)
+			| (((old8 ^ 4) & (old8 ^ r8)) >> 31) << 28;
+		m->cpu.shifter_carry = 1;
+		m->cpu.pc = ended ? head + sizeof(mixer_fix_ops) : head;
+	}
+	r[0] = last; r[1] = (r[11] * last) & ~0xff0000u; r[3] = src + (q - q0); r[8] = r8;
+	m->cpu.cpsr = flags;
+	m->prefetched_pc = 0;
+	m->now = now;
+	if (m->cpu.pc == head) { m->cpu.pipe[0] = mixer_fix_ops[0]; m->cpu.pipe[1] = mixer_fix_ops[1]; }
+	else if (m->cpu.pc == head + 8) { m->cpu.pipe[0] = mixer_fix_ops[2]; m->cpu.pipe[1] = mixer_fix_ops[3]; }
+	else { m->cpu.pipe[0] = fetch(m, m->cpu.pc, 4); m->cpu.pipe[1] = fetch(m, m->cpu.pc + 4, 4); }
+	return retired;
+}
+#endif
 #undef MIXER_HEAD_BYTES

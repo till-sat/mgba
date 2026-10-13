@@ -1834,12 +1834,18 @@ static uint32_t exit_stub(struct GbnRv32*, bool ram, bool miss);
 #if GBN_RV32_FAST & 8192
 static bool mixer_head_at(const struct Gbn* m, uint32_t pc);
 #endif
+#if GBN_RV32_FAST & 524288
+static bool mixer_fix_at(const struct Gbn* m, uint32_t pc);
+#endif
 static void tail(struct Emit* e, struct GbnRv32* backend, uint32_t pc, bool fallback) {
 	struct GbnRv32Block* b = e->block;
 	bool unlinked = fallback;
 #if GBN_RV32_FAST & 8192
 	/* Every edge into the mixer loop head returns to C (mixer_hle). */
 	if (!b->thumb && mixer_head_at(backend->machine, pc)) unlinked = true;
+#if GBN_RV32_FAST & 524288
+	if (!b->thumb && mixer_fix_at(backend->machine, pc)) unlinked = true;
+#endif
 #endif
 #if GBN_RV32_FAST & 1024
 	time_flush(e);
@@ -2698,6 +2704,9 @@ restart:;
 		if (m->code_region < 8 && offset != (block->pc & m->code_mask) + width * i) break;
 #if GBN_RV32_FAST & 8192
 		if (i && !block->thumb && mixer_head_at(m, pc)) break;
+#if GBN_RV32_FAST & 524288
+		if (i && !block->thumb && mixer_fix_at(m, pc)) break;
+#endif
 #endif
 		/* Reserve one lowering, two guarded successor edges, the common
 		 * return, both stop reasons at each instruction and RAM validation. */
@@ -2878,6 +2887,10 @@ static inline __attribute__((always_inline)) unsigned execute_mode(struct GbnRv3
 	if (!thumb && m->code_region == 3) {
 		uint32_t done = mixer_hle(m);
 		if (done) return done;
+#if GBN_RV32_FAST & 524288
+		done = mixer_fix_hle(m);
+		if (done) return done;
+#endif
 	}
 #endif
 	unsigned index = block_index(m->cpu.pc), key = timing(m);
