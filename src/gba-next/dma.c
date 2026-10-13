@@ -388,6 +388,83 @@ static __attribute__((noinline)) bool dma_span(struct Gbn* m, unsigned channel) 
 #endif
 }
 
+#if (GBN_RV32_FAST & 262144) && (GBN_RV32_FAST & 1048576)
+/* The common immediate DMA in one step: no repeat or cartridge request, an
+ * incrementing destination in RAM/video memory, an incrementing or fixed
+ * source with a raw pointer, the only active channel. Same beats, time,
+ * latch and finish as dma_span + dma_finish, without the event round trips. */
+static bool dma_now_lean(struct Gbn* m) {
+	struct GbnDevices* d = m->devices;
+	int channel = d->active_dma;
+	if (channel < 0) return false;
+	struct GbnDma* c = &d->dma[channel];
+	uint16_t control = c->control;
+	if ((control & 0xba00) != 0x8000 || c->fifo || c->finishing || !c->remaining || c->remaining != c->count) return false;
+	for (int i = 0; i < 4; ++i) if (i != channel &&
+	    (d->dma[i].control & 0x8000) && (d->dma[i].remaining || d->dma[i].finishing)) return false;
+	unsigned width = control & 0x400 ? 4 : 2;
+	uint32_t source = c->next_source, dest = c->next_dest;
+	unsigned sm = source >= 0x08000000 && source < 0x0e000000 ? 0 : control >> 7 & 3, dm = control >> 5 & 3;
+	if (((source | dest) & (width - 1)) || (sm != 0 && sm != 2) || (dm != 0 && dm != 3)) return false;
+	const uint8_t* src = dma_read_pointer(m, source, width);
+	uint8_t* dst = dma_write_pointer(m, dest, width);
+	if (!src || !dst || (((uintptr_t) src | (uintptr_t) dst) & (width - 1))) return false;
+	int ss = sm == 2 ? 0 : (int) width;
+	unsigned beats = c->remaining;
+	if ((ss && beats > span_limit(m, source, width, ss)) || beats > span_limit(m, dest, width, (int) width)) return false;
+#if GBN_RV32_FAST & 2048
+	gbn_ppu_before_write(m, dest);
+#endif
+	uint32_t value = 0;
+#if GBN_RV32_FAST & 32768
+	bool video = (dest >> 24) == 6 && d->ppu.cache;
+	uint32_t changed = 0;
+#else
+	const bool video = false;
+	uint32_t changed = 0;
+#endif
+	if (width == 4) {
+		for (unsigned i = 0; i < beats; ++i) {
+			uint32_t old;
+			__builtin_memcpy(&value, __builtin_assume_aligned(src + (ptrdiff_t) i * ss, 4), 4);
+			if (video) { __builtin_memcpy(&old, __builtin_assume_aligned(dst + 4 * i, 4), 4); changed |= old ^ value; }
+			__builtin_memcpy(__builtin_assume_aligned(dst + 4 * i, 4), &value, 4);
+		}
+	} else {
+		uint16_t half = 0, old;
+		for (unsigned i = 0; i < beats; ++i) {
+			__builtin_memcpy(&half, __builtin_assume_aligned(src + (ptrdiff_t) i * ss, 2), 2);
+			if (video) { __builtin_memcpy(&old, __builtin_assume_aligned(dst + 2 * i, 2), 2); changed |= (uint32_t) (old ^ half); }
+			__builtin_memcpy(__builtin_assume_aligned(dst + 2 * i, 2), &half, 2);
+		}
+		value = (uint32_t) half * 0x10001u;
+	}
+#if GBN_RV32_FAST & 32768
+	if (changed) gbn_vram_written(d, (uint32_t) (dst - d->vram), (uint32_t) (dst - d->vram) + beats * width);
+#else
+	(void) changed;
+#endif
+	if ((dest >> 24) == 7) gbn_ppu_invalidate_oam(m);
+	unsigned elapsed = 2 + wait_cycles(m, source, width, true) + wait_cycles(m, dest, width, true);
+	unsigned first_elapsed = 2 + wait_cycles(m, source, width, false) + wait_cycles(m, dest, width, false);
+	/* First beat at the observed boundary; raw destinations release in two. */
+	m->now += first_elapsed + (beats - 1) * elapsed + 2;
+	c->when = m->now;
+	c->next_source = source + beats * (uint32_t) ss;
+	c->next_dest = dm == 3 ? c->dest : dest + beats * width;
+	c->remaining = 0; c->finishing = false; c->fifo = false;
+	c->latch = value; d->dma_bus = value; d->dma_bus_valid = true;
+	d->dma_pc = m->cpu.pc + (m->cpu.cpsr & 0x20 ? 2 : 4);
+	c->control &= ~0x8000u;
+	d->io[(0xba + channel * 12) / 2] &= ~0x8000u;
+	if (control & 0x4000) gbn_irq_at(m, (uint16_t) (0x100u << channel), m->now);
+	d->active_dma = -1;
+	d->dma_blocked = false;
+	gbn_cancel(m, GBN_EVENT_DMA);
+	return true;
+}
+#endif
+
 #if GBN_RV32_FAST & 262144
 /* Native code just started an immediate DMA, whose event comes next: run it
  * to completion now. True when native code may go on: the DMA finished,
@@ -398,6 +475,13 @@ __attribute__((used, noinline)) bool gbn_dma_now(struct Gbn* m, uint32_t deadlin
 		if (m->next_event != (int) GBN_EVENT_DMA) return false;
 		uint32_t when = m->events[GBN_EVENT_DMA].when;
 		if ((int32_t) (m->now - when) < 0) m->now = when;
+#if GBN_RV32_FAST & 1048576
+		if (!step && dma_now_lean(m)) {
+			int next = gbn_cpu_event(m);
+			return (int32_t) (m->now - deadline) < 0 &&
+				(next < 0 || (int32_t) (m->events[next].when - deadline) >= 0);
+		}
+#endif
 		if (gbn_dma_service(m) != GBN_STEP) return false;
 		if (!m->events[GBN_EVENT_DMA].active && d->active_dma < 0) {
 			int next = gbn_cpu_event(m);
