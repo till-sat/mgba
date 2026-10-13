@@ -58,6 +58,26 @@ __attribute__((naked,noinline,used)) static void dma_start_leaf(void) {
 }
 
 static void finish_count(struct Emit*,unsigned,bool);
+#if (GBN_RV32_FAST & 262144) && (GBN_RV32_FAST & 512)
+/* Private ABI, s3=link: run the DMA just started (gbn_dma_now) with every
+ * caller-saved native register preserved. NOW is converted through the
+ * frame's deadline both ways; t2 returns whether the block may go on. */
+__attribute__((naked,noinline,used)) static void dma_now_stub(void) {
+    __asm__ volatile(
+        "addi sp,sp,-64\n\tsw ra,0(sp)\n\tsw a0,4(sp)\n\tsw a1,8(sp)\n\tsw a2,12(sp)\n\tsw a3,16(sp)\n\t"
+        "sw a4,20(sp)\n\tsw a5,24(sp)\n\tsw a6,28(sp)\n\tsw a7,32(sp)\n\t"
+        "sw t3,36(sp)\n\tsw t4,40(sp)\n\tsw t5,44(sp)\n\tsw t6,48(sp)\n\t"
+        "lw a1,%[deadline]+64(sp)\n\tadd t0,s0,a1\n\tsw t0,%[now](a0)\n\t"
+        "call gbn_dma_now\n\tmv t2,a0\n\t"
+        "lw a0,4(sp)\n\tlw t0,%[now](a0)\n\tlw t1,%[deadline]+64(sp)\n\tsub s0,t0,t1\n\t"
+        "lw ra,0(sp)\n\tlw a1,8(sp)\n\tlw a2,12(sp)\n\tlw a3,16(sp)\n\t"
+        "lw a4,20(sp)\n\tlw a5,24(sp)\n\tlw a6,28(sp)\n\tlw a7,32(sp)\n\t"
+        "lw t3,36(sp)\n\tlw t4,40(sp)\n\tlw t5,44(sp)\n\tlw t6,48(sp)\n\t"
+        "addi sp,sp,64\n\tjalr zero,s3,0\n\t"
+        : : [deadline]"i"(INITIAL_DEADLINE), [now]"i"(offsetof(struct Gbn, now)));
+}
+#endif
+
 static void dma_start_emit(struct Emit* e,const struct Gbn* m,uint32_t pc,unsigned rd,unsigned rn,int adjustment) {
     constant(e,LHS,0x040000dcu);
     unsigned different=e->count;word(e,0);
@@ -75,6 +95,20 @@ static void dma_start_emit(struct Emit* e,const struct Gbn* m,uint32_t pc,unsign
     imm(e,NOW,NOW,0,1+(e->block->thumb?m->code_wait:m->code_word_wait));
 #if GBN_RV32_FAST & 1024
     time_flush(e);
+#endif
+#if (GBN_RV32_FAST & 262144) && (GBN_RV32_FAST & 512)
+    if (m->code_region >= 8) {
+        /* Fast mode, ROM code (DMA cannot rewrite it): run the DMA here and
+         * go on with the next instruction unless something became due. */
+        constant(e,TEMP,pc);store(e,TEMP,offsetof(struct Gbn,cpu.pc));
+        constant(e,WAIT,(uint32_t)(uintptr_t)dma_now_stub);word(e,WAIT<<15|WAIT<<7|0x67);
+        unsigned exit=e->count;word(e,beq(RESULT,ZERO,0));
+#if GBN_RV32_FAST & 1024
+        { unsigned flushed=e->prefix[e->block->instructions]; if(flushed)imm(e,NOW,NOW,0,-(int)flushed); }
+#endif
+        e->cold_out[e->cold_out_count][0]=e->count;e->cold_out[e->cold_out_count++][1]=e->hot_count;word(e,0);
+        e->block->code[exit]|=beq(0,0,4*(e->count-exit))&0xfe000f80u;
+    }
 #endif
     /* The new DMA deadline invalidates this frame's bound. Always exit
      * after exactly this store; the normal CPU/event dispatcher resumes. */

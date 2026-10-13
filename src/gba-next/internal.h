@@ -57,6 +57,9 @@ bool gbn_bus_writable(const struct Gbn*, uint32_t address, unsigned width);
 void gbn_dma_write(struct Gbn*, unsigned offset, uint16_t value);
 void gbn_dma_trigger(struct Gbn*, unsigned timing, uint32_t when);
 enum GbnStatus gbn_dma_service(struct Gbn*);
+#if GBN_RV32_FAST & 262144
+bool gbn_dma_now(struct Gbn*, uint32_t deadline);
+#endif
 void gbn_dma_fifo(struct Gbn*, unsigned fifo, uint32_t when);
 uint16_t gbn_timer_read(const struct Gbn*, unsigned timer, uint32_t when);
 void gbn_timer_write(struct Gbn*, unsigned timer, bool control, uint16_t value, uint16_t mask);

@@ -388,6 +388,27 @@ static __attribute__((noinline)) bool dma_span(struct Gbn* m, unsigned channel) 
 #endif
 }
 
+#if GBN_RV32_FAST & 262144
+/* Native code just started an immediate DMA, whose event comes next: run it
+ * to completion now. True when native code may go on: the DMA finished,
+ * time is still before deadline and no event became due before it. */
+__attribute__((used, noinline)) bool gbn_dma_now(struct Gbn* m, uint32_t deadline) {
+	struct GbnDevices* d = m->devices;
+	for (unsigned step = 0; step < 8; ++step) {
+		if (m->next_event != (int) GBN_EVENT_DMA) return false;
+		uint32_t when = m->events[GBN_EVENT_DMA].when;
+		if ((int32_t) (m->now - when) < 0) m->now = when;
+		if (gbn_dma_service(m) != GBN_STEP) return false;
+		if (!m->events[GBN_EVENT_DMA].active && d->active_dma < 0) {
+			int next = gbn_cpu_event(m);
+			return (int32_t) (m->now - deadline) < 0 &&
+				(next < 0 || (int32_t) (m->events[next].when - deadline) >= 0);
+		}
+	}
+	return false;
+}
+#endif
+
 enum GbnStatus gbn_dma_service(struct Gbn* m) {
 	struct GbnDevices* d = m->devices;
 	if (!d || d->active_dma < 0) return GBN_INVALID_ARGUMENT;
