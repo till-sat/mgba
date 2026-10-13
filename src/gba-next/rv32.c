@@ -64,6 +64,7 @@ struct Emit {
 #if GBN_RV32_FAST & 8
 	bool cv_dead; /* the instruction's C/V are overwritten in this block before any read */
 #endif
+
 #if GBN_RV32_FAST & 16
 	unsigned link_count, link_at[GBN_RV32_INSNS + 2]; /* exit sites that may link directly */
 	uint32_t link_pc[GBN_RV32_INSNS + 2];
@@ -1768,8 +1769,16 @@ static void indirect_tail(struct Emit* e, struct GbnRv32* backend) {
 static void far_jump(struct Emit*, uint32_t target, unsigned through, unsigned link);
 static uint32_t exit_stub(struct GbnRv32*, bool ram, bool miss);
 #endif
+#if GBN_RV32_FAST & 8192
+static bool mixer_head_at(const struct Gbn* m, uint32_t pc);
+#endif
 static void tail(struct Emit* e, struct GbnRv32* backend, uint32_t pc, bool fallback) {
 	struct GbnRv32Block* b = e->block;
+	bool unlinked = fallback;
+#if GBN_RV32_FAST & 8192
+	/* Every edge into the mixer loop head returns to C (mixer_hle). */
+	if (!b->thumb && mixer_head_at(backend->machine, pc)) unlinked = true;
+#endif
 #if GBN_RV32_FAST & 1024
 	time_flush(e);
 #endif
@@ -1778,7 +1787,7 @@ static void tail(struct Emit* e, struct GbnRv32* backend, uint32_t pc, bool fall
      * jump directly to the target's exact cap/event guards. Rebase LIMIT to
      * keep initial_cap - LIMIT + source_index equal to retired instructions. */
     uint32_t offset = pc - b->pc;
-    if (!fallback && !b->thumb && offset && !(offset & 3)
+    if (!unlinked && !b->thumb && offset && !(offset & 3)
             && offset / 4 < e->source_count) {
         unsigned target = offset / 4;
         imm(e, LIMIT, LIMIT, 0, (int) target - (int) b->instructions);
@@ -1801,7 +1810,7 @@ static void tail(struct Emit* e, struct GbnRv32* backend, uint32_t pc, bool fall
     }
 	imm(e, LIMIT, LIMIT, 0, -(int) b->instructions);
 	unsigned misses[10], n = 0;
-	if (!fallback && (pc >> 24) == (b->pc >> 24)) {
+	if (!unlinked && (pc >> 24) == (b->pc >> 24)) {
 		misses[n++] = e->count; word(e, beq(LIMIT, ZERO, 0));
 		misses[n++] = e->count; word(e, beq(NOW, ZERO, 0) | 5u << 12);
 		if (pc == b->pc) {
@@ -2312,6 +2321,9 @@ static bool arm_pure(uint32_t code) {
 
 #include "mixer-native-emitter.h"
 #include "mixer-packet-emitter.h"
+#if GBN_RV32_FAST & 8192
+#include "mixer-hle.h"
+#endif
 
 /* A short fast body has no observable instruction boundary inside it. The
  * original body remains native and exact when cap/time proof fails. All
@@ -2525,6 +2537,9 @@ restart:;
 		unsigned size = m->code_region >= 8 ? m->rom_size : m->code_region == 2 ? GBN_EWRAM_SIZE : GBN_IWRAM_SIZE;
 		if (pc >> 24 != m->code_region || offset >= size || size - offset < width) break;
 		if (m->code_region < 8 && offset != (block->pc & m->code_mask) + width * i) break;
+#if GBN_RV32_FAST & 8192
+		if (i && !block->thumb && mixer_head_at(m, pc)) break;
+#endif
 		/* Reserve one lowering, two guarded successor edges, the common
 		 * return, both stop reasons at each instruction and RAM validation. */
         bool exact = e.count + COLD_WORDS + 340 + 64 * edge_count
@@ -2697,6 +2712,12 @@ static inline __attribute__((always_inline)) unsigned execute_mode(struct GbnRv3
 	bool rom = m->code_region >= 8 && m->code_region <= 13;
 	const uint8_t* source = rom ? m->rom : m->code_region == 2 ? m->ewram : m->code_region == 3 ? m->iwram : NULL;
 	if (!source || m->code != source || m->cpu.pc >> 24 != m->code_region) return 0;
+#if GBN_RV32_FAST & 8192
+	if (!thumb && m->code_region == 3) {
+		uint32_t done = mixer_hle(m);
+		if (done) return done;
+	}
+#endif
 	unsigned index = block_index(m->cpu.pc), key = timing(m);
 	struct GbnRv32Block* b = backend->lookup[index];
 	bool hit = matches(b, m, key);
