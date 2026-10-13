@@ -439,7 +439,11 @@ $(TARGET): $(FRONTEND_OBJECTS) $(CORE_LIBRARY) $(AM_LIBRARY) $(BOOT_OBJECT) $(RO
 		-Wl,--start-group $(CORE_LIBRARY) $(AM_LIBRARY) $(PLATFORM_LIBS) $(LDLIBS) -Wl,--end-group
 
 ifeq ($(PLATFORM),native)
-run: $(TARGET)
+# `run` plays the independent core (gba-next); run-mgba runs mGBA, which also
+# plays Game Boy ROMs and takes ARGS.
+run: run-gba-next-player
+.PHONY: run-mgba
+run-mgba: $(TARGET)
 	"$(abspath $(TARGET))" $(ARGS) "$(ROM_PATH)"
 
 $(BUILD_DIR)/am/test/native.o: Makefile $(BUILD_DIR)/.build-config | check-deps

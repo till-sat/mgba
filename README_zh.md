@@ -21,7 +21,7 @@
 ## rv32 分支：独立新内核的窗口入口
 
 ```sh
-make -j6 PLATFORM=spike GBN_RV32=1 run-gba-next
+make -j6 PLATFORM=spike run
 ```
 
 默认运行 `roms/dragonball.gba`，`ROM=go` 可换游戏；也支持
@@ -31,8 +31,8 @@ Enter 为 Start，Backspace 为 Select，Esc 或关闭窗口退出。
 `GBN_PLAYER_AUDIO=0` 关闭声音输出；`GBN_PLAYER_FRAMES=N` 限制完整帧数，
 默认 0 持续运行。当前存档仅在内存中，退出不保存。
 
-`run-gba-next-bench` 是无窗口的固定工作量测试入口；下文的 `run` 仍运行
-原来的 mGBA 播放器。新内核的范围和验证见 [doc/gba-next.md](doc/gba-next.md)。
+`run-gba-next-bench` 是无窗口的固定工作量测试入口；各平台的 `run` 都运行
+新内核（gba-next），原来的 mGBA 播放器改用 `run-mgba`。新内核的范围和验证见 [doc/gba-next.md](doc/gba-next.md)。
 
 ## 最小运行命令
 
@@ -97,12 +97,12 @@ RV32 基本块；采集和报告命令见上述文档。Spike 的时间和 IPC �
 
 | 变量 | 作用 | 默认值 |
 | --- | --- | --- |
-| `ARGS` | 传给 Native 播放器的选项，例如 `--headless --frames 120` | 空 |
+| `ARGS` | 传给 mGBA 播放器（`run-mgba`）的选项，例如 `--headless --frames 120` | 空 |
 
 Native 通过 `ARGS` 接收运行参数。例如，不开窗口和音频，运行 120 帧后退出：
 
 ```sh
-make PLATFORM=native run ARGS="--headless --frames 120"
+make PLATFORM=native run-mgba ARGS="--headless --frames 120"
 ```
 
 | 写在 `ARGS` 中的参数 | 作用 |

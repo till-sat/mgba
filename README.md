@@ -22,12 +22,13 @@ For the Chinese version, see [README_zh.md](README_zh.md).
 ## rv32 branch: independent core window
 
 ```sh
-make -j6 PLATFORM=spike GBN_RV32=1 run-gba-next
+make -j6 PLATFORM=spike run
 ```
 
-This runs the independent core, RV32 native backend and current PPU with a window,
+This runs the independent core (gba-next), RV32 native backend and current PPU with a window,
 keyboard input and audio. The default ROM is `roms/dragonball.gba`; use `ROM=go`
-to select another game. `PLATFORM=spike_zve32x` is also supported.
+to select another game. `PLATFORM=spike_zve32x` is also supported (with the RVV PPU
+kernels). On every platform `run` plays gba-next; `run-mgba` runs mGBA instead.
 Controls: arrows, Z/X for A/B, A/S for L/R, Enter for Start, Backspace for Select,
 and Escape or window close to quit. `GBN_PLAYER_AUDIO=0` disables audio output;
 `GBN_PLAYER_FRAMES=N` limits complete frames (default 0 runs until closed).
@@ -129,13 +130,13 @@ reporting commands. Spike timing and IPC are functional simulation values.
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `ARGS` | Options passed to the native player, such as `--headless --frames 120` | empty |
+| `ARGS` | Options passed to the mGBA player (`run-mgba`), such as `--headless --frames 120` | empty |
 
-Native receives runtime options through `ARGS`. For example, run 120 frames
+Native mGBA receives runtime options through `ARGS`. For example, run 120 frames
 without a window or audio:
 
 ```sh
-make PLATFORM=native run ARGS="--headless --frames 120"
+make PLATFORM=native run-mgba ARGS="--headless --frames 120"
 ```
 
 | Option inside `ARGS` | Meaning |

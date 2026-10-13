@@ -2,6 +2,8 @@
 PLATFORM_MAKEFILE := am/platform/spike.mk
 AM_RUNNER_FLAGS := -DAM_SPIKE -DAM_SIM_MEDIA
 include am/platform/rv32.mk
+# `run` plays the independent core (gba-next) with its RV32 translator.
+GBN_RV32 ?= 1
 SPIKE_PREFIX ?= /home/tillsat/tools/spike-20feb9c2
 SPIKE := $(SPIKE_PREFIX)/bin/spike
 SPIKE_PLUGIN := $(BUILD_DIR)/protosoc.so
@@ -27,7 +29,9 @@ $(SPIKE_PLUGIN): am/sim/protosoc.cc am/sim/media.cc am/sim/media.h am/sim/media-
 
 SPIKE_COMMAND = "$(SPIKE)" --isa=$(RISCV_ISA) --priv=m \
                 -m0xa0000000:0x04000000 --extlib="$(abspath $(SPIKE_PLUGIN))"
-run: $(TARGET) $(SPIKE_PLUGIN) check-rv32
+run: run-gba-next-player
+.PHONY: run-mgba
+run-mgba: $(TARGET) $(SPIKE_PLUGIN) check-rv32
 	$(SPIKE_COMMAND) --device=am_protosoc,$(GPIO) --device=am_media "$(TARGET)"
 
 $(BUILD_DIR)/am/test/riscv.o: Makefile $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config | $(RUNTIME_READY)
