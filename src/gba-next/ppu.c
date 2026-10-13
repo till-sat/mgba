@@ -820,6 +820,17 @@ static inline __attribute__((always_inline)) bool cached_indexed_body(
     if (!hit) {
         memcpy(row->map, map, first * 2);
         if (first < 31) memcpy(row->map + first, next_map, (31 - first) * 2);
+#if defined(AM_RVV) && (GBN_PPU_RVV & 32)
+        unsigned decoded = aligned ? gbn_ppu_row_decode_vector(d->vram, row->map, character, sy & 7,
+            row->indices, row->address, row->words) : 0;
+        if (decoded) {
+            row->samples = 31;
+            row->character = character;
+            row->opaque30 = (decoded & 2) != 0; row->opaque31 = (decoded & 4) != 0;
+            row->valid = true;
+        } else
+#endif
+        {
         uint32_t opaque30 = 0, opaque31 = 0;
         bool transparent_tail = false;
         row->samples = 0;
@@ -845,7 +856,7 @@ static inline __attribute__((always_inline)) bool cached_indexed_body(
         row->character = character;
         row->opaque30 = opaque30 != 0; row->opaque31 = opaque31 != 0;
         row->valid = true;
-
+        }
     }
 #if GBN_RV32_FAST & 32768
     if (!cache->tracked_oam) stamp->state = 0;
@@ -998,7 +1009,16 @@ static __attribute__((noinline)) void indexed_line(struct GbnDevices* d, unsigne
         }
         if(have_objects) {
             if(d->io[0]&0x8000)memset(object_window,0,sizeof(object_window));
+#if defined(AM_RVV) && (GBN_PPU_RVV & 64)
+            {
+                /* The empty object pixel {0, 255, 4, false} as one word. */
+                struct Pixel none = {0, 255, 4, false};
+                uint32_t word; __builtin_memcpy(&word, &none, sizeof(word));
+                gbn_rvv_fill32((uint32_t*) (obj + first), word, last - first);
+            }
+#else
             for(unsigned x=first;x<last;++x)obj[x]=(struct Pixel){0,255,4,false};
+#endif
             object_bounds=objects(d,y,obj,object_window);
         }
     }

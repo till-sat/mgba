@@ -102,6 +102,57 @@ static inline __attribute__((always_inline)) void indexed_vector_body(
     }
 }
 
+#if GBN_PPU_RVV & 32
+unsigned gbn_ppu_row_decode_vector(const uint8_t* vram, const uint16_t* row_map,
+    unsigned character, unsigned sy7, uint8_t* indices, uint16_t* address, uint32_t* words) {
+    size_t vl = __riscv_vsetvl_e32m8(31);
+    vuint32m8_t e = __riscv_vzext_vf2_u32m8(__riscv_vle16_v_u16m4(row_map, vl), vl);
+    vbool4_t vflip = __riscv_vmsne_vx_u32m8_b4(__riscv_vand_vx_u32m8(e, 0x800, vl), 0, vl);
+    vbool4_t hflip = __riscv_vmsne_vx_u32m8_b4(__riscv_vand_vx_u32m8(e, 0x400, vl), 0, vl);
+    vuint32m8_t ty = __riscv_vmerge_vxm_u32m8(__riscv_vmv_v_x_u32m8(sy7, vl), 7 - sy7, vflip, vl);
+    vuint32m8_t at = __riscv_vsll_vx_u32m8(__riscv_vand_vx_u32m8(e, 0x3ff, vl), 5, vl);
+    at = __riscv_vadd_vx_u32m8(__riscv_vadd_vv_u32m8(at, __riscv_vsll_vx_u32m8(ty, 2, vl), vl), character, vl);
+    if (__riscv_vcpop_m_b4(__riscv_vmsltu_vx_u32m8_b4(at, 0x10000, vl), vl) != vl) return 0;
+    vuint32m8_t w = __riscv_vluxei32_v_u32m8((const uint32_t*) vram, at, vl);
+    __riscv_vse32_v_u32m8(words, w, vl);
+    __riscv_vse16_v_u16m4(address, __riscv_vnsrl_wx_u16m4(at, 2, vl), vl);
+    /* Horizontal flip: nibbles in reverse order (swap within bytes, then
+     * reverse the bytes). */
+    vuint32m8_t s = __riscv_vor_vv_u32m8(
+        __riscv_vand_vx_u32m8(__riscv_vsrl_vx_u32m8(w, 4, vl), 0x0f0f0f0fu, vl),
+        __riscv_vsll_vx_u32m8(__riscv_vand_vx_u32m8(w, 0x0f0f0f0fu, vl), 4, vl), vl);
+    vuint32m8_t r = __riscv_vor_vv_u32m8(__riscv_vsrl_vx_u32m8(s, 24, vl), __riscv_vsll_vx_u32m8(s, 24, vl), vl);
+    r = __riscv_vor_vv_u32m8(r, __riscv_vand_vx_u32m8(__riscv_vsrl_vx_u32m8(s, 8, vl), 0xff00u, vl), vl);
+    r = __riscv_vor_vv_u32m8(r, __riscv_vand_vx_u32m8(__riscv_vsll_vx_u32m8(s, 8, vl), 0xff0000u, vl), vl);
+    vuint32m8_t src = __riscv_vmerge_vvm_u32m8(w, r, hflip, vl);
+    /* Spread four nibbles into byte lanes, as the scalar row decoder does. */
+    vuint32m8_t lo = __riscv_vand_vx_u32m8(src, 0xffff, vl), hi = __riscv_vsrl_vx_u32m8(src, 16, vl);
+    lo = __riscv_vand_vx_u32m8(__riscv_vor_vv_u32m8(lo, __riscv_vsll_vx_u32m8(lo, 8, vl), vl), 0x00ff00ffu, vl);
+    lo = __riscv_vand_vx_u32m8(__riscv_vor_vv_u32m8(lo, __riscv_vsll_vx_u32m8(lo, 4, vl), vl), 0x0f0f0f0fu, vl);
+    hi = __riscv_vand_vx_u32m8(__riscv_vor_vv_u32m8(hi, __riscv_vsll_vx_u32m8(hi, 8, vl), vl), 0x00ff00ffu, vl);
+    hi = __riscv_vand_vx_u32m8(__riscv_vor_vv_u32m8(hi, __riscv_vsll_vx_u32m8(hi, 4, vl), vl), 0x0f0f0f0fu, vl);
+    vuint32m8_t bank = __riscv_vmul_vx_u32m8(__riscv_vsll_vx_u32m8(__riscv_vsrl_vx_u32m8(e, 12, vl), 4, vl), 0x01010101u, vl);
+    vbool4_t opaque = __riscv_vmsne_vx_u32m8_b4(w, 0, vl);
+    vuint32m8_t zero = __riscv_vmv_v_x_u32m8(0, vl);
+    lo = __riscv_vmerge_vvm_u32m8(zero, __riscv_vor_vv_u32m8(lo, bank, vl), opaque, vl);
+    hi = __riscv_vmerge_vvm_u32m8(zero, __riscv_vor_vv_u32m8(hi, bank, vl), opaque, vl);
+    __riscv_vsse32_v_u32m8((uint32_t*) indices, 8, lo, vl);
+    __riscv_vsse32_v_u32m8((uint32_t*) (indices + 4), 8, hi, vl);
+    unsigned flags = 1;
+    if (__riscv_vcpop_m_b4(opaque, 30)) flags |= 2;
+    if (__riscv_vcpop_m_b4(opaque, vl)) flags |= 4;
+    return flags;
+}
+#endif
+
+void gbn_rvv_fill32(uint32_t* p, uint32_t value, unsigned n) {
+    for (unsigned i = 0; i < n;) {
+        size_t vl = __riscv_vsetvl_e32m8(n - i);
+        __riscv_vse32_v_u32m8(p + i, __riscv_vmv_v_x_u32m8(value, vl), vl);
+        i += (unsigned) vl;
+    }
+}
+
 bool gbn_rvv_equal(const uint8_t* a, const uint8_t* b, unsigned n) {
     for (unsigned i = 0; i < n;) {
         size_t vl = __riscv_vsetvl_e8m8(n - i);
