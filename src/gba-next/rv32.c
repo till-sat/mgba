@@ -68,6 +68,14 @@ struct Emit {
 	unsigned link_count, link_at[GBN_RV32_INSNS + 2]; /* exit sites that may link directly */
 	uint32_t link_pc[GBN_RV32_INSNS + 2];
 #endif
+#if GBN_RV32_FAST & 512
+	/* Cold paths, appended after the epilogue (cold_begin/cold_end). */
+	uint32_t* hot_code;
+	unsigned hot_count, cold_count, cold_stops, cold_returns, cold_link_count;
+	unsigned cold_in_count, cold_in[2 * GBN_RV32_INSNS][2]; /* hot branch, cold target */
+	unsigned cold_out_count, cold_out[2 * GBN_RV32_INSNS][2]; /* cold jump, hot target */
+	uint32_t cold[GBN_RV32_WORDS];
+#endif
 };
 
 static void word(struct Emit* e, uint32_t v) { e->block->code[e->count++] = v; }
@@ -101,6 +109,28 @@ static void stop(struct Emit* e, unsigned a, unsigned b, unsigned fn, bool fallb
 static void guard(struct Emit* e, unsigned reg, bool reject_zero) {
 	stop(e, reg, ZERO, reject_zero ? 0 : 1, true);
 }
+#if GBN_RV32_FAST & 512
+/* Fast mode: a rarely taken path goes to a separate buffer that finish_body
+ * appends after the epilogue, so the hot path stays dense in the I-cache.
+ * The hot branch at hot_at (its condition already encoded) enters it; the
+ * cold code ends with a jump back to the hot code emitted next. Its stops
+ * and returns are marked and relocated when the buffer is appended. */
+#define COLD_AT 0x80000000u
+static void cold_begin(struct Emit* e, unsigned hot_at) {
+	e->cold_in[e->cold_in_count][0] = hot_at; e->cold_in[e->cold_in_count++][1] = e->cold_count;
+	e->hot_code = e->block->code; e->hot_count = e->count;
+	e->block->code = e->cold; e->count = e->cold_count;
+	e->cold_stops = e->stop_count; e->cold_returns = e->return_count;
+}
+static void cold_end(struct Emit* e) {
+	e->cold_out[e->cold_out_count][0] = e->count; e->cold_out[e->cold_out_count++][1] = e->hot_count;
+	word(e, 0);
+	for (unsigned i = e->cold_stops; i < e->stop_count; ++i) e->stops[i].at |= COLD_AT;
+	for (unsigned i = e->cold_returns; i < e->return_count; ++i) e->returns[i] |= COLD_AT;
+	e->cold_count = e->count;
+	e->block->code = e->hot_code; e->count = e->hot_count;
+}
+#endif
 static void get(struct Emit* e, unsigned dest, unsigned r, uint32_t pc) {
 	if (resident(r)) imm(e, dest, guest[r], 0, 0);
 	else if (r == 15) constant(e, dest, pc + (e->block->thumb ? 4 : 8));
@@ -1036,6 +1066,16 @@ static void leaf_read(struct Emit* e, const struct Gbn* m, uint32_t pc,
      * no open-bus path for unmapped regions. */
     {
         constant(e, WAIT, 2);
+#if GBN_RV32_FAST & 512
+        unsigned to_open_bus = e->count; word(e, beq(RHS, WAIT, 0));
+        loaded_value(e, rd, kind, rn, adjustment);
+        op(e, NOW, NOW, LHS, 0, 0);
+        cold_begin(e, to_open_bus);
+        open_bus_value(e, m, pc, rd, kind, width, rn, adjustment);
+        constant(e, WAIT, 2); ram_wait(e, m, pc);
+        cold_end(e);
+        return;
+#endif
         unsigned open = e->count; word(e, 0);
         loaded_value(e, rd, kind, rn, adjustment);
         op(e, NOW, NOW, LHS, 0, 0);
@@ -1079,7 +1119,11 @@ static void direct_access(struct Emit* e, const struct Gbn* m, uint32_t pc, unsi
 	imm(e, RHS, LHS, 5, 24); imm(e, RHS, RHS, 0, -2);
 	imm(e, RESULT, RHS, 3, 2); /* region 2 or 3 */
 	unsigned cartridge = 0;
+#if GBN_RV32_FAST & 512
+	if (width == 4) { cartridge = e->count; word(e, beq(RESULT, ZERO, 0)); }
+#else
 	if (width == 4) { cartridge = e->count; word(e, 0); }
+#endif
 	else guard(e, RESULT, true);
 	if (m->code_region < 8) {
 		/* A RAM block may store data in its own RAM bank, but a write near
@@ -1116,6 +1160,15 @@ static void direct_access(struct Emit* e, const struct Gbn* m, uint32_t pc, unsi
 	op(e, LHS, TEMP, LHS, 7, 0); op(e, LHS, LHS, RESULT, 0, 0);
 	access_value(e, pc, rd, kind, width, rn, adjustment);
 	ram_wait(e, m, pc);
+#if GBN_RV32_FAST & 512
+		if (width == 4) {
+			cold_begin(e, cartridge);
+			dma_start_emit(e, m, pc, rd, rn, adjustment);
+			dma_address_store(e, m, pc, rd, rn, adjustment);
+			cold_end(e);
+		}
+		return;
+#endif
 		if (width == 4) {
 			unsigned done = e->count; word(e, 0);
 			e->block->code[cartridge] = beq(RESULT, ZERO, 4 * (e->count - cartridge));
@@ -2168,6 +2221,25 @@ static unsigned finish_body(struct GbnRv32* backend, struct GbnRv32Block* block,
     stack(e, 27, SAVED_S11, false); stack(e, RA, SAVED_RA, false);
 	imm(e, SP, SP, 0, FRAME_BYTES); word(e, RA << 15 | 0x67);
 #endif
+#if GBN_RV32_FAST & 512
+	{
+		unsigned base = e->count;
+		memcpy(block->code + base, e->cold, e->cold_count * sizeof(uint32_t));
+		e->count += e->cold_count;
+		for (unsigned i = 0; i < e->cold_in_count; ++i) {
+			unsigned at = e->cold_in[i][0];
+			block->code[at] |= beq(0, 0, 4 * (base + e->cold_in[i][1] - at)) & 0xfe000f80u;
+		}
+		for (unsigned i = 0; i < e->cold_out_count; ++i) {
+			unsigned at = base + e->cold_out[i][0];
+			block->code[at] = beq(ZERO, ZERO, 4 * (e->cold_out[i][1] - at));
+		}
+		for (unsigned i = 0; i < e->stop_count; ++i)
+			if (e->stops[i].at & COLD_AT) e->stops[i].at = base + (e->stops[i].at & ~COLD_AT);
+		for (unsigned i = 0; i < e->return_count; ++i)
+			if (e->returns[i] & COLD_AT) e->returns[i] = base + (e->returns[i] & ~COLD_AT);
+	}
+#endif
 	for (unsigned i = 0; i < e->return_count; ++i)
 		block->code[e->returns[i]] = beq(ZERO, ZERO, 4 * (epilogue - e->returns[i]));
 	unsigned stubs[GBN_RV32_INSNS][2];
@@ -2364,6 +2436,16 @@ restart:;
 	struct Emit e;
 	e.block = block; e.count = prologue_words;
 	e.stop_count = e.return_count = e.loop_jump_count = e.source_count = 0;
+#if GBN_RV32_FAST & 512
+	e.cold_count = e.cold_in_count = e.cold_out_count = 0;
+#define COLD_WORDS e.cold_count
+#define COLD_SAVE unsigned saved_cold[3] = {e.cold_count, e.cold_in_count, e.cold_out_count};
+#define COLD_RESTORE e.cold_count = saved_cold[0]; e.cold_in_count = saved_cold[1]; e.cold_out_count = saved_cold[2];
+#else
+#define COLD_WORDS 0
+#define COLD_SAVE
+#define COLD_RESTORE
+#endif
 	e.written = e.thumb_literal_mask = 0;
 	e.read_only = true;
 	e.read_seen = e.dynamic_pc = e.skip_shifter = e.io_guarded = false;
@@ -2411,7 +2493,7 @@ restart:;
 		if (m->code_region < 8 && offset != (block->pc & m->code_mask) + width * i) break;
 		/* Reserve one lowering, two guarded successor edges, the common
 		 * return, both stop reasons at each instruction and RAM validation. */
-        bool exact = e.count + 340 + 64 * edge_count
+        bool exact = e.count + COLD_WORDS + 340 + 64 * edge_count
             + (13 + ram_guard_words) * (i + 1) >= GBN_RV32_WORDS;
         if (block->thumb && exact) break;
         /* Lowering appends stop/body arrays. Only these scalar fields and
@@ -2426,6 +2508,7 @@ restart:;
         unsigned saved_edges = edge_count;
         unsigned saved_returns=e.return_count,saved_loops=e.loop_jump_count;
 		unsigned start = e.count, stops = e.stop_count;
+		COLD_SAVE
 		e.body_offsets[i] = start;
 #if GBN_RV32_FAST & 1
 		/* Fast mode: events are taken at block exits (up to one block late).
@@ -2460,9 +2543,9 @@ restart:;
             uint32_t target = pc + 8 + (uint32_t) ((int32_t) (code << 8) >> 6);
             if (target >> 24 != m->code_region || (m->code_region >= 8
                     && (target & (GBN_ROM_MAX_SIZE - 1)) >= m->rom_size)) {
-                e.count = start; e.stop_count = stops; block->fallback = true; break;
+                e.count = start; e.stop_count = stops; COLD_RESTORE block->fallback = true; break;
             }
-            exact |= e.count + 340 + 64 * (edge_count + 1)
+            exact |= e.count + COLD_WORDS + 340 + 64 * (edge_count + 1)
                     + (13 + ram_guard_words) * (i + 1) >= GBN_RV32_WORDS;
             condition(&e, code >> 28);
             imm(&e, NOW, NOW, 0, 1 + m->code_word_wait);
@@ -2475,14 +2558,14 @@ restart:;
         }
 
 		if (!(block->thumb ? instruction(&e, m, code, pc) : arm_instruction(&e, m, code, pc))) {
-			e.count = start; e.stop_count = stops;
+			e.count = start; e.stop_count = stops; COLD_RESTORE
 			block->fallback = true; break;
 		}
 		imm(&e, NOW, NOW, 0, 1 + (block->thumb ? m->code_wait : m->code_word_wait));
 		++block->instructions;
     check_size:
         if (exact && !body_fits(backend, &e, prologue_words, edges, edge_count)) {
-            e.count = start; e.stop_count = stops; e.written = saved_written;
+            e.count = start; e.stop_count = stops; COLD_RESTORE e.written = saved_written;
             memcpy(e.thumb_literal, saved_thumb_literal, sizeof(saved_thumb_literal));
             e.thumb_literal_mask = saved_thumb_literal_mask;
 			e.io_guarded=saved_io_guarded;
@@ -2552,6 +2635,9 @@ restart:;
 #if GBN_RV32_STATS
 	++backend->compiled_blocks;
 #endif
+#undef COLD_WORDS
+#undef COLD_SAVE
+#undef COLD_RESTORE
 }
 
 static bool matches(const struct GbnRv32Block* b, const struct Gbn* m, uint32_t key) {
