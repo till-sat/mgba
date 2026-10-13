@@ -95,6 +95,7 @@ struct Emit {
 	 * (zero with branch_clear), or always; else LIMIT bit 31 carries it. */
 	bool branch_direct, branch_always, branch_clear;
 	uint8_t branch_reg;
+	unsigned extra_time;
 #endif
 #if GBN_RV32_FAST & 1024
 	/* Thumb fetch time not yet added to NOW, and its value at each
@@ -154,6 +155,9 @@ static void cold_begin(struct Emit* e, unsigned hot_at) {
  * time is observed: at its exits (time_flush) and in its stop stubs. */
 static void time_flush(struct Emit* e) {
 	unsigned d = e->prefix[e->block->instructions];
+#if GBN_RV32_FAST & 8388608
+	d += e->extra_time; e->extra_time = 0; /* a taken branch's time, the same add */
+#endif
 	if (d) imm(e, NOW, NOW, 0, (int) d);
 }
 #endif
@@ -1085,10 +1089,36 @@ LEAF static void code_target(void) {
         "jalr zero,s3,0\n\t"
         : : [target] "i" (STACK_TARGET), [rom_size] "i" (offsetof(struct Gbn, rom_size)));
 }
+/* code_target for BX, which also needs an odd (Thumb) target; t1 is free. */
+LEAF static void code_target_odd(void) {
+    __asm__ volatile(
+        "andi t1,t2,1\n\t"
+        "beqz t1,9f\n\t"
+        "xor t0,t0,t2\n\t"
+        "srli t0,t0,24\n\t"
+        "bnez t0,9f\n\t"
+        "slli t0,t2,7\n\t"
+        "srli t0,t0,7\n\t"
+        "andi t2,t2,-2\n\t"
+        "sw t2,%c[target](sp)\n\t"
+        "lw t2,%c[rom_size](a0)\n\t"
+        "sltu t0,t0,t2\n\t"
+        "xori t0,t0,1\n\t"
+        "jalr zero,s3,0\n\t"
+        "9: li t0,1\n\t"
+        "jalr zero,s3,0\n\t"
+        : : [target] "i" (STACK_TARGET), [rom_size] "i" (offsetof(struct Gbn, rom_size)));
+}
 _Static_assert(GBN_ROM_MAX_SIZE == 1u << 25, "code_target keeps 25 offset bits");
 /* The indirect tail's lookup (one backend's table, hub_lookup): a hit
  * enters the target's chain, a miss returns to the block's own exit. */
 static uint32_t hub_lookup;
+#if GBN_RV32_FAST & 8388608
+#define HUB_CONTEXT "lw a3,%c[context](t0)\n\tbne a3,s10,9f\n\t" /* s10 = CONTEXT */
+_Static_assert(CONTEXT == 26, "HUB_CONTEXT names s10");
+#else
+#define HUB_CONTEXT
+#endif
 LEAF static void indirect_lookup(void) {
     __asm__ volatile(
         "lw t2,%c[target](sp)\n\t"
@@ -1106,17 +1136,19 @@ LEAF static void indirect_lookup(void) {
         "beqz t1,9f\n\t"
         "lw a3,%c[pc](t0)\n\t"
         "bne a3,t2,9f\n\t"
+        HUB_CONTEXT
         "jr t1\n\t"
         "9: jalr zero,s3,0\n\t"
         : : [target] "i" (STACK_TARGET), [shift] "i" (GBN_RV32_HASH_SHIFT), [lookup] "s" (&hub_lookup),
-            [chain] "i" (offsetof(struct GbnRv32Block, chain)), [pc] "i" (offsetof(struct GbnRv32Block, pc)));
+            [chain] "i" (offsetof(struct GbnRv32Block, chain)), [pc] "i" (offsetof(struct GbnRv32Block, pc)),
+            [context] "i" (offsetof(struct GbnRv32Block, context_tag)));
 }
 
 /* tp addresses the leaves: tp itself is unused by the C code, so native
  * code sets it on entry and calls a leaf with one jalr s3, offset(tp). */
 static uint32_t hub_base(void) { return (uint32_t) (uintptr_t) read_byte + 2048; }
 static bool hub_reaches(void) {
-    static const void* const leaves[] = {read_byte, read_half, read_word, write_byte, write_half, write_word, stack_span, code_target, indirect_lookup};
+    static const void* const leaves[] = {read_byte, read_half, read_word, write_byte, write_half, write_word, stack_span, code_target, code_target_odd, indirect_lookup};
     for (unsigned i = 0; i < sizeof(leaves) / sizeof(leaves[0]); ++i) {
         int32_t offset = (int32_t) ((uint32_t) (uintptr_t) leaves[i] - hub_base());
         if (offset < -2048 || offset > 2047) return false;
@@ -1832,6 +1864,14 @@ static bool instruction(struct Emit* e, const struct Gbn* m, unsigned code, uint
 		} else put_value(e, rd, b);
     } else if (code >= 0x4700 && code < 0x4780) {
         get(e, RESULT, code >> 3 & 15, pc);
+#if (GBN_RV32_FAST & 8388608) && (GBN_RV32_FAST & 4194304)
+        if (hub_ready && m->code_region >= 8) {
+            word(e, m->code_region << 24 | LHS << 7 | 0x37);
+            hub_call(e, code_target_odd); guard(e, LHS, false);
+            e->dynamic_pc = true;
+            return true;
+        }
+#endif
         imm(e, WAIT, RESULT, 7, 1); guard(e, WAIT, true);
         indirect_target(e, m); /* BX remains Thumb only for an odd target. */
 	} else if (code >= 0x4800 && code < 0xa000) {
@@ -2208,6 +2248,10 @@ static void indirect_tail(struct Emit* e, struct GbnRv32* backend) {
     misses[n++] = e->count; word(e, beq(RHS, ZERO, 0));
     word(e, offsetof(struct GbnRv32Block, pc) << 20 | LHS << 15 | 2 << 12 | TEMP << 7 | 3);
     misses[n++] = e->count; word(e, beq(TEMP, RESULT, 0) | 1u << 12);
+#if GBN_RV32_FAST & 8388608
+    word(e, offsetof(struct GbnRv32Block, context_tag) << 20 | LHS << 15 | 2 << 12 | TEMP << 7 | 3);
+    misses[n++] = e->count; word(e, beq(TEMP, CONTEXT, 0) | 1u << 12);
+#endif
 #if GBN_RV32_STATS
     constant(e, LHS, (uint32_t) (uintptr_t) &backend->chained_blocks);
     word(e, LHS << 15 | 2 << 12 | TEMP << 7 | 3);
@@ -2438,12 +2482,16 @@ static uint32_t exit_stub(struct GbnRv32* backend, bool ram, bool miss) {
 		constant(e, RHS, (uint32_t) (uintptr_t) backend->lookup);
 		op(e, LHS, LHS, RHS, 0, 0);
 		word(e, LHS << 15 | 2 << 12 | LHS << 7 | 3);
-		unsigned misses[3], n = 0;
+		unsigned misses[4], n = 0;
 		misses[n++] = e->count; word(e, beq(LHS, ZERO, 0));
 		word(e, offsetof(struct GbnRv32Block, chain) << 20 | LHS << 15 | 2 << 12 | RHS << 7 | 3);
 		misses[n++] = e->count; word(e, beq(RHS, ZERO, 0));
 		word(e, offsetof(struct GbnRv32Block, pc) << 20 | LHS << 15 | 2 << 12 | RESULT << 7 | 3);
 		misses[n++] = e->count; word(e, beq(RESULT, WAIT, 0) | 1u << 12);
+#if GBN_RV32_FAST & 8388608
+		word(e, offsetof(struct GbnRv32Block, context_tag) << 20 | LHS << 15 | 2 << 12 | RESULT << 7 | 3);
+		misses[n++] = e->count; word(e, beq(RESULT, CONTEXT, 0) | 1u << 12);
+#endif
 		word(e, RHS << 15 | 0x67); /* tail entry: no call, spill or prologue */
 		for (unsigned i = 0; i < n; ++i)
 			routine.code[misses[i]] |= beq(0, 0, 4 * (e->count - misses[i])) & 0xfe000f80u;
@@ -2626,7 +2674,11 @@ static unsigned finish_body(struct GbnRv32* backend, struct GbnRv32Block* block,
 	e->source_count = block->instructions;
 	block->loop = block->branch && block->target == block->pc;
 	if (e->dynamic_pc) {
+#if (GBN_RV32_FAST & 8388608) && (GBN_RV32_FAST & 1024)
+		e->extra_time = 2 + m->code_wait + m->code_nonseq; /* added by indirect_tail's time_flush */
+#else
 		imm(e, NOW, NOW, 0, 2 + m->code_wait + m->code_nonseq);
+#endif
 		constant(e, PREFETCH, 0);
         indirect_tail(e, backend);
 	} else if (block->branch) {
@@ -2634,7 +2686,11 @@ static unsigned finish_body(struct GbnRv32* backend, struct GbnRv32Block* block,
 		if (e->branch_direct) {
 			unsigned untaken = e->count;
 			if (!e->branch_always) word(e, beq(e->branch_reg, ZERO, 0) | (e->branch_clear ? 1u : 0u) << 12);
+#if GBN_RV32_FAST & 1024
+			e->extra_time = 2 + m->code_wait + m->code_nonseq; /* added by tail's time_flush */
+#else
 			imm(e, NOW, NOW, 0, 2 + m->code_wait + m->code_nonseq);
+#endif
 			constant(e, PREFETCH, 0);
 			tail(e, backend, block->target, false);
 			if (e->branch_always) goto tails_done; /* no fall-through edge */
@@ -3006,6 +3062,46 @@ static unsigned thumb_needed(const struct Gbn* m, uint32_t pc, unsigned depth) {
 }
 #endif
 
+#if (GBN_RV32_FAST & 8388608) && (GBN_RV32_FAST & 4194304) && (GBN_RV32_FAST & 1024) && (GBN_RV32_FAST & 16384)
+/* Fast mode, ROM code: POP followed by POP (the return idiom POP {r4-r7};
+ * POP {r0}; BX r0) as one span check and SP update; the same loads, the
+ * same time. Either guard failing leaves before the first POP. */
+static unsigned thumb_pop_pair(struct Emit* e, const struct Gbn* m, unsigned first, unsigned code) {
+	if (!hub_ready || m->code_region < 8 || (code & 0xff00) != 0xbc00 || !(code & 255) ||
+	    first + 1 >= GBN_RV32_INSNS) return 0;
+	uint32_t pc = e->block->pc + 2 * first;
+	if (!thumb_rom_code(m, pc + 2)) return 0;
+	unsigned next = thumb_rom_half(m, pc + 2);
+	if ((next & 0xfe00) != 0xbc00 || !(next & 0x1ff)) return 0;
+	bool extra = (next & 0x100) != 0;
+	unsigned bytes = 4 * ((unsigned) __builtin_popcount(code & 255) + (unsigned) __builtin_popcount(next & 255) + extra);
+	e->read_seen = true;
+	get(e, TEMP, 13, pc);
+	constant(e, RESULT, bytes | 1);
+	hub_call(e, stack_span);
+	guard(e, RHS, true);
+	if (extra) {
+		word(e, (bytes - 4) << 20 | RHS << 15 | 2 << 12 | RESULT << 7 | 3);
+		indirect_target(e, m);
+	}
+	imm(e, TEMP, TEMP, 0, (int) bytes); put_value(e, 13, TEMP);
+	unsigned offset = 0;
+	for (unsigned pass = 0; pass < 2; ++pass) {
+		unsigned list = (pass ? next : code) & 255;
+		for (unsigned r = 0; r < 8; ++r) if (list & (1u << r)) {
+			word(e, offset << 20 | RHS << 15 | 2 << 12 | guest[r] << 7 | 3);
+			e->written |= 1u << r; e->thumb_literal_mask &= ~(1u << r);
+			offset += 4;
+		}
+	}
+	/* The leaf adds one POP's internal cycle; the second one and both
+	 * fetches go with the block's deferred time. */
+	e->deferred += 1 + 2 * (1 + m->code_wait);
+	e->block->instructions += 2;
+	return 2;
+}
+#endif
+
 static void compile(struct GbnRv32* backend, struct GbnRv32Block* block) {
 	const struct Gbn* m = backend->machine;
 #if GBN_RV32_FAST & 8
@@ -3063,6 +3159,7 @@ restart:;
 #if GBN_RV32_FAST & 8388608
 	e.insn_start = ~0u;
 	e.branch_direct = e.branch_always = e.branch_clear = false;
+	e.extra_time = 0;
 #endif
 	e.read_only = true;
 	e.read_seen = e.dynamic_pc = e.skip_shifter = e.io_guarded = false;
@@ -3073,8 +3170,12 @@ restart:;
 	unsigned chain_at = 0;
 	if (m->code_region >= 8) {
 		chain_at = e.count;
+#if (GBN_RV32_FAST & 8388608) && (GBN_RV32_FAST & 128) && !GBN_RV32_STATS
+		/* Links join equal contexts; the shared lookups compare it. */
+#else
 		constant(&e, TEMP, block->context_tag);
 		stop(&e, TEMP, CONTEXT, 1, false); e.stops[e.stop_count - 1].instruction = 0;
+#endif
 		prologue_words = e.count;
 	}
 #endif
@@ -3193,6 +3294,9 @@ restart:;
 		unsigned bulk_count = block->thumb && (code & 0xf000) == 0x6000 ?
 			thumb_io_group(&e,backend,m,i,code) : 0;
 		if (bulk_count) { i += bulk_count - 1; goto check_size; }
+#if (GBN_RV32_FAST & 8388608) && (GBN_RV32_FAST & 4194304) && (GBN_RV32_FAST & 1024) && (GBN_RV32_FAST & 16384)
+		if (block->thumb && (bulk_count = thumb_pop_pair(&e, m, i, code))) { i += bulk_count - 1; goto check_size; }
+#endif
 		arm_mixer_packet(&e,backend,m,i);
 		bulk_count=arm_mixer_bulk(&e,backend,m,i,ram_guard_words,edge_count);
 		if(!bulk_count)bulk_count=arm_bulk(&e,m,i,ram_guard_words,edge_count);
