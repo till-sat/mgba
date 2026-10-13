@@ -73,6 +73,9 @@ static void dma_start_emit(struct Emit* e,const struct Gbn* m,uint32_t pc,unsign
     writeback(e,rn,adjustment);
     constant(e,WAIT,1);ram_wait(e,m,pc);
     imm(e,NOW,NOW,0,1+(e->block->thumb?m->code_wait:m->code_word_wait));
+#if GBN_RV32_FAST & 1024
+    time_flush(e);
+#endif
     /* The new DMA deadline invalidates this frame's bound. Always exit
      * after exactly this store; the normal CPU/event dispatcher resumes. */
     finish_count(e,e->block->instructions+1,false);

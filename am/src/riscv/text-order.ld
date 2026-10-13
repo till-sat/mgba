@@ -1,0 +1,32 @@
+/* SPDX-License-Identifier: MPL-2.0 */
+/* Hot code first and contiguous (included by link.ld): the gba-next player and
+ * benchmark's hottest functions on the proto-soc chip model, densest first,
+ * so that they conflict with each other as little as possible in the 32 KiB
+ * two-way I-cache. Names that a build lacks match nothing. */
+*(.text.read_word .text.read_word.*)
+*(.text.read_half .text.read_half.*)
+*(.text.read_byte .text.read_byte.*)
+*(.text.dma_start_leaf .text.dma_start_leaf.*)
+*(.text.mixer_packet_guard .text.mixer_packet_guard.*)
+*(.text.mixer_packet_leaf .text.mixer_packet_leaf.*)
+*(.text.memcmp .text.memcpy .text.memset)
+*(.text.gbn_ppu_indexed_vector .text.gbn_ppu_indexed_vector.*)
+*(.text.cached_indexed_aligned .text.cached_indexed_aligned.*)
+*(.text.indexed_line .text.indexed_line.*)
+*(.text.objects_aligned .text.objects_aligned.*)
+*(.text.object_membership .text.object_membership.*)
+*(.text.gbn_audio_timer .text.gbn_audio_timer.*)
+*(.text.gbn_audio_timeline_queue .text.gbn_audio_timeline_queue.*)
+*(.text.gbn_audio_timeline_drain .text.gbn_audio_timeline_drain.*)
+*(.text.advance_all .text.advance_all.*)
+*(.text.gbn_schedule_at .text.gbn_schedule_at.*)
+*(.text.select_dma .text.select_dma.*)
+*(.text.span_limit .text.span_limit.*)
+*(.text.dma_span .text.dma_span.*)
+*(.text.dma_read_pointer .text.dma_read_pointer.*)
+*(.text.dma_write_pointer .text.dma_write_pointer.*)
+*(.text.dma_finish .text.dma_finish.*)
+*(.text.vcount_match .text.vcount_match.*)
+*(.text.fetch .text.fetch.*)
+*(.text.startup.main)
+*(.text.gbn_ppu_line .text.gbn_ppu_line.*)

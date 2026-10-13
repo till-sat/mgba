@@ -76,6 +76,12 @@ struct Emit {
 	unsigned cold_out_count, cold_out[2 * GBN_RV32_INSNS][2]; /* cold jump, hot target */
 	uint32_t cold[GBN_RV32_WORDS];
 #endif
+#if GBN_RV32_FAST & 1024
+	/* Thumb fetch time not yet added to NOW, and its value at each
+	 * instruction's start (stops resume the interpreter there). */
+	unsigned deferred, prefix_filled;
+	uint16_t prefix[GBN_RV32_INSNS + 1];
+#endif
 };
 
 static void word(struct Emit* e, uint32_t v) { e->block->code[e->count++] = v; }
@@ -122,6 +128,16 @@ static void cold_begin(struct Emit* e, unsigned hot_at) {
 	e->block->code = e->cold; e->count = e->cold_count;
 	e->cold_stops = e->stop_count; e->cold_returns = e->return_count;
 }
+#endif
+#if GBN_RV32_FAST & 1024
+/* Fast mode: a Thumb block adds its instructions' fetch time once, where
+ * time is observed: at its exits (time_flush) and in its stop stubs. */
+static void time_flush(struct Emit* e) {
+	unsigned d = e->prefix[e->block->instructions];
+	if (d) imm(e, NOW, NOW, 0, (int) d);
+}
+#endif
+#if GBN_RV32_FAST & 512
 static void cold_end(struct Emit* e) {
 	e->cold_out[e->cold_out_count][0] = e->count; e->cold_out[e->cold_out_count++][1] = e->hot_count;
 	word(e, 0);
@@ -1713,6 +1729,9 @@ static void finish_count(struct Emit* e, unsigned partial, bool fallback) {
 }
 static void indirect_tail(struct Emit* e, struct GbnRv32* backend) {
     struct GbnRv32Block* b = e->block;
+#if GBN_RV32_FAST & 1024
+    time_flush(e);
+#endif
     imm(e, LIMIT, LIMIT, 0, -(int) b->instructions);
     unsigned misses[8], n = 0;
     misses[n++] = e->count; word(e, beq(LIMIT, ZERO, 0));
@@ -1751,6 +1770,9 @@ static uint32_t exit_stub(struct GbnRv32*, bool ram, bool miss);
 #endif
 static void tail(struct Emit* e, struct GbnRv32* backend, uint32_t pc, bool fallback) {
 	struct GbnRv32Block* b = e->block;
+#if GBN_RV32_FAST & 1024
+	time_flush(e);
+#endif
     /* The entry proof covers the entire contiguous source span. Native
      * stores overlapping it already fall back, so an internal ARM edge can
      * jump directly to the target's exact cap/event guards. Rebase LIMIT to
@@ -2248,6 +2270,9 @@ static unsigned finish_body(struct GbnRv32* backend, struct GbnRv32Block* block,
 		unsigned index = e->stops[i].instruction, slow = e->stops[i].fallback;
 		if (!stubs[index][slow]) {
 			stubs[index][slow] = e->count;
+#if GBN_RV32_FAST & 1024
+			if (e->prefix[index]) imm(e, NOW, NOW, 0, (int) e->prefix[index]);
+#endif
 			finish_count(e, index, slow);
 			constant(e, RHS, block->pc + width * index);
 			word(e, beq(ZERO, ZERO, 4 * (epilogue - e->count)));
@@ -2436,6 +2461,15 @@ restart:;
 	struct Emit e;
 	e.block = block; e.count = prologue_words;
 	e.stop_count = e.return_count = e.loop_jump_count = e.source_count = 0;
+#if GBN_RV32_FAST & 1024
+	e.deferred = e.prefix_filled = 0;
+#define TIME_FILL while (e.prefix_filled <= block->instructions) e.prefix[e.prefix_filled++] = (uint16_t) e.deferred;
+#define TIME_SAVE unsigned saved_deferred = e.deferred;
+#define TIME_RESTORE e.deferred = saved_deferred;
+#else
+#define TIME_SAVE
+#define TIME_RESTORE
+#endif
 #if GBN_RV32_FAST & 512
 	e.cold_count = e.cold_in_count = e.cold_out_count = 0;
 #define COLD_WORDS e.cold_count
@@ -2508,8 +2542,11 @@ restart:;
         unsigned saved_edges = edge_count;
         unsigned saved_returns=e.return_count,saved_loops=e.loop_jump_count;
 		unsigned start = e.count, stops = e.stop_count;
-		COLD_SAVE
+		COLD_SAVE TIME_SAVE
 		e.body_offsets[i] = start;
+#if GBN_RV32_FAST & 1024
+		TIME_FILL /* also the indices inside a preceding instruction group */
+#endif
 #if GBN_RV32_FAST & 1
 		/* Fast mode: events are taken at block exits (up to one block late).
 		 * The block runs whole only with budget for all of it, so LIMIT,
@@ -2543,7 +2580,7 @@ restart:;
             uint32_t target = pc + 8 + (uint32_t) ((int32_t) (code << 8) >> 6);
             if (target >> 24 != m->code_region || (m->code_region >= 8
                     && (target & (GBN_ROM_MAX_SIZE - 1)) >= m->rom_size)) {
-                e.count = start; e.stop_count = stops; COLD_RESTORE block->fallback = true; break;
+                e.count = start; e.stop_count = stops; COLD_RESTORE TIME_RESTORE block->fallback = true; break;
             }
             exact |= e.count + COLD_WORDS + 340 + 64 * (edge_count + 1)
                     + (13 + ram_guard_words) * (i + 1) >= GBN_RV32_WORDS;
@@ -2558,14 +2595,17 @@ restart:;
         }
 
 		if (!(block->thumb ? instruction(&e, m, code, pc) : arm_instruction(&e, m, code, pc))) {
-			e.count = start; e.stop_count = stops; COLD_RESTORE
+			e.count = start; e.stop_count = stops; COLD_RESTORE TIME_RESTORE
 			block->fallback = true; break;
 		}
+#if GBN_RV32_FAST & 1024
+		if (block->thumb) e.deferred += 1 + m->code_wait; else
+#endif
 		imm(&e, NOW, NOW, 0, 1 + (block->thumb ? m->code_wait : m->code_word_wait));
 		++block->instructions;
     check_size:
         if (exact && !body_fits(backend, &e, prologue_words, edges, edge_count)) {
-            e.count = start; e.stop_count = stops; COLD_RESTORE e.written = saved_written;
+            e.count = start; e.stop_count = stops; COLD_RESTORE TIME_RESTORE e.written = saved_written;
             memcpy(e.thumb_literal, saved_thumb_literal, sizeof(saved_thumb_literal));
             e.thumb_literal_mask = saved_thumb_literal_mask;
 			e.io_guarded=saved_io_guarded;
@@ -2589,6 +2629,9 @@ restart:;
 #if GBN_RV32_FAST & 1
     if (fast_budget_at != ~0u && block->instructions)
         block->code[fast_budget_at] = (uint32_t) block->instructions << 20 | ZERO << 15 | TEMP << 7 | 0x13;
+#endif
+#if GBN_RV32_FAST & 1024
+    TIME_FILL
 #endif
     unsigned chain = finish_body(backend, block, &e, prologue_words, edges, edge_count, &loop_entry);
 #if GBN_RV32_FAST & 256
@@ -2638,6 +2681,9 @@ restart:;
 #undef COLD_WORDS
 #undef COLD_SAVE
 #undef COLD_RESTORE
+#undef TIME_SAVE
+#undef TIME_RESTORE
+#undef TIME_FILL
 }
 
 static bool matches(const struct GbnRv32Block* b, const struct Gbn* m, uint32_t key) {

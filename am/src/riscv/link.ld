@@ -15,6 +15,7 @@ SECTIONS {
     .text : {
         _text_start = .;
         KEEP(*(.text.entry))
+        INCLUDE am/src/riscv/text-order.ld
         *(.text .text.*)
         _text_end = .;
     } > ram :text
