@@ -212,7 +212,8 @@ GBN_RV32_CODE_MIB ?= 16
 # added once per block exit. Devices (also without the translator): 32 DMA
 # transfers and sound FIFO bursts at once, 64 timer overflows only the sound
 # FIFOs see without events, 2048 lines drawn in batches before a write that
-# could change them and at VBlank (catch-up rendering). 4095 enables all.
+# could change them and at VBlank (catch-up rendering), 4096 PCM at most
+# 32768 Hz and unrouted PSG oscillators not advanced. 8191 enables all.
 # Pictures and sound stay correct but no longer match the exact core frame for
 # frame; 0 is the exact translator, which test-gba-next-rv32 compares cycle by
 # cycle.

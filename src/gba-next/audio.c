@@ -5,7 +5,16 @@
 /* The sequencer and PCM clock share the machine timeline. Oscillators advance
  * analytically between observations; only the noise recurrence needs steps. */
 static bool master(const struct Gbn* m) { return (m->devices->io[0x84 / 2] & 0x80) != 0; }
+#if GBN_RV32_FAST & 4096
+/* Fast mode: PCM at most 32768 Hz (the players output that rate; the FIFOs
+ * change at a lower rate), so a 65536 Hz resolution emits half the samples. */
+static unsigned interval(const struct Gbn* m) {
+	unsigned cycles = 512u >> (m->devices->io[0x88 / 2] >> 14);
+	return cycles < 512 ? 512 : cycles;
+}
+#else
 static unsigned interval(const struct Gbn* m) { return 512u >> (m->devices->io[0x88 / 2] >> 14); }
+#endif
 
 static unsigned period(const struct GbnPsgChannel* c, unsigned id) {
 	if (id < 2) return 16u * (2048 - c->frequency);
@@ -62,6 +71,16 @@ static void advance_channel(struct Gbn* m, unsigned id, uint32_t when, bool powe
 
 static void advance_all(struct Gbn* m, uint32_t when) {
     struct GbnAudio* a=&m->devices->audio;
+#if GBN_RV32_FAST & 4096
+    if (!(m->devices->io[0x80 / 2] & 0xff00)) {
+        /* Fast mode: unrouted PSG channels are not heard; skip their
+         * oscillators (only a later routing sees a different phase). */
+        a->psg_pending = false;
+        for (unsigned i = 0; i < 4; ++i)
+            if ((int32_t) (when - a->psg[i].updated) >= 0) a->psg[i].updated = when;
+        return;
+    }
+#endif
     if(a->psg_pending) {
         uint32_t last=a->samples[(a->read+a->size-1)&(GBN_AUDIO_CAPACITY-1)].when;
         a->psg_pending=false;
