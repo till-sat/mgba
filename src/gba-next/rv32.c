@@ -64,7 +64,9 @@ struct Emit {
 #if GBN_RV32_FAST & 8
 	bool cv_dead; /* the instruction's C/V are overwritten in this block before any read */
 #endif
-
+#if GBN_RV32_FAST & 16384
+	uint8_t live; /* flags read after the current instruction: N 8, Z 4, C 2, V 1 */
+#endif
 #if GBN_RV32_FAST & 16
 	unsigned link_count, link_at[GBN_RV32_INSNS + 2]; /* exit sites that may link directly */
 	uint32_t link_pc[GBN_RV32_INSNS + 2];
@@ -169,7 +171,13 @@ static void put_value(struct Emit* e, unsigned r, unsigned value) {
 static void put(struct Emit* e, unsigned r) { put_value(e, r, RESULT); }
 static void nz(struct Emit* e) {
 	/* Keep independent booleans: entry CPSR may legally contain N=Z=1. */
+#if GBN_RV32_FAST & 16384
+	if (e->live & 8)
+#endif
 	imm(e, NEGATIVE, RESULT, 5, 31);
+#if GBN_RV32_FAST & 16384
+	if (e->live & 4)
+#endif
 	imm(e, IS_ZERO, RESULT, 3, 1);
 }
 /* FLAGS retains bits 0..29. Materialize N/Z only when the complete CPSR is
@@ -181,6 +189,29 @@ static void packed_flags(struct Emit* e, unsigned dest) {
 /* Inputs may alias their assigned LHS/RHS scratch registers, respectively;
  * neither is overwritten until all uses of that original operand complete. */
 static void arithmetic(struct Emit* e, bool subtract, unsigned a, unsigned b) {
+#if GBN_RV32_FAST & 16384
+    if (e->live != 15) {
+        /* Only the flags a later instruction reads. C before V: V may reuse
+         * the scratch operands. N/Z come from RESULT alone. */
+        op(e, RESULT, a, b, 0, subtract ? 0x20 : 0);
+        if (e->live & 3) {
+            if (e->live & 2) {
+                op(e, TEMP, subtract ? a : RESULT, subtract ? b : a, 3, 0);
+                if (subtract) imm(e, TEMP, TEMP, 4, 1);
+            }
+            if (e->live & 1) {
+                if (subtract) { op(e, LHS, a, b, 2, 0); imm(e, RHS, RESULT, 5, 31); }
+                else { op(e, LHS, RESULT, a, 2, 0); imm(e, RHS, b, 5, 31); }
+                op(e, LHS, LHS, RHS, 4, 0);
+            }
+            imm(e, FLAGS, FLAGS, 1, 8); imm(e, FLAGS, FLAGS, 5, 8);
+            if (e->live & 1) { imm(e, LHS, LHS, 1, 28); op(e, FLAGS, FLAGS, LHS, 6, 0); }
+            if (e->live & 2) { imm(e, TEMP, TEMP, 1, 29); op(e, FLAGS, FLAGS, TEMP, 6, 0); }
+        }
+        nz(e);
+        return;
+    }
+#endif
 #if GBN_RV32_FAST & 8
     if (e->cv_dead) { op(e, RESULT, a, b, 0, subtract ? 0x20 : 0); nz(e); return; }
 #endif
@@ -1351,10 +1382,15 @@ static bool instruction(struct Emit* e, const struct Gbn* m, unsigned code, uint
 		if (!amount && kind) amount = 32;
 		if (!amount) imm(e, RESULT, a, 0, 0);
 		else {
+#if GBN_RV32_FAST & 16384
+			if (e->live & 2)
+#endif
+			{
 			imm(e, RHS, a, 5, (int) (kind ? amount - 1 : 32 - amount));
 			imm(e, RHS, RHS, 7, 1); imm(e, RHS, RHS, 1, 29);
 			constant(e, TEMP, ~0x20000000u); op(e, FLAGS, FLAGS, TEMP, 7, 0);
 			op(e, FLAGS, FLAGS, RHS, 6, 0);
+			}
 			if (amount == 32 && kind == 1) imm(e, RESULT, ZERO, 0, 0);
 			else imm(e, RESULT, a, kind ? 5 : 1, (int) (amount == 32 ? 31 : amount) | (kind == 2 ? 0x400 : 0));
 		}
@@ -2439,10 +2475,82 @@ static unsigned thumb_cv(unsigned op) {
 }
 #endif
 
+#if GBN_RV32_FAST & 16384
+/* Flag liveness for Thumb code: N 8, Z 4, C 2, V 1. A flag a later
+ * instruction overwrites before any read is not computed. Readers are the
+ * guest's own: conditions, ADC/SBC, shifts that may keep C. Exits to C need
+ * no more: an event or interrupt there resumes the same instruction stream,
+ * whose dead flags stay unread (SPSR saves and restores them unchanged). */
+enum { FLAGS_ALL = 15, FLOW_NEXT = 0, FLOW_BRANCH, FLOW_JUMP, FLOW_CALL, FLOW_STOP };
+static unsigned thumb_flow(unsigned op, unsigned next, uint32_t pc, unsigned* reads, unsigned* writes, uint32_t* target) {
+	static const uint8_t condition_reads[14] = {4, 4, 2, 2, 8, 8, 1, 1, 6, 6, 9, 9, 13, 13};
+	*reads = *writes = 0;
+	if (op >> 11 == 0x03) { *writes = 15; return FLOW_NEXT; }                 /* add/sub reg/imm3 */
+	if (op >> 13 == 0) { *writes = op >> 6 & 31 || op >> 11 ? 14 : 12; return FLOW_NEXT; } /* LSL #0 keeps C */
+	if (op >> 11 == 0x04) { *writes = 12; return FLOW_NEXT; }                 /* mov imm8 */
+	if (op >> 13 == 1) { *writes = 15; return FLOW_NEXT; }                    /* cmp/add/sub imm8 */
+	if (op >> 10 == 0x10) {
+		switch (op >> 6 & 15) {
+		case 5: case 6: *reads = 2; *writes = 15; break;                       /* adc sbc */
+		case 9: case 10: case 11: *writes = 15; break;                         /* neg cmp cmn */
+		case 2: case 3: case 4: case 7: *reads = 2; *writes = 12; break;      /* shifts by register may keep C */
+		default: *writes = 12; break;                                          /* logical, tst, mul */
+		}
+		return FLOW_NEXT;
+	}
+	if (op >> 10 == 0x11) {
+		unsigned kind = op >> 8 & 3, rd = (op & 7) | (op >> 4 & 8);
+		if (kind == 1) { *writes = 15; return FLOW_NEXT; }                    /* hi-reg cmp */
+		return kind == 3 || rd == 15 ? FLOW_STOP : FLOW_NEXT;                  /* bx, pc written */
+	}
+	if (op >> 11 == 0x09 || (op >> 12 >= 5 && op >> 12 <= 10) || op >> 12 == 12 || op >> 8 == 0xb0) return FLOW_NEXT;
+	if ((op & 0xf600) == 0xb400) return (op & 0x0800) && (op & 0x100) ? FLOW_STOP : FLOW_NEXT; /* pop pc */
+	if (op >> 12 == 13 && (op >> 8 & 15) < 14) {
+		*reads = condition_reads[op >> 8 & 15];
+		*target = pc + 4 + (uint32_t) ((int32_t) (op << 24) >> 23);
+		return FLOW_BRANCH;
+	}
+	if (op >> 11 == 0x1c) { *target = pc + 4 + (uint32_t) ((int32_t) (op << 21) >> 20); return FLOW_JUMP; }
+	if (op >> 11 == 0x1e && next >> 11 == 0x1f) {                            /* BL pair */
+		*target = pc + 4 + (uint32_t) ((int32_t) (op << 21) >> 9) + 2 * (next & 2047);
+		return FLOW_CALL;
+	}
+	return FLOW_STOP;
+}
+static bool thumb_rom_code(const struct Gbn* m, uint32_t pc) {
+	return pc >> 24 >= 8 && pc >> 24 <= 13 && (pc & 0x01ffffffu) + 4 <= m->rom_size;
+}
+static unsigned thumb_rom_half(const struct Gbn* m, uint32_t pc) {
+	uint32_t offset = pc & 0x01ffffffu;
+	return m->rom[offset] | (unsigned) m->rom[offset + 1] << 8;
+}
+/* Flags that the ROM code at pc may read before writing them. */
+static unsigned thumb_needed(const struct Gbn* m, uint32_t pc, unsigned depth) {
+	unsigned needed = 0, killed = 0;
+	for (unsigned i = 0; i < 24; ++i, pc += 2) {
+		if (!thumb_rom_code(m, pc)) break;
+		unsigned op = thumb_rom_half(m, pc), reads, writes;
+		uint32_t target = 0;
+		unsigned flow = thumb_flow(op, thumb_rom_half(m, pc + 2), pc, &reads, &writes, &target);
+		needed |= reads & ~killed;
+		killed |= writes;
+		if (killed == FLAGS_ALL) return needed;
+		if (flow == FLOW_NEXT) continue;
+		unsigned after = FLAGS_ALL;
+		if (depth && flow == FLOW_BRANCH)
+			after = thumb_needed(m, target, depth - 1) | thumb_needed(m, pc + 2, depth - 1);
+		else if (depth && (flow == FLOW_JUMP || flow == FLOW_CALL))
+			after = thumb_needed(m, target, depth - 1);
+		return needed | (after & ~killed);
+	}
+	return needed | (FLAGS_ALL & ~killed);
+}
+#endif
+
 static void compile(struct GbnRv32* backend, struct GbnRv32Block* block) {
 	const struct Gbn* m = backend->machine;
 #if GBN_RV32_FAST & 8
-	bool allow_cv = true;
+	bool allow_cv = !(GBN_RV32_FAST & 16384);
 restart:;
 #endif
 	unlink_code(backend, block);
@@ -2532,6 +2640,31 @@ restart:;
         }
     }
 #endif
+#if GBN_RV32_FAST & 16384
+    /* ROM Thumb only: the straight line from the block start to its first
+     * control transfer, then up to two levels of successors. A block cut
+     * short continues into the same straight line, so its exit needs exactly
+     * the live-in of the next instruction. */
+    uint8_t live_after[GBN_RV32_INSNS]; unsigned live_count = 0;
+    if (block->thumb && m->code_region >= 8) {
+        unsigned reads[GBN_RV32_INSNS], writes[GBN_RV32_INSNS], end_live = FLAGS_ALL;
+        for (unsigned i = 0; i < GBN_RV32_INSNS; ++i) {
+            uint32_t at = block->pc + 2 * i, target = 0;
+            if (!thumb_rom_code(m, at)) break;
+            unsigned flow = thumb_flow(thumb_rom_half(m, at), thumb_rom_half(m, at + 2), at, &reads[i], &writes[i], &target);
+            live_count = i + 1;
+            if (flow == FLOW_NEXT) {
+                if (i + 1 == GBN_RV32_INSNS) end_live = thumb_needed(m, at + 2, 2);
+                continue;
+            }
+            end_live = flow == FLOW_BRANCH ? thumb_needed(m, target, 2) | thumb_needed(m, at + 2, 2)
+                : flow == FLOW_JUMP || flow == FLOW_CALL ? thumb_needed(m, target, 2) : FLAGS_ALL;
+            break;
+        }
+        unsigned live = end_live;
+        for (unsigned i = live_count; i-- > 0;) { live_after[i] = (uint8_t) live; live = (live & ~writes[i]) | reads[i]; }
+    }
+#endif
 	for (unsigned i = 0; i < GBN_RV32_INSNS; ++i) {
 		uint32_t pc = block->pc + width * i, offset = pc & m->code_mask;
 		unsigned size = m->code_region >= 8 ? m->rom_size : m->code_region == 2 ? GBN_EWRAM_SIZE : GBN_IWRAM_SIZE;
@@ -2579,6 +2712,9 @@ restart:;
 #endif
 #if GBN_RV32_FAST & 8
 		e.cv_dead = (cv_dead >> i) & 1;
+#endif
+#if GBN_RV32_FAST & 16384
+		e.live = i < live_count ? live_after[i] : FLAGS_ALL;
 #endif
 		uint32_t code = block->thumb ? fetch(m, pc, width) : 0;
 		unsigned bulk_count = block->thumb && (code & 0xf000) == 0x6000 ?
