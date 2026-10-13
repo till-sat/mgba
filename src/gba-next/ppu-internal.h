@@ -28,6 +28,10 @@ void gbn_ppu_indexed_vector(const struct IndexedBackground* layers, unsigned cou
  * tiles 0..29 have an opaque pixel | 4 when tiles 0..30 do. */
 unsigned gbn_ppu_row_decode_vector(const uint8_t* vram, const uint16_t* row_map,
     unsigned character, unsigned sy7, uint8_t* indices, uint16_t* address, uint32_t* words);
+/* Copy n bytes between non-overlapping buffers; the second form returns
+ * whether any destination byte changed. */
+void gbn_rvv_copy(uint8_t* dst, const uint8_t* src, unsigned n);
+bool gbn_rvv_copy_changed(uint8_t* dst, const uint8_t* src, unsigned n);
 /* Store value into n consecutive words. */
 void gbn_rvv_fill32(uint32_t* p, uint32_t value, unsigned n);
 /* n bytes at a and b are equal (cache validation of translated RAM code). */

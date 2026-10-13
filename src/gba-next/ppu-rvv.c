@@ -145,6 +145,26 @@ unsigned gbn_ppu_row_decode_vector(const uint8_t* vram, const uint16_t* row_map,
 }
 #endif
 
+void gbn_rvv_copy(uint8_t* dst, const uint8_t* src, unsigned n) {
+    for (unsigned i = 0; i < n;) {
+        size_t vl = __riscv_vsetvl_e8m8(n - i);
+        __riscv_vse8_v_u8m8(dst + i, __riscv_vle8_v_u8m8(src + i, vl), vl);
+        i += (unsigned) vl;
+    }
+}
+
+bool gbn_rvv_copy_changed(uint8_t* dst, const uint8_t* src, unsigned n) {
+    unsigned changed = 0;
+    for (unsigned i = 0; i < n;) {
+        size_t vl = __riscv_vsetvl_e8m8(n - i);
+        vuint8m8_t value = __riscv_vle8_v_u8m8(src + i, vl);
+        changed |= __riscv_vcpop_m_b1(__riscv_vmsne_vv_u8m8_b1(value, __riscv_vle8_v_u8m8(dst + i, vl), vl), vl);
+        __riscv_vse8_v_u8m8(dst + i, value, vl);
+        i += (unsigned) vl;
+    }
+    return changed != 0;
+}
+
 void gbn_rvv_fill32(uint32_t* p, uint32_t value, unsigned n) {
     for (unsigned i = 0; i < n;) {
         size_t vl = __riscv_vsetvl_e32m8(n - i);

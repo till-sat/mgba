@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MPL-2.0 */
 #include "internal.h"
+#include "ppu-internal.h" /* RVV helpers */
 #include <stddef.h>
 #if GBN_DMA_STATS
 uint64_t gbn_dma_first_span_hits;
@@ -422,6 +423,15 @@ static bool dma_now_lean(struct Gbn* m) {
 #else
 	const bool video = false;
 	uint32_t changed = 0;
+#endif
+#if defined(AM_RVV) && (GBN_PPU_RVV & 128)
+	/* Separate incrementing buffers: whole vector copies (no beat order to keep). */
+	if (ss && (dst + beats * width <= src || src + beats * width <= dst)) {
+		if (video) changed = gbn_rvv_copy_changed(dst, src, beats * width);
+		else gbn_rvv_copy(dst, src, beats * width);
+		if (width == 4) __builtin_memcpy(&value, __builtin_assume_aligned(src + 4 * (beats - 1), 4), 4);
+		else { uint16_t half; __builtin_memcpy(&half, __builtin_assume_aligned(src + 2 * (beats - 1), 2), 2); value = (uint32_t) half * 0x10001u; }
+	} else
 #endif
 	if (width == 4) {
 		for (unsigned i = 0; i < beats; ++i) {
