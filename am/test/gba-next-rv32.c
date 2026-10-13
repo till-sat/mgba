@@ -11,6 +11,9 @@
 #if !GBN_RV32_STATS
 #error This diagnostic requires GBN_RV32_STATS=1
 #endif
+#if GBN_RV32_FAST
+#error This diagnostic compares the exact translator cycle by cycle; build with GBN_RV32_FAST=0
+#endif
 #define CHECK(x) do { if (!(x)) { printf("FAIL RV32 line %d: %s\n", __LINE__, #x); exit(1); } } while (0)
 static struct Gbn machine, reference;
 static struct GbnRv32 backend;

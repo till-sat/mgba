@@ -3,6 +3,9 @@
  * guest time and prefetch state in one register frame across direct edges.
  * Generated code has no C calls or instruction decoding. */
 #include <gba-next/rv32.h>
+#ifndef GBN_RV32_FAST
+#define GBN_RV32_FAST 0
+#endif
 #include "internal.h"
 #include <stddef.h>
 #include <string.h>
@@ -58,6 +61,13 @@ struct Emit {
 	uint32_t thumb_literal[8];
 	unsigned thumb_literal_mask;
 	bool io_guarded;
+#if GBN_RV32_FAST & 8
+	bool cv_dead; /* the instruction's C/V are overwritten in this block before any read */
+#endif
+#if GBN_RV32_FAST & 16
+	unsigned link_count, link_at[GBN_RV32_INSNS + 2]; /* exit sites that may link directly */
+	uint32_t link_pc[GBN_RV32_INSNS + 2];
+#endif
 };
 
 static void word(struct Emit* e, uint32_t v) { e->block->code[e->count++] = v; }
@@ -124,6 +134,9 @@ static void packed_flags(struct Emit* e, unsigned dest) {
 /* Inputs may alias their assigned LHS/RHS scratch registers, respectively;
  * neither is overwritten until all uses of that original operand complete. */
 static void arithmetic(struct Emit* e, bool subtract, unsigned a, unsigned b) {
+#if GBN_RV32_FAST & 8
+    if (e->cv_dead) { op(e, RESULT, a, b, 0, subtract ? 0x20 : 0); nz(e); return; }
+#endif
     op(e,RESULT,a,b,0,subtract?0x20:0);
     op(e,TEMP,subtract?a:RESULT,subtract?b:a,3,0);
     if(subtract)imm(e,TEMP,TEMP,4,1);
@@ -224,6 +237,12 @@ static void ram_wait(struct Emit* e, const struct Gbn* m, uint32_t pc) {
 		op(e, NOW, NOW, WAIT, 0, 0);
 		return;
 	}
+#if GBN_RV32_FAST & 1
+	/* Fast mode: prefetch hides the fetch break; only the data wait counts. */
+	(void) pc;
+	op(e, NOW, NOW, WAIT, 0, 0);
+	return;
+#endif
 	unsigned shift = 0;
 	while ((1u << shift) < seq) ++shift;
 	constant(e, TEMP, pc + (e->block->thumb ? 4 : 8));
@@ -263,6 +282,9 @@ static void io_wait(struct Emit* e, const struct Gbn* m, uint32_t pc, unsigned w
 		ram_wait(e, m, pc);
 		return;
 	}
+#if GBN_RV32_FAST & 1
+	return; /* fast mode: the prefetch slot model is gone, the device wait is hidden */
+#endif
 	constant(e, TEMP, pc + (e->block->thumb ? 4 : 8));
 	op(e, LHS, PREFETCH, TEMP, 0, 0x20);
 	imm(e, RESULT, LHS, 3, 16);
@@ -1008,6 +1030,23 @@ static void leaf_read(struct Emit* e, const struct Gbn* m, uint32_t pc,
     constant(e, WAIT, (uint32_t) (uintptr_t) (width == 4 ? read_word : width == 2 ? read_half : read_byte));
     word(e, WAIT << 15 | WAIT << 7 | 0x67);
     guard(e, RHS, true);
+#if GBN_RV32_FAST & 2
+    /* Fast mode: a cartridge read counts like a RAM read, with the helper's
+     * wait (LHS). Open bus (class 2) stays native: the interpreter's bus has
+     * no open-bus path for unmapped regions. */
+    {
+        constant(e, WAIT, 2);
+        unsigned open = e->count; word(e, 0);
+        loaded_value(e, rd, kind, rn, adjustment);
+        op(e, NOW, NOW, LHS, 0, 0);
+        unsigned done = e->count; word(e, 0);
+        e->block->code[open] = beq(RHS, WAIT, 4 * (e->count - open));
+        open_bus_value(e, m, pc, rd, kind, width, rn, adjustment);
+        constant(e, WAIT, 2); ram_wait(e, m, pc);
+        e->block->code[done] = beq(ZERO, ZERO, 4 * (e->count - done));
+        return;
+    }
+#endif
     constant(e, WAIT, 2);
     unsigned open = e->count; word(e, 0);
     unsigned cartridge = 0;
@@ -1664,7 +1703,21 @@ static void tail(struct Emit* e, struct GbnRv32* backend, uint32_t pc, bool fall
             && offset / 4 < e->source_count) {
         unsigned target = offset / 4;
         imm(e, LIMIT, LIMIT, 0, (int) target - (int) b->instructions);
+#if GBN_RV32_FAST & 1
+        /* Fast mode has no per-instruction checks inside the body: a loop
+         * back into it takes the event and needs budget for the rest. */
+        unsigned late = e->count; word(e, beq(NOW, ZERO, 0) | 5u << 12);
+        imm(e, TEMP, ZERO, 0, (int) b->instructions);
+        unsigned short_budget = e->count; word(e, beq(LIMIT, TEMP, 0) | 4u << 12);
         word(e, beq(ZERO, ZERO, 4 * (e->body_offsets[target] - e->count)));
+        b->code[late] |= beq(0, 0, 4 * (e->count - late)) & 0xfe000f80u;
+        b->code[short_budget] |= beq(0, 0, 4 * (e->count - short_budget)) & 0xfe000f80u;
+        finish_count(e, target, false);
+        constant(e, RHS, pc);
+        e->returns[e->return_count++] = e->count; word(e, 0);
+#else
+        word(e, beq(ZERO, ZERO, 4 * (e->body_offsets[target] - e->count)));
+#endif
         return;
     }
 	imm(e, LIMIT, LIMIT, 0, -(int) b->instructions);
@@ -1683,7 +1736,17 @@ static void tail(struct Emit* e, struct GbnRv32* backend, uint32_t pc, bool fall
 			e->loop_jumps[e->loop_jump_count++] = e->count; word(e, 0);
 		} else {
 			unsigned slot = block_index(pc);
+#if GBN_RV32_FAST & 16
+			{
+				/* Always two words: a direct link to the target replaces them. */
+				uint32_t a = (uint32_t) (uintptr_t) &backend->lookup[slot], hi = (a + 0x800) >> 12;
+				if (e->link_count < GBN_RV32_INSNS + 2) { e->link_at[e->link_count] = e->count; e->link_pc[e->link_count++] = pc; }
+				word(e, hi << 12 | LHS << 7 | 0x37);
+				word(e, (a - (hi << 12)) << 20 | LHS << 15 | LHS << 7 | 0x13);
+			}
+#else
 			constant(e, LHS, (uint32_t) (uintptr_t) &backend->lookup[slot]);
+#endif
 			word(e, LHS << 15 | 2 << 12 | LHS << 7 | 3);
 			misses[n++] = e->count; word(e, beq(LHS, ZERO, 0));
 			word(e, offsetof(struct GbnRv32Block, chain) << 20 | LHS << 15 | 2 << 12 | RHS << 7 | 3);
@@ -1710,6 +1773,72 @@ static void tail(struct Emit* e, struct GbnRv32* backend, uint32_t pc, bool fall
 	e->returns[e->return_count++] = e->count; word(e, 0);
 }
 
+#if GBN_RV32_FAST & 4
+/* Fast mode: one prologue and one epilogue per kind of block (RAM blocks
+ * also carry RAM_EPOCH), shared by every block instead of a copy in each.
+ * A block enters the prologue with its return address in LHS (free at the C
+ * entry) and leaves through the epilogue jumping with TEMP (free there). */
+static uint32_t shared_frame_code[2][2][64] __attribute__((aligned(64)));
+static bool shared_frame_ready[2][2];
+static void prologue_body(struct Emit* e, bool ram) {
+	imm(e, SP, SP, 0, -FRAME_BYTES);
+	stack(e, NOW, 0, true); stack(e, HOST_S1, 4, true);
+	stack(e, PREFETCH, 8, true); stack(e, WAIT, 12, true); stack(e, HOST_S4, 16, true);
+	stack(e, NEGATIVE, SAVED_NEGATIVE, true); stack(e, IS_ZERO, SAVED_ZERO, true);
+	if (ram) { stack(e, RAM_EPOCH, SAVED_EPOCH, true); imm(e, RAM_EPOCH, TEMP, 0, 0); }
+	stack(e, CONTEXT, SAVED_CONTEXT, true); imm(e, CONTEXT, 14, 0, 0);
+	stack(e, 23, SAVED_S7, true); stack(e, 24, SAVED_S8, true);
+	stack(e, 27, SAVED_S11, true); stack(e, RA, SAVED_RA, true);
+	stack(e, LIMIT, INITIAL_CAP, true); stack(e, FLAGS, INITIAL_DEADLINE, true);
+	load(e, NOW, offsetof(struct Gbn, now));
+	op(e, NOW, NOW, FLAGS, 0, 0x20);
+	load(e, PREFETCH, offsetof(struct Gbn, prefetched_pc));
+	for (unsigned i = 0; i < 15; ++i) if (resident(i)) load(e, guest[i], offsetof(struct Gbn, cpu.r) + 4 * i);
+	load(e, FLAGS, offsetof(struct Gbn, cpu.cpsr));
+	imm(e, NEGATIVE, FLAGS, 5, 31); imm(e, IS_ZERO, FLAGS, 5, 30);
+	imm(e, IS_ZERO, IS_ZERO, 7, 1);
+	imm(e, FLAGS, FLAGS, 1, 2); imm(e, FLAGS, FLAGS, 5, 2);
+	word(e, LHS << 15 | 0x67);
+}
+static void epilogue_body(struct Emit* e, bool ram) {
+	for (unsigned i = 0; i < 15; ++i) if (resident(i)) store(e, guest[i], offsetof(struct Gbn, cpu.r) + 4 * i);
+	packed_flags(e, TEMP); store(e, TEMP, offsetof(struct Gbn, cpu.cpsr));
+	stack(e, TEMP, INITIAL_DEADLINE, false);
+	op(e, NOW, NOW, TEMP, 0, 0);
+	store(e, NOW, offsetof(struct Gbn, now));
+	store(e, PREFETCH, offsetof(struct Gbn, prefetched_pc));
+	imm(e, MACHINE, LIMIT, 0, 0);
+	imm(e, LIMIT, RHS, 0, 0);
+	stack(e, NOW, 0, false); stack(e, HOST_S1, 4, false);
+	stack(e, PREFETCH, 8, false); stack(e, WAIT, 12, false); stack(e, HOST_S4, 16, false);
+	stack(e, NEGATIVE, SAVED_NEGATIVE, false); stack(e, IS_ZERO, SAVED_ZERO, false);
+	if (ram) stack(e, RAM_EPOCH, SAVED_EPOCH, false);
+	stack(e, CONTEXT, SAVED_CONTEXT, false);
+	stack(e, 23, SAVED_S7, false); stack(e, 24, SAVED_S8, false);
+	stack(e, 27, SAVED_S11, false); stack(e, RA, SAVED_RA, false);
+	imm(e, SP, SP, 0, FRAME_BYTES); word(e, RA << 15 | 0x67);
+}
+/* kind 0: prologue, 1: epilogue */
+static uint32_t shared_frame(unsigned kind, bool ram) {
+	if (!shared_frame_ready[kind][ram]) {
+		static struct GbnRv32Block routine; /* Emit is ~4 KiB: not on the compile stack */
+		static struct Emit r;
+		memset(&r, 0, sizeof(r));
+		routine.code = shared_frame_code[kind][ram];
+		r.block = &routine;
+		if (kind) epilogue_body(&r, ram); else prologue_body(&r, ram);
+		shared_frame_ready[kind][ram] = true; /* allocate_code's fence.i publishes it */
+	}
+	return (uint32_t) (uintptr_t) shared_frame_code[kind][ram];
+}
+/* lui link, hi(target); jalr link_to, lo(target)(link) */
+static void far_jump(struct Emit* e, uint32_t target, unsigned through, unsigned link) {
+	uint32_t hi = (target + 0x800) >> 12;
+	word(e, hi << 12 | through << 7 | 0x37);
+	word(e, (target - (hi << 12)) << 20 | through << 15 | link << 7 | 0x67);
+}
+#endif
+
 static void unlink_code(struct GbnRv32* backend, struct GbnRv32Block* b) {
 	if (!b->arena_linked) return;
 	if (b->arena_prev) b->arena_prev->arena_next = b->arena_next;
@@ -1718,6 +1847,86 @@ static void unlink_code(struct GbnRv32* backend, struct GbnRv32Block* b) {
 	b->arena_linked = false;
 	b->arena_prev = b->arena_next = NULL;
 }
+
+#if GBN_RV32_FAST & 16
+/* Direct block links. An exit whose target block exists jumps straight to the
+ * target's chained entry (which still proves the context) instead of loading
+ * the lookup table. Each link is on the source's outgoing list and on either
+ * the target's incoming list or the pending bucket of its pc: retiring a
+ * target restores its incoming sites to the lookup and makes them pending;
+ * retiring a source forgets its links. Patches precede the compile's fence.i. */
+struct GbnLink {
+	uint32_t* site;
+	uint32_t pc, context, restore[2];
+	struct GbnLink **head, *next, *prev, *next_out;
+};
+#define GBN_LINKS 65536u
+#define GBN_LINK_BUCKETS 4096u
+static struct GbnLink link_pool[GBN_LINKS], *link_free;
+static unsigned link_used;
+static struct GbnLink *link_in[GBN_RV32_SLOTS], *link_out[GBN_RV32_SLOTS], *link_pending[GBN_LINK_BUCKETS];
+static unsigned link_site_count, link_site_at[GBN_RV32_INSNS + 2];
+static uint32_t link_site_pc[GBN_RV32_INSNS + 2];
+static unsigned link_bucket(uint32_t pc) { return ((pc >> 1) * 0x9e3779b1u) >> 20; }
+static void link_insert(struct GbnLink* l, struct GbnLink** head) {
+	l->head = head; l->prev = NULL; l->next = *head;
+	if (*head) (*head)->prev = l;
+	*head = l;
+}
+static void link_remove(struct GbnLink* l) {
+	if (l->prev) l->prev->next = l->next; else *l->head = l->next;
+	if (l->next) l->next->prev = l->prev;
+}
+static void link_patch(struct GbnLink* l, const struct GbnRv32Block* t) {
+	uint32_t target = (uint32_t) (uintptr_t) t->chain, hi = (target + 0x800) >> 12;
+	l->site[0] = hi << 12 | WAIT << 7 | 0x37;
+	l->site[1] = (target - (hi << 12)) << 20 | WAIT << 15 | 0x67;
+}
+static void link_retire(struct GbnRv32* backend, struct GbnRv32Block* b) {
+	unsigned slot = (unsigned) (b - backend->blocks);
+	while (link_in[slot]) {
+		struct GbnLink* l = link_in[slot];
+		link_remove(l);
+		l->site[0] = l->restore[0]; l->site[1] = l->restore[1];
+		link_insert(l, &link_pending[link_bucket(l->pc)]);
+	}
+	for (struct GbnLink *l = link_out[slot], *n; l; l = n) {
+		n = l->next_out;
+		link_remove(l);
+		l->next = link_free; link_free = l;
+	}
+	link_out[slot] = NULL;
+}
+static struct GbnRv32Block* link_target(struct GbnRv32* backend, uint32_t pc, uint32_t context) {
+	unsigned index = block_index(pc);
+	struct GbnRv32Block* b = backend->lookup[index];
+	if (b && b->valid && b->chain && b->pc == pc && b->context_tag == context) return b;
+	b = &backend->blocks[(index & (GBN_RV32_SETS - 1)) * GBN_RV32_WAYS];
+	for (unsigned way = 0; way < GBN_RV32_WAYS; ++way)
+		if (b[way].valid && b[way].chain && b[way].pc == pc && b[way].context_tag == context) return b + way;
+	return NULL;
+}
+static void link_publish(struct GbnRv32* backend, struct GbnRv32Block* block) {
+	unsigned slot = (unsigned) (block - backend->blocks);
+	for (unsigned k = 0; k < link_site_count; ++k) {
+		struct GbnLink* l = link_free;
+		if (l) link_free = l->next;
+		else if (link_used < GBN_LINKS) l = &link_pool[link_used++];
+		else break;
+		l->site = block->code + link_site_at[k]; l->pc = link_site_pc[k]; l->context = block->context_tag;
+		l->restore[0] = l->site[0]; l->restore[1] = l->site[1];
+		l->next_out = link_out[slot]; link_out[slot] = l;
+		struct GbnRv32Block* t = link_target(backend, l->pc, l->context);
+		if (t && t != block) { link_patch(l, t); link_insert(l, &link_in[t - backend->blocks]); }
+		else link_insert(l, &link_pending[link_bucket(l->pc)]);
+	}
+	for (struct GbnLink *l = link_pending[link_bucket(block->pc)], *n; l; l = n) {
+		n = l->next;
+		if (l->pc != block->pc || l->context != block->context_tag) continue;
+		link_remove(l); link_patch(l, block); link_insert(l, &link_in[slot]);
+	}
+}
+#endif
 
 static void allocate_code(struct GbnRv32* backend, struct GbnRv32Block* block, unsigned chain) {
 	if (backend->code_used + block->words > (backend->code_segment + 1) * GBN_RV32_SEGMENT_WORDS) {
@@ -1731,6 +1940,9 @@ static void allocate_code(struct GbnRv32* backend, struct GbnRv32Block* block, u
 		 * blocks and their guarded edges survive the arena wrapping. */
 		while (old) {
 			struct GbnRv32Block* next = old->arena_next;
+#if GBN_RV32_FAST & 16
+			link_retire(backend, old);
+#endif
 			old->valid = false; old->chain = NULL; old->arena_linked = false;
 			old->arena_prev = old->arena_next = NULL;
 			old = next;
@@ -1746,8 +1958,14 @@ static void allocate_code(struct GbnRv32* backend, struct GbnRv32Block* block, u
 	if (block->arena_next) block->arena_next->arena_prev = block;
 	backend->segments[backend->code_segment] = block;
 	block->arena_linked = true;
+#if GBN_RV32_FAST & 16
+	block->chain = block->code + chain;
+	link_publish(backend, block);
+	__asm__ volatile("fence.i" ::: "memory");
+#else
 	__asm__ volatile("fence.i" ::: "memory");
 	block->chain = block->code + chain;
+#endif
 }
 
 /* Tags are assigned only after comparing the complete immutable key.
@@ -1761,6 +1979,9 @@ static uint32_t context_tag(struct GbnRv32* backend, uint32_t generation, uint32
 		return entry->tag;
 	if (backend->next_context_tag == UINT32_MAX) {
 		for (unsigned i = 0; i < GBN_RV32_SLOTS; ++i) {
+#if GBN_RV32_FAST & 16
+			link_retire(backend, &backend->blocks[i]);
+#endif
 			backend->blocks[i].valid = false; backend->blocks[i].chain = NULL;
 		}
 		memset(backend->keys, 0, sizeof(backend->keys));
@@ -1778,6 +1999,9 @@ static unsigned finish_body(struct GbnRv32* backend, struct GbnRv32Block* block,
         unsigned edge_count, unsigned* entry) {
     const struct Gbn* m = backend->machine;
     unsigned width = block->thumb ? 2 : 4;
+#if GBN_RV32_FAST & 16
+    e->link_count = 0;
+#endif
 	e->source_count = block->instructions;
 	block->loop = block->branch && block->target == block->pc;
 	if (e->dynamic_pc) {
@@ -1849,7 +2073,12 @@ static unsigned finish_body(struct GbnRv32* backend, struct GbnRv32Block* block,
 		word(e, beq(ZERO, ZERO, 4 * (loop_entry - e->count)));
 	}
 	unsigned epilogue = e->count;
+#if GBN_RV32_FAST & 4
+	far_jump(e, shared_frame(1, m->code_region < 8), TEMP, ZERO);
+	if (0)
+#endif
 	for (unsigned i = 0; i < 15; ++i) if (resident(i)) store(e, guest[i], offsetof(struct Gbn, cpu.r) + 4 * i);
+#if !(GBN_RV32_FAST & 4)
 	packed_flags(e, TEMP); store(e, TEMP, offsetof(struct Gbn, cpu.cpsr));
 	stack(e, TEMP, INITIAL_DEADLINE, false);
 	op(e, NOW, NOW, TEMP, 0, 0);
@@ -1865,6 +2094,7 @@ static unsigned finish_body(struct GbnRv32* backend, struct GbnRv32Block* block,
     stack(e, 23, SAVED_S7, false); stack(e, 24, SAVED_S8, false);
     stack(e, 27, SAVED_S11, false); stack(e, RA, SAVED_RA, false);
 	imm(e, SP, SP, 0, FRAME_BYTES); word(e, RA << 15 | 0x67);
+#endif
 	for (unsigned i = 0; i < e->return_count; ++i)
 		block->code[e->returns[i]] = beq(ZERO, ZERO, 4 * (epilogue - e->returns[i]));
 	unsigned stubs[GBN_RV32_INSNS][2];
@@ -1997,9 +2227,46 @@ static unsigned arm_bulk(struct Emit* e, const struct Gbn* m, unsigned first,
     return 0;
 }
 
+#if GBN_RV32_FAST & 8
+/* What a Thumb instruction does to C and V, for dead-flag elimination:
+ * bit 0 writes C, bit 1 writes V, bit 2 reads C or V (or might), bit 3 ends
+ * the block or leaves the straight line (flags then count as live). */
+enum { CV_WC = 1, CV_WV = 2, CV_READ = 4, CV_END = 8 };
+static unsigned thumb_cv(unsigned op) {
+	if (op >> 11 == 0x03) return CV_WC | CV_WV;                    /* add/sub reg/imm3 */
+	if (op >> 13 == 0) return ((op >> 6) & 31) || (op >> 11) ? CV_WC : 0; /* LSL #0 keeps C */
+	if (op >> 11 == 0x04) return 0;                                /* mov imm8: N, Z */
+	if (op >> 13 == 1) return CV_WC | CV_WV;                       /* cmp/add/sub imm8 */
+	if (op >> 10 == 0x10) {
+		switch ((op >> 6) & 15) {
+		case 0: case 1: case 8: case 12: case 14: case 15: return 0;      /* and eor tst orr bic mvn */
+		case 9: case 10: case 11: return CV_WC | CV_WV;                   /* neg cmp cmn */
+		default: return CV_READ;                                          /* shifts by reg, adc, sbc, mul */
+		}
+	}
+	if (op >> 10 == 0x11) {
+		unsigned kind = op >> 8 & 3, rd = (op & 7) | ((op >> 4) & 8);
+		if (kind == 1) return CV_WC | CV_WV;                           /* hi-reg cmp */
+		if (kind == 3 || rd == 15) return CV_END;                       /* bx, or pc written */
+		return 0;
+	}
+	if (op >> 11 == 0x09 || (op >> 12 >= 5 && op >> 12 <= 10) || op >> 12 == 12) return 0; /* loads/stores, add pc/sp, ldm/stm */
+	if (op >> 8 == 0xb0) return 0;                                 /* sp adjust */
+	if ((op & 0xf600) == 0xb400) return (op & 0x0800) && (op & 0x100) ? CV_END : 0; /* push, pop (pc ends) */
+	return CV_END;                                                 /* branches, swi, the rest */
+}
+#endif
+
 static void compile(struct GbnRv32* backend, struct GbnRv32Block* block) {
 	const struct Gbn* m = backend->machine;
+#if GBN_RV32_FAST & 8
+	bool allow_cv = true;
+restart:;
+#endif
 	unlink_code(backend, block);
+#if GBN_RV32_FAST & 16
+	link_retire(backend, block);
+#endif
 	/* Oversized private workspace permits a rejected next instruction to be
      * lowered safely; only blocks fitting the unchanged 1024-word cap publish. */
     uint32_t work[4096];
@@ -2013,7 +2280,11 @@ static void compile(struct GbnRv32* backend, struct GbnRv32Block* block) {
 	unsigned width = block->thumb ? 2 : 4;
 	block->branch = false; block->fallback = false; block->loop = false; block->instructions = 0; block->proof_instructions = 0;
 	block->pipe[0] = fetch(m, block->pc, width); block->pipe[1] = fetch(m, block->pc + width, width);
+#if GBN_RV32_FAST & 4
+	unsigned prologue_words = 3; /* far call to the shared prologue, then to the body */
+#else
 	unsigned prologue_words = PROLOGUE_WORDS + 2 + (m->code_region < 8 ? 2 : 0);
+#endif
 	/* Entries in stops/returns/loop_jumps/body_offsets are written before
 	 * use, and their counters delimit the live prefix. Do not clear the
 	 * entire 4 KiB scratch table on every block compilation. */
@@ -2031,6 +2302,24 @@ static void compile(struct GbnRv32* backend, struct GbnRv32Block* block) {
 	}
     struct ArmEdge edges[GBN_RV32_INSNS];
     unsigned edge_count = 0;
+#if GBN_RV32_FAST & 1
+    unsigned fast_budget_at = ~0u;
+#endif
+#if GBN_RV32_FAST & 8
+    /* C/V of instruction i are dead when a later instruction of the straight
+     * line writes both before anything reads them; cv_killer[i] is that one. */
+    uint32_t cv_dead = 0; uint8_t cv_killer[GBN_RV32_INSNS];
+    e.cv_dead = false;
+    if (allow_cv && block->thumb) for (unsigned i = 0; i < GBN_RV32_INSNS; ++i) {
+        unsigned wrote = 0;
+        for (unsigned j = i + 1; j < GBN_RV32_INSNS; ++j) {
+            unsigned f = thumb_cv(fetch(m, block->pc + 2 * j, 2));
+            if (f & (CV_READ | CV_END)) break;
+            wrote |= f & (CV_WC | CV_WV);
+            if (wrote == (CV_WC | CV_WV)) { cv_dead |= 1u << i; cv_killer[i] = (uint8_t) j; break; }
+        }
+    }
+#endif
 	for (unsigned i = 0; i < GBN_RV32_INSNS; ++i) {
 		uint32_t pc = block->pc + width * i, offset = pc & m->code_mask;
 		unsigned size = m->code_region >= 8 ? m->rom_size : m->code_region == 2 ? GBN_EWRAM_SIZE : GBN_IWRAM_SIZE;
@@ -2054,10 +2343,24 @@ static void compile(struct GbnRv32* backend, struct GbnRv32Block* block) {
         unsigned saved_returns=e.return_count,saved_loops=e.loop_jump_count;
 		unsigned start = e.count, stops = e.stop_count;
 		e.body_offsets[i] = start;
+#if GBN_RV32_FAST & 1
+		/* Fast mode: events are taken at block exits (up to one block late).
+		 * The block runs whole only with budget for all of it, so LIMIT,
+		 * whose sign carries a branch condition, never goes negative. */
+		if (!i) {
+			fast_budget_at = e.count;
+			imm(&e, TEMP, ZERO, 0, 0); /* patched with the block's length */
+			stop(&e, LIMIT, TEMP, 4, false);
+		}
+#else
 		if (i) {
 			constant(&e, TEMP, i); stop(&e, LIMIT, TEMP, 0, false);
 			stop(&e, NOW, ZERO, 5, false);
 		}
+#endif
+#if GBN_RV32_FAST & 8
+		e.cv_dead = (cv_dead >> i) & 1;
+#endif
 		uint32_t code = block->thumb ? fetch(m, pc, width) : 0;
 		unsigned bulk_count = block->thumb && (code & 0xf000) == 0x6000 ?
 			thumb_io_group(&e,backend,m,i,code) : 0;
@@ -2108,8 +2411,25 @@ static void compile(struct GbnRv32* backend, struct GbnRv32Block* block) {
 		if (block->branch || e.dynamic_pc) break;
 	}
     unsigned loop_entry;
+#if GBN_RV32_FAST & 8
+    e.cv_dead = false;
+    for (unsigned i = 0; i < block->instructions && i < GBN_RV32_INSNS; ++i)
+        if ((cv_dead >> i & 1) && cv_killer[i] >= block->instructions) {
+            allow_cv = false;
+            goto restart;
+        }
+#endif
+#if GBN_RV32_FAST & 1
+    if (fast_budget_at != ~0u && block->instructions)
+        block->code[fast_budget_at] = (uint32_t) block->instructions << 20 | ZERO << 15 | TEMP << 7 | 0x13;
+#endif
     unsigned chain = finish_body(backend, block, &e, prologue_words, edges, edge_count, &loop_entry);
 	e.count = 0;
+#if GBN_RV32_FAST & 4
+	far_jump(&e, shared_frame(0, m->code_region < 8), LHS, LHS);
+	word(&e, beq(ZERO, ZERO, 4 * (loop_entry - e.count)));
+	if (0) {
+#endif
 	imm(&e, SP, SP, 0, -FRAME_BYTES);
 	stack(&e, NOW, 0, true); stack(&e, HOST_S1, 4, true);
 	stack(&e, PREFETCH, 8, true); stack(&e, WAIT, 12, true); stack(&e, HOST_S4, 16, true);
@@ -2128,11 +2448,18 @@ static void compile(struct GbnRv32* backend, struct GbnRv32Block* block) {
 	imm(&e, IS_ZERO, IS_ZERO, 7, 1);
 	imm(&e, FLAGS, FLAGS, 1, 2); imm(&e, FLAGS, FLAGS, 5, 2);
 	word(&e, beq(ZERO, ZERO, 4 * (loop_entry - e.count)));
+#if GBN_RV32_FAST & 4
+	}
+#endif
 	if (m->code_region < 8) {
 		unsigned slot = (unsigned) (block - backend->blocks);
 		memcpy(backend->source[slot], m->code + (block->pc & m->code_mask),
 			(block->proof_instructions > block->instructions ? block->proof_instructions : block->instructions ? block->instructions : 1) * width);
 	}
+#if GBN_RV32_FAST & 16
+	link_site_count = e.link_count;
+	for (unsigned k = 0; k < e.link_count; ++k) { link_site_at[k] = e.link_at[k]; link_site_pc[k] = e.link_pc[k]; }
+#endif
 	if (block->instructions) allocate_code(backend, block, chain);
 	else block->code = NULL;
 #if GBN_RV32_STATS

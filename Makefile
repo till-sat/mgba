@@ -204,6 +204,12 @@ GBN_RV32_SLOTS ?= 16384
 GBN_RV32_WAYS ?= 8
 # Executable arena capacity; reduce for targets with less memory.
 GBN_RV32_CODE_MIB ?= 16
+# Relaxed-timing translation (bits: 1 block-level budget and event checks
+# without the ROM prefetch model, 2 lean loads, 4 shared prologue/epilogue,
+# 8 dead C/V elimination, 16 direct block links; 31 enables all). Pictures
+# and sound stay correct but no longer match the exact core frame for frame;
+# 0 is the exact translator, which test-gba-next-rv32 compares cycle by cycle.
+GBN_RV32_FAST ?= 0
 # Optional vector PPU kernels: bit 0 = 4bpp rows, bit 1 = RGB composition,
 # bit 2 = indexed spans. RISCV_C_ISA may keep ordinary C/LTO scalar.
 GBN_PPU_RVV ?= 0
@@ -211,7 +217,7 @@ ifeq ($(GBN_RV32):$(PLATFORM),1:native)
 $(error GBN_RV32=1 requires a bare-metal RV32 platform)
 endif
 GBN_OBJECTS := $(addprefix $(BUILD_DIR)/src/gba-next/,core.o devices.o dma.o bios.o timer.o audio.o sio.o save.o ppu.o ppu-rvv.o rv32.o)
-GBN_CPPFLAGS := -Iinclude -DGBN_RV32=$(GBN_RV32) -DGBN_RV32_STATS=$(GBN_RV32_STATS) -DGBN_RV32_SLOTS=$(GBN_RV32_SLOTS) -DGBN_RV32_WAYS=$(GBN_RV32_WAYS) -DGBN_RV32_CODE_MIB=$(GBN_RV32_CODE_MIB) -DGBN_PPU_RVV=$(GBN_PPU_RVV)
+GBN_CPPFLAGS := -Iinclude -DGBN_RV32=$(GBN_RV32) -DGBN_RV32_STATS=$(GBN_RV32_STATS) -DGBN_RV32_SLOTS=$(GBN_RV32_SLOTS) -DGBN_RV32_WAYS=$(GBN_RV32_WAYS) -DGBN_RV32_CODE_MIB=$(GBN_RV32_CODE_MIB) -DGBN_RV32_FAST=$(GBN_RV32_FAST) -DGBN_PPU_RVV=$(GBN_PPU_RVV)
 ifeq ($(PROFILE),1)
 GBN_CPPFLAGS += -DGBN_PROFILE
 endif
