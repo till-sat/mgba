@@ -136,10 +136,46 @@ bool gbn_ppu_row_matches_vector(const uint8_t* vram, const uint8_t* map, unsigne
     return !__riscv_vcpop_m_b4(changed, vl);
 }
 
+#if GBN_PPU_RVV & 16
+/* With objects: 32-pixel chunks, so that one unit-stride e32 load brings the
+ * object pixels (color, key) in and two narrowing shifts split them, instead
+ * of two strided loads. */
+static void indexed_vector_objects(const struct IndexedBackground* layers, unsigned count,
+    const struct Pixel* objects, unsigned start, unsigned end,
+    const uint8_t* palette, uint16_t* output) {
+    for (unsigned x = start; x < end;) {
+        size_t vl = __riscv_vsetvl_e8m2(end - x);
+        vuint8m2_t indices = __riscv_vmv_v_x_u8m2(0, vl);
+        vuint8m2_t keys = __riscv_vmv_v_x_u8m2(39, vl);
+        for (unsigned i = count; i > 0; --i) {
+            const struct IndexedBackground* layer = layers + i - 1;
+            vuint8m2_t candidate = __riscv_vle8_v_u8m2(layer->indices + x, vl);
+            vbool4_t opaque = __riscv_vmsne_vx_u8m2_b4(__riscv_vand_vx_u8m2(candidate, 15, vl), 0, vl);
+            indices = __riscv_vmerge_vvm_u8m2(indices, candidate, opaque, vl);
+            keys = __riscv_vmerge_vxm_u8m2(keys, layer->key, opaque, vl);
+        }
+        vuint16m4_t offsets = __riscv_vsll_vx_u16m4(__riscv_vzext_vf2_u16m4(indices, vl), 1, vl);
+        vuint16m4_t colors = __riscv_vluxei16_v_u16m4((const uint16_t*) palette, offsets, vl);
+        colors = __riscv_vand_vx_u16m4(colors, 0x7fff, vl);
+        vuint32m8_t pixels = __riscv_vle32_v_u32m8((const uint32_t*) (objects + x), vl);
+        vuint16m4_t obj_colors = __riscv_vnsrl_wx_u16m4(pixels, 0, vl);
+        vuint8m2_t obj_keys = __riscv_vnsrl_wx_u8m2(__riscv_vnsrl_wx_u16m4(pixels, 16, vl), 0, vl);
+        vbool4_t allowed = __riscv_vmsltu_vv_u8m2_b4(obj_keys, keys, vl);
+        colors = __riscv_vmerge_vvm_u16m4(colors, obj_colors, allowed, vl);
+        __riscv_vse8_v_u8m4((uint8_t*) (output + x), __riscv_vreinterpret_v_u16m4_u8m4(colors), 2 * vl);
+        x += (unsigned) vl;
+    }
+}
+#endif
+
 void gbn_ppu_indexed_vector(const struct IndexedBackground* layers, unsigned count,
     const struct Pixel* objects, unsigned start, unsigned end,
     const uint8_t* palette, uint16_t* output) {
+#if GBN_PPU_RVV & 16
+    if (objects) indexed_vector_objects(layers, count, objects, start, end, palette, output);
+#else
     if (objects) indexed_vector_body(layers, count, objects, start, end, palette, output);
+#endif
     else indexed_vector_body(layers, count, NULL, start, end, palette, output);
 }
 #endif

@@ -32,6 +32,10 @@ static bool batched(const struct GbnDevices* d, unsigned id) {
  * change goes through schedule_timer, which forgets it. */
 static const struct Gbn* due_machine;
 static uint32_t due_when;
+/* Next overflow of each batched timer (bit in due_live) while due_machine
+ * is current: overflows below keep them exact without a rescan. */
+static uint32_t due_next[4];
+static unsigned due_live;
 #endif
 
 static void schedule_timer(struct Gbn* m, unsigned id) {
@@ -82,12 +86,16 @@ void gbn_timer_service(struct Gbn* m, unsigned id, uint32_t when) {
 void gbn_timer_catchup(struct Gbn* m, uint32_t until) {
 	struct GbnDevices* d = m->devices;
 	if (!d || (due_machine == m && (int32_t) (due_when - until) > 0)) return;
-	uint32_t next[4];
-	unsigned live = 0;
-	for (unsigned id = 0; id < 4; ++id) if (batched(d, id)) {
-		const struct GbnTimer* t = &d->timers[id];
-		next[id] = t->epoch + ((0x10000u - t->value) << shift(t->control));
-		live |= 1u << id;
+	uint32_t* next = due_next;
+	unsigned live = due_live;
+	if (due_machine != m) {
+		live = 0;
+		for (unsigned id = 0; id < 4; ++id) if (batched(d, id)) {
+			const struct GbnTimer* t = &d->timers[id];
+			next[id] = t->epoch + ((0x10000u - t->value) << shift(t->control));
+			live |= 1u << id;
+		}
+		due_live = live;
 	}
 	for (;;) {
 		int best = -1;

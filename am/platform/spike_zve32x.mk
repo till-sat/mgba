@@ -4,6 +4,6 @@
 SPIKE_PREFIX ?= /home/tillsat/tools/spike-zve32x
 RISCV_ISA ?= rv32im_zicsr_zifencei_zicbom_zve32x_zvl128b
 # The chip's vector PPU kernels.
-GBN_PPU_RVV ?= 12
+GBN_PPU_RVV ?= 28
 include am/platform/spike.mk
 PLATFORM_MAKEFILE += am/platform/spike_zve32x.mk
