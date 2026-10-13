@@ -1413,6 +1413,27 @@ static bool instruction(struct Emit* e, const struct Gbn* m, unsigned code, uint
 		if (kind != 1) put(e, rd);
 	} else if (code < 0x4400) {
 		unsigned kind = code >> 6 & 15;
+#if (GBN_RV32_FAST & 131072) && (GBN_RV32_FAST & 16384)
+		if (kind >= 2 && kind <= 4 && !(e->live & 2)) {
+			/* LSL/LSR/ASR by register with a dead C: amounts 32..255 give
+			 * zero (LSL/LSR) or the sign (ASR); one internal cycle. */
+			unsigned a = source(e, LHS, rd, pc), b = source(e, RHS, rs, pc);
+			imm(e, TEMP, b, 7, 255);
+			imm(e, WAIT, TEMP, 3, 32);
+			if (kind == 4) {
+				word(e, beq(WAIT, ZERO, 8) | 1u << 12);
+				imm(e, TEMP, ZERO, 0, 31);
+				op(e, RESULT, a, TEMP, 5, 0x20);
+			} else {
+				op(e, RESULT, a, TEMP, kind == 2 ? 1 : 5, 0);
+				op(e, WAIT, ZERO, WAIT, 0, 0x20);
+				op(e, RESULT, RESULT, WAIT, 7, 0);
+			}
+			nz(e); put(e, rd);
+			imm(e, NOW, NOW, 0, 1);
+			return true;
+		}
+#endif
 		if ((kind >= 2 && kind <= 4) || kind == 7) return false;
 		unsigned a = source(e, LHS, rd, pc), b = source(e, RHS, rs, pc);
 		if (kind == 13) {
