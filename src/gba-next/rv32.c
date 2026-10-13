@@ -22,9 +22,15 @@
 
 bool gbn_rv32_available(void) { return NATIVE_RV32 != 0; }
 
+#if (GBN_RV32_FAST & 4194304) && NATIVE_RV32
+static void hub_init(void);
+#endif
 void gbn_rv32_init(struct GbnRv32* backend, struct Gbn* m) {
 	memset(backend, 0, sizeof(*backend));
 	backend->machine = m;
+#if (GBN_RV32_FAST & 4194304) && NATIVE_RV32
+	hub_init();
+#endif
 }
 
 #if NATIVE_RV32
@@ -79,6 +85,16 @@ struct Emit {
 	unsigned cold_in_count, cold_in[2 * GBN_RV32_INSNS][2]; /* hot branch, cold target */
 	unsigned cold_out_count, cold_out[2 * GBN_RV32_INSNS][2]; /* cold jump, hot target */
 	uint32_t cold[GBN_RV32_WORDS];
+#endif
+#if GBN_RV32_FAST & 4194304
+	unsigned access_start; /* first word of the current load/store's address */
+#endif
+#if GBN_RV32_FAST & 8388608
+	unsigned insn_start; /* first word of the current instruction */
+	/* A Thumb branch ending the block: taken when branch_reg is nonzero
+	 * (zero with branch_clear), or always; else LIMIT bit 31 carries it. */
+	bool branch_direct, branch_always, branch_clear;
+	uint8_t branch_reg;
 #endif
 #if GBN_RV32_FAST & 1024
 	/* Thumb fetch time not yet added to NOW, and its value at each
@@ -163,24 +179,68 @@ static unsigned source(struct Emit* e, unsigned scratch, unsigned r, uint32_t pc
 	get(e, scratch, r, pc);
 	return scratch;
 }
+#if (GBN_RV32_FAST & 8388608) && (GBN_RV32_FAST & 512)
+/* Fast mode, Thumb: instead of copying RESULT into a guest register, let
+ * the instruction that computed it write the register, and its later readers
+ * (flag computations) read it there. Only when that is provably the same:
+ * the definition is an ALU word of this instruction, every word after it
+ * an ALU word that neither reads nor writes the register, and no branch of
+ * this instruction or cold path lands after the definition. */
+static bool direct_result(struct Emit* e, unsigned reg) {
+	uint32_t* code = e->block->code;
+	unsigned n = e->count, start = e->insn_start, k = n;
+	if (!e->block->thumb || code == e->cold || start == ~0u || n <= start) return false;
+	for (unsigned j = n; j-- > start;) {
+		uint32_t w = code[j], o = w & 127;
+		bool writes = o != 0x63 && o != 0x23 && (w >> 7 & 31) == RESULT;
+		if (writes) { k = j; break; }
+		if ((o != 0x13 && o != 0x33) || (w >> 7 & 31) == reg || (w >> 15 & 31) == reg ||
+		    (o == 0x33 && (w >> 20 & 31) == reg)) return false;
+	}
+	if (k == n || ((code[k] & 127) != 0x13 && (code[k] & 127) != 0x33 && (code[k] & 127) != 0x37)) return false;
+	for (unsigned j = start; j < k; ++j) {
+		uint32_t w = code[j];
+		int32_t delta;
+		if ((w & 127) == 0x63) delta = (int32_t) ((w >> 31) << 12 | (w >> 7 & 1) << 11 | (w >> 25 & 63) << 5 | (w >> 8 & 15) << 1) << 19 >> 19;
+		else if ((w & 127) == 0x6f) delta = (int32_t) ((w >> 31) << 20 | (w >> 12 & 255) << 12 | (w >> 20 & 1) << 11 | (w >> 21 & 1023) << 1) << 11 >> 11;
+		else continue;
+		int32_t target = (int32_t) j + delta / 4;
+		if (target > (int32_t) k && target <= (int32_t) n) return false;
+	}
+	for (unsigned i = 0; i < e->cold_out_count; ++i)
+		if (e->cold_out[i][1] > k && e->cold_out[i][1] <= n) return false;
+	code[k] = (code[k] & ~(31u << 7)) | reg << 7;
+	for (unsigned j = k + 1; j < n; ++j) {
+		uint32_t w = code[j];
+		if ((w >> 15 & 31) == RESULT) w = (w & ~(31u << 15)) | reg << 15;
+		if ((w & 127) == 0x33 && (w >> 20 & 31) == RESULT) w = (w & ~(31u << 20)) | reg << 20;
+		code[j] = w;
+	}
+	return true;
+}
+#endif
 static void put_value(struct Emit* e, unsigned r, unsigned value) {
 	e->written |= 1u << r;
 	e->thumb_literal_mask &= ~(1u << r);
+#if (GBN_RV32_FAST & 8388608) && (GBN_RV32_FAST & 512)
+	if (resident(r) && value == RESULT && direct_result(e, guest[r])) return;
+#endif
 	if (resident(r)) { if (guest[r] != value) imm(e, guest[r], value, 0, 0); }
 	else store(e, value, offsetof(struct Gbn, cpu.r) + 4 * r);
 }
 static void put(struct Emit* e, unsigned r) { put_value(e, r, RESULT); }
-static void nz(struct Emit* e) {
+static void nz_of(struct Emit* e, unsigned value) {
 	/* Keep independent booleans: entry CPSR may legally contain N=Z=1. */
 #if GBN_RV32_FAST & 16384
 	if (e->live & 8)
 #endif
-	imm(e, NEGATIVE, RESULT, 5, 31);
+	imm(e, NEGATIVE, value, 5, 31);
 #if GBN_RV32_FAST & 16384
 	if (e->live & 4)
 #endif
-	imm(e, IS_ZERO, RESULT, 3, 1);
+	imm(e, IS_ZERO, value, 3, 1);
 }
+static void nz(struct Emit* e) { nz_of(e, RESULT); }
 /* FLAGS retains bits 0..29. Materialize N/Z only when the complete CPSR is
  * observed, including fixed-point proofs and every native return reason. */
 static void packed_flags(struct Emit* e, unsigned dest) {
@@ -587,11 +647,27 @@ static void open_bus_value(struct Emit* e, const struct Gbn* m, uint32_t pc,
     put(e,rd);
 }
 
+#if GBN_RV32_FAST & 4194304
+/* Fast mode: the memory leaves sit together within reach of tp (see
+ * hub_call), and a read reports success as 0, its wait already added to
+ * NOW, so a single branch leaves for the miss (1) and open-bus (2) paths. */
+#define LEAF __attribute__((naked, noinline, used, section(".text.gbn_hub")))
+#define LEAF_OK "0"
+#define LEAF_ROM "0"
+#define LEAF_MISS "1"
+#define LEAF_TIME "bnez t1,1f\n\tadd s0,s0,t0\n\t1: " /* NOW += wait */
+#else
+#define LEAF __attribute__((naked, noinline, used))
+#define LEAF_OK "1"
+#define LEAF_ROM "-1"
+#define LEAF_MISS "0"
+#define LEAF_TIME ""
+#endif
 /* Preserve the resident guest frame. a3 is the original data address;
  * t2 returns an unsigned value, t0 the bus/internal wait and t1 the kind:
  * 0=miss, 1=RAM/stored IO, -1=ROM, 2=open bus handled with the caller PC.
  * s3 is the private link; gp/tp, guest LR and all resident state stay intact. */
-__attribute__((naked, noinline, used)) static void read_byte(void) {
+LEAF static void read_byte(void) {
     __asm__ volatile(
         "srli t1,a3,24\n\t"
         "addi t1,t1,-2\n\t"
@@ -612,7 +688,7 @@ __attribute__((naked, noinline, used)) static void read_byte(void) {
         "add t0,t0,t2\n\t"
         "lbu t2,0(t0)\n\t"
         "mv t0,t1\n\t"
-        "li t1,1\n\t"
+        "li t1," LEAF_OK "\n\t"
         "j 8f\n\t"
         "3: srli t1,a3,24\n\t"
         "addi t1,t1,-8\n\t"
@@ -633,7 +709,7 @@ __attribute__((naked, noinline, used)) static void read_byte(void) {
         "add t0,a0,t0\n\t"
         "lbu t1,%c[rom_nonseq](t0)\n\t"
         "addi t0,t1,2\n\t"
-        "li t1,-1\n\t"
+        "li t1," LEAF_ROM "\n\t"
         "j 8f\n\t"
         "4: srli t1,a3,24\n\t"
         "addi t1,t1,-4\n\t"
@@ -658,17 +734,17 @@ __attribute__((naked, noinline, used)) static void read_byte(void) {
         "add t0,t0,t2\n\t"
         "lbu t2,0(t0)\n\t"
         "li t0,2\n\t"
-        "li t1,1\n\t"
+        "li t1," LEAF_OK "\n\t"
         "j 8f\n\t"
         "6: li t2,0\n\t"
         "li t0,2\n\t"
-        "li t1,1\n\t"
+        "li t1," LEAF_OK "\n\t"
         "j 8f\n\t"
         "7: li t0,2\n\t"
         "li t1,2\n\t"
         "j 8f\n\t"
-        "9: li t1,0\n\t"
-        "8: jalr zero,s3,0\n\t"
+        "9: li t1," LEAF_MISS "\n\t"
+        "8: " LEAF_TIME "jalr zero,s3,0\n\t"
         : : [iwram] "i" (offsetof(struct Gbn, iwram)),
             [ewram] "i" (offsetof(struct Gbn, ewram)),
             [ewram_wait] "i" (offsetof(struct Gbn, ewram_wait)),
@@ -683,7 +759,7 @@ __attribute__((naked, noinline, used)) static void read_byte(void) {
  * t2 returns an unsigned value, t0 the bus/internal wait and t1 the kind:
  * 0=miss, 1=RAM/stored IO, -1=ROM, 2=open bus handled with the caller PC.
  * s3 is the private link; gp/tp, guest LR and all resident state stay intact. */
-__attribute__((naked, noinline, used)) static void read_half(void) {
+LEAF static void read_half(void) {
     __asm__ volatile(
         "andi t0,a3,1\n\t"
         "bnez t0,9f\n\t"
@@ -708,7 +784,7 @@ __attribute__((naked, noinline, used)) static void read_half(void) {
         "bnez t2,9f\n\t"
         "lhu t2,0(t0)\n\t"
         "mv t0,t1\n\t"
-        "li t1,1\n\t"
+        "li t1," LEAF_OK "\n\t"
         "j 8f\n\t"
         "3: srli t1,a3,24\n\t"
         "addi t1,t1,-8\n\t"
@@ -733,7 +809,7 @@ __attribute__((naked, noinline, used)) static void read_half(void) {
         "add t0,a0,t0\n\t"
         "lbu t1,%c[rom_nonseq](t0)\n\t"
         "addi t0,t1,2\n\t"
-        "li t1,-1\n\t"
+        "li t1," LEAF_ROM "\n\t"
         "j 8f\n\t"
         "4: srli t1,a3,24\n\t"
         "addi t1,t1,-4\n\t"
@@ -758,17 +834,17 @@ __attribute__((naked, noinline, used)) static void read_half(void) {
         "add t0,t0,t2\n\t"
         "lhu t2,0(t0)\n\t"
         "li t0,2\n\t"
-        "li t1,1\n\t"
+        "li t1," LEAF_OK "\n\t"
         "j 8f\n\t"
         "6: li t2,0\n\t"
         "li t0,2\n\t"
-        "li t1,1\n\t"
+        "li t1," LEAF_OK "\n\t"
         "j 8f\n\t"
         "7: li t0,2\n\t"
         "li t1,2\n\t"
         "j 8f\n\t"
-        "9: li t1,0\n\t"
-        "8: jalr zero,s3,0\n\t"
+        "9: li t1," LEAF_MISS "\n\t"
+        "8: " LEAF_TIME "jalr zero,s3,0\n\t"
         : : [iwram] "i" (offsetof(struct Gbn, iwram)),
             [ewram] "i" (offsetof(struct Gbn, ewram)),
             [ewram_wait] "i" (offsetof(struct Gbn, ewram_wait)),
@@ -783,7 +859,7 @@ __attribute__((naked, noinline, used)) static void read_half(void) {
  * t2 returns an unsigned value, t0 the bus/internal wait and t1 the kind:
  * 0=miss, 1=RAM/stored IO, -1=ROM, 2=open bus handled with the caller PC.
  * s3 is the private link; gp/tp, guest LR and all resident state stay intact. */
-__attribute__((naked, noinline, used)) static void read_word(void) {
+LEAF static void read_word(void) {
     __asm__ volatile(
         "andi t0,a3,3\n\t"
         "bnez t0,9f\n\t"
@@ -809,7 +885,7 @@ __attribute__((naked, noinline, used)) static void read_word(void) {
         "bnez t2,9f\n\t"
         "lw t2,0(t0)\n\t"
         "mv t0,t1\n\t"
-        "li t1,1\n\t"
+        "li t1," LEAF_OK "\n\t"
         "j 8f\n\t"
         "3: srli t1,a3,24\n\t"
         "addi t1,t1,-8\n\t"
@@ -834,7 +910,7 @@ __attribute__((naked, noinline, used)) static void read_word(void) {
         "lbu t0,%c[rom_seq](t0)\n\t"
         "add t1,t1,t0\n\t"
         "addi t0,t1,3\n\t"
-        "li t1,-1\n\t"
+        "li t1," LEAF_ROM "\n\t"
         "j 8f\n\t"
         "4: srli t1,a3,24\n\t"
         "addi t1,t1,-4\n\t"
@@ -859,7 +935,7 @@ __attribute__((naked, noinline, used)) static void read_word(void) {
         "add t0,t0,t2\n\t"
         "lw t2,0(t0)\n\t"
         "li t0,2\n\t"
-        "li t1,1\n\t"
+        "li t1," LEAF_OK "\n\t"
         "j 8f\n\t"
         "6: lw t2,%c[devices](a0)\n\t"
         "add t0,t0,t2\n\t"
@@ -867,13 +943,13 @@ __attribute__((naked, noinline, used)) static void read_word(void) {
         "srli t2,t2,16\n\t"
         "slli t2,t2,16\n\t"
         "li t0,2\n\t"
-        "li t1,1\n\t"
+        "li t1," LEAF_OK "\n\t"
         "j 8f\n\t"
         "7: li t0,2\n\t"
         "li t1,2\n\t"
         "j 8f\n\t"
-        "9: li t1,0\n\t"
-        "8: jalr zero,s3,0\n\t"
+        "9: li t1," LEAF_MISS "\n\t"
+        "8: " LEAF_TIME "jalr zero,s3,0\n\t"
         : : [iwram] "i" (offsetof(struct Gbn, iwram)),
             [ewram] "i" (offsetof(struct Gbn, ewram)),
             [ewram_wait] "i" (offsetof(struct Gbn, ewram_wait)),
@@ -883,6 +959,196 @@ __attribute__((naked, noinline, used)) static void read_word(void) {
             [devices] "i" (offsetof(struct Gbn, devices)),
             [io_bytes] "i" (sizeof(native_io_readable) * 2), [table] "i" (native_io_readable));
 }
+
+#if GBN_RV32_FAST & 4194304
+/* Fast mode, ROM blocks: RAM stores through shared leaves. a3 is the data
+ * address and t2 the value; t1 returns 0 when stored (its wait added to
+ * NOW), else nonzero: not RAM, absent RAM or a misaligned address. s3 is
+ * the link. */
+_Static_assert(GBN_IWRAM_SIZE == 32768 && GBN_EWRAM_SIZE == 262144, "write leaf masks");
+#define WRITE_LEAF(name, align, store, word) \
+LEAF static void name(void) { \
+    __asm__ volatile( \
+        "andi t1,a3," #align "\n\t" \
+        "bnez t1,9f\n\t" \
+        "srli t1,a3,24\n\t" \
+        "addi t1,t1,-2\n\t" \
+        "sltiu t0,t1,2\n\t" \
+        "beqz t0,9f\n\t" \
+        "beqz t1,0f\n\t" \
+        "lw t1,%c[iwram](a0)\n\t" \
+        "li t0,32767\n\t" \
+        "beqz t1,9f\n\t" \
+        "and t0,a3,t0\n\t" \
+        "add t1,t1,t0\n\t" \
+        "andi t0,t1," #align "\n\t" \
+        "bnez t0,9f\n\t" \
+        store " t2,0(t1)\n\t" \
+        "addi s0,s0,1\n\t" \
+        "li t1,0\n\t" \
+        "jalr zero,s3,0\n\t" \
+        "0: lw t1,%c[ewram](a0)\n\t" \
+        "li t0,262143\n\t" \
+        "beqz t1,9f\n\t" \
+        "and t0,a3,t0\n\t" \
+        "add t1,t1,t0\n\t" \
+        "andi t0,t1," #align "\n\t" \
+        "bnez t0,9f\n\t" \
+        store " t2,0(t1)\n\t" \
+        "lbu t0,%c[ewram_wait](a0)\n\t" \
+        "addi t0,t0,1\n\t" \
+        word \
+        "add s0,s0,t0\n\t" \
+        "li t1,0\n\t" \
+        "jalr zero,s3,0\n\t" \
+        "9: li t1,1\n\t" \
+        "jalr zero,s3,0\n\t" \
+        : : [iwram] "i" (offsetof(struct Gbn, iwram)), [ewram] "i" (offsetof(struct Gbn, ewram)), \
+            [ewram_wait] "i" (offsetof(struct Gbn, ewram_wait))); \
+}
+WRITE_LEAF(write_byte, 0, "sb", "")
+WRITE_LEAF(write_half, 1, "sh", "")
+WRITE_LEAF(write_word, 3, "sw", "slli t0,t0,1\n\t")
+#undef WRITE_LEAF
+/* Fast mode, ROM blocks: a Thumb PUSH/POP span. a3 is its lowest address,
+ * t2 its bytes plus 1 for POP (consumed); t1 returns the host address of the
+ * lowest word, the span's time added to NOW (per word 1 in IWRAM, 2 * (wait
+ * + 1) in EWRAM, plus 1 for POP), or 0: not RAM, absent or misaligned host
+ * RAM, or a span over the mirror end (bytes + pop - 2 past the offset
+ * reaching the size). */
+LEAF static void stack_span(void) {
+    __asm__ volatile(
+        "srli t1,a3,24\n\t"
+        "addi t1,t1,-2\n\t"
+        "sltiu t0,t1,2\n\t"
+        "beqz t0,9f\n\t"
+        "bnez t1,3f\n\t"
+        "lw t1,%c[ewram](a0)\n\t"
+        "beqz t1,9f\n\t"
+        "andi t0,t1,3\n\t"
+        "bnez t0,9f\n\t"
+        "li t0,262140\n\t"
+        "and t0,a3,t0\n\t"
+        "add t1,t1,t0\n\t"
+        "add t0,t0,t2\n\t"
+        "addi t0,t0,-2\n\t"
+        "srli t0,t0,18\n\t"
+        "bnez t0,9f\n\t"
+        "add s0,s0,t2\n\t"
+        "lbu t0,%c[ewram_wait](a0)\n\t"
+        "slli t0,t0,1\n\t"
+        "addi t0,t0,-2\n\t"
+        "srli t2,t2,2\n\t"
+        "mul t2,t2,t0\n\t"
+        "add s0,s0,t2\n\t"
+        "jalr zero,s3,0\n\t"
+        "3: lw t1,%c[iwram](a0)\n\t"
+        "beqz t1,9f\n\t"
+        "andi t0,t1,3\n\t"
+        "bnez t0,9f\n\t"
+        "li t0,32764\n\t"
+        "and t0,a3,t0\n\t"
+        "add t1,t1,t0\n\t"
+        "add t0,t0,t2\n\t"
+        "addi t0,t0,-2\n\t"
+        "srli t0,t0,15\n\t"
+        "bnez t0,9f\n\t"
+        "srli t0,t2,2\n\t"
+        "add s0,s0,t0\n\t"
+        "andi t2,t2,1\n\t"
+        "add s0,s0,t2\n\t"
+        "jalr zero,s3,0\n\t"
+        "9: li t1,0\n\t"
+        "jalr zero,s3,0\n\t"
+        : : [iwram] "i" (offsetof(struct Gbn, iwram)), [ewram] "i" (offsetof(struct Gbn, ewram)),
+            [ewram_wait] "i" (offsetof(struct Gbn, ewram_wait)));
+}
+
+/* Fast mode, ROM blocks: an indirect target in t2 (raw), its block's
+ * region in t0 (shifted to bits 24..31). t0 returns 0 when the target lies
+ * in that region and inside the ROM, its Thumb address stored for the
+ * indirect tail; else nonzero (nothing that matters stored). */
+LEAF static void code_target(void) {
+    __asm__ volatile(
+        "xor t0,t0,t2\n\t"
+        "srli t0,t0,24\n\t"
+        "bnez t0,9f\n\t"
+        "slli t0,t2,7\n\t"
+        "srli t0,t0,7\n\t"
+        "andi t2,t2,-2\n\t"
+        "sw t2,%c[target](sp)\n\t"
+        "lw t2,%c[rom_size](a0)\n\t"
+        "sltu t0,t0,t2\n\t"
+        "xori t0,t0,1\n\t"
+        "jalr zero,s3,0\n\t"
+        "9: li t0,1\n\t"
+        "jalr zero,s3,0\n\t"
+        : : [target] "i" (STACK_TARGET), [rom_size] "i" (offsetof(struct Gbn, rom_size)));
+}
+_Static_assert(GBN_ROM_MAX_SIZE == 1u << 25, "code_target keeps 25 offset bits");
+/* The indirect tail's lookup (one backend's table, hub_lookup): a hit
+ * enters the target's chain, a miss returns to the block's own exit. */
+static uint32_t hub_lookup;
+LEAF static void indirect_lookup(void) {
+    __asm__ volatile(
+        "lw t2,%c[target](sp)\n\t"
+        "srli a3,t2,1\n\t"
+        "li t0,0x9e3779b1\n\t"
+        "mul a3,a3,t0\n\t"
+        "srli a3,a3,%c[shift]\n\t"
+        "slli a3,a3,2\n\t"
+        "lui t0,%%hi(%[lookup])\n\t"
+        "lw t0,%%lo(%[lookup])(t0)\n\t"
+        "add t0,t0,a3\n\t"
+        "lw t0,0(t0)\n\t"
+        "beqz t0,9f\n\t"
+        "lw t1,%c[chain](t0)\n\t"
+        "beqz t1,9f\n\t"
+        "lw a3,%c[pc](t0)\n\t"
+        "bne a3,t2,9f\n\t"
+        "jr t1\n\t"
+        "9: jalr zero,s3,0\n\t"
+        : : [target] "i" (STACK_TARGET), [shift] "i" (GBN_RV32_HASH_SHIFT), [lookup] "s" (&hub_lookup),
+            [chain] "i" (offsetof(struct GbnRv32Block, chain)), [pc] "i" (offsetof(struct GbnRv32Block, pc)));
+}
+
+/* tp addresses the leaves: tp itself is unused by the C code, so native
+ * code sets it on entry and calls a leaf with one jalr s3, offset(tp). */
+static uint32_t hub_base(void) { return (uint32_t) (uintptr_t) read_byte + 2048; }
+static bool hub_reaches(void) {
+    static const void* const leaves[] = {read_byte, read_half, read_word, write_byte, write_half, write_word, stack_span, code_target, indirect_lookup};
+    for (unsigned i = 0; i < sizeof(leaves) / sizeof(leaves[0]); ++i) {
+        int32_t offset = (int32_t) ((uint32_t) (uintptr_t) leaves[i] - hub_base());
+        if (offset < -2048 || offset > 2047) return false;
+    }
+    return true;
+}
+static void hub_call(struct Emit* e, void (*leaf)(void)) {
+    uint32_t offset = (uint32_t) (uintptr_t) leaf - hub_base();
+    word(e, (offset & 4095) << 20 | 4u << 15 | WAIT << 7 | 0x67);
+}
+static bool hub_ready;
+static void hub_init(void) { hub_ready = hub_reaches(); }
+/* The leaves take the address in TEMP; memory()/arm_memory() computed it in
+ * LHS with their last words. Retarget the last one, folding a copy of a
+ * guest register into it, instead of adding a move. */
+static void address_to_temp(struct Emit* e) {
+    uint32_t* code = e->block->code;
+    unsigned n = e->count, start = e->access_start;
+    e->access_start = ~0u;
+    uint32_t last = n ? code[n - 1] : 0;
+    bool alu = ((last & 127) == 0x13 || (last & 127) == 0x33) && (last >> 7 & 31) == LHS;
+    if (start == ~0u || n < start + 1 || !alu) { imm(e, TEMP, LHS, 0, 0); return; }
+    last = (last & ~(31u << 7)) | TEMP << 7;
+    uint32_t prev = n >= start + 2 ? code[n - 2] : 0;
+    bool copy = (prev & 0xfff07fffu) == (0x13u | LHS << 7); /* addi LHS, x, 0 */
+    bool reads_rs2 = (last & 127) == 0x33 && (last >> 20 & 31) == LHS;
+    if (copy && (last >> 15 & 31) == LHS && !reads_rs2) {
+        last = (last & ~(31u << 15)) | (prev >> 15 & 31) << 15;
+        code[n - 2] = last; e->count = n - 1;
+    } else code[n - 1] = last;
+}
+#endif
 
 static void loaded_value(struct Emit* e, unsigned rd, unsigned kind, unsigned rn, int adjustment) {
     if (kind == 3 || kind == 7) {
@@ -1109,6 +1375,21 @@ static void leaf_read(struct Emit* e, const struct Gbn* m, uint32_t pc,
         unsigned rd, unsigned kind, unsigned rn, int adjustment) {
     unsigned width = kind == 4 ? 4 : kind == 5 || kind == 7 ? 2 : 1;
     e->read_seen = true;
+#if (GBN_RV32_FAST & 4194304) && (GBN_RV32_FAST & 512) && (GBN_RV32_FAST & 2)
+    if (hub_ready) {
+        /* One call through tp and one branch for the miss and open bus. */
+        address_to_temp(e);
+        hub_call(e, width == 4 ? read_word : width == 2 ? read_half : read_byte);
+        unsigned slow = e->count; word(e, beq(RHS, ZERO, 0) | 1u << 12);
+        loaded_value(e, rd, kind, rn, adjustment);
+        cold_begin(e, slow);
+        imm(e, WAIT, RHS, 0, -1); guard(e, WAIT, true);
+        open_bus_value(e, m, pc, rd, kind, width, rn, adjustment);
+        constant(e, WAIT, 2); ram_wait(e, m, pc);
+        cold_end(e);
+        return;
+    }
+#endif
     imm(e, TEMP, LHS, 0, 0);
     constant(e, WAIT, (uint32_t) (uintptr_t) (width == 4 ? read_word : width == 2 ? read_half : read_byte));
     word(e, WAIT << 15 | WAIT << 7 | 0x67);
@@ -1168,6 +1449,28 @@ static void direct_access(struct Emit* e, const struct Gbn* m, uint32_t pc, unsi
 	e->read_only = false;
 	static const unsigned widths[] = {4, 2, 1, 1, 4, 2, 1, 2};
 	unsigned width = widths[kind];
+#if (GBN_RV32_FAST & 4194304) && (GBN_RV32_FAST & 512)
+	if (hub_ready && m->code_region >= 8) {
+		/* ROM code: a RAM store is one leaf call (no code to protect);
+		 * anything else leaves as before, word stores through the DMA
+		 * register paths. */
+		address_to_temp(e);
+		get(e, RESULT, rd, pc);
+		hub_call(e, width == 4 ? write_word : width == 2 ? write_half : write_byte);
+		if (width == 4) {
+			unsigned other = e->count; word(e, beq(RHS, ZERO, 0) | 1u << 12);
+			writeback(e, rn, adjustment);
+			cold_begin(e, other);
+			dma_start_emit(e, m, pc, rd, rn, adjustment);
+			dma_address_store(e, m, pc, rd, rn, adjustment);
+			cold_end(e);
+		} else {
+			guard(e, RHS, false);
+			writeback(e, rn, adjustment);
+		}
+		return;
+	}
+#endif
 	imm(e, TEMP, LHS, 0, 0); /* original address */
 	imm(e, RHS, LHS, 5, 24); imm(e, RHS, RHS, 0, -2);
 	imm(e, RESULT, RHS, 3, 2); /* region 2 or 3 */
@@ -1237,6 +1540,9 @@ static void direct_access(struct Emit* e, const struct Gbn* m, uint32_t pc, unsi
  * instruction for IO, unaligned or unmapped accesses. */
 static bool memory(struct Emit* e, const struct Gbn* m, unsigned code, uint32_t pc) {
 	unsigned rd = code & 7, rs = code >> 3 & 7, kind;
+#if GBN_RV32_FAST & 4194304
+	e->access_start = e->count;
+#endif
 	uint32_t effective = 0, base_value = 0;
 	bool thumb_immediate = false;
 	bool thumb_exact = false;
@@ -1256,11 +1562,21 @@ static bool memory(struct Emit* e, const struct Gbn* m, unsigned code, uint32_t 
 		constant(e, RESULT, value); put(e, rd);
 		e->thumb_literal[rd] = value; e->thumb_literal_mask |= 1u << rd;
 		/* ROM word read + internal cycle + fetch_break, same ROM window. */
+#if (GBN_RV32_FAST & 4194304) && (GBN_RV32_FAST & 1024)
+		e->deferred += 3 + 2 * m->code_nonseq; /* a constant: with the fetch time */
+#else
 		imm(e, NOW, NOW, 0, 3 + 2 * m->code_nonseq);
+#endif
 		return true;
 	} else if ((code & 0xf000) == 0x5000) {
 		kind = code >> 9 & 7;
-		get(e, LHS, rs, pc); get(e, RHS, code >> 6 & 7, pc); op(e, LHS, LHS, RHS, 0, 0);
+#if GBN_RV32_FAST & 4194304
+		if (hub_ready) {
+			unsigned a = source(e, LHS, rs, pc);
+			op(e, LHS, a, source(e, RHS, code >> 6 & 7, pc), 0, 0);
+		} else
+#endif
+		{ get(e, LHS, rs, pc); get(e, RHS, code >> 6 & 7, pc); op(e, LHS, LHS, RHS, 0, 0); }
 	} else if (code >= 0x6000 && code < 0x9000) {
 		thumb_exact = (e->thumb_literal_mask & 1u << rs) != 0;
 		thumb_immediate = thumb_exact || !(e->written & 1u << rs);
@@ -1291,6 +1607,7 @@ static bool memory(struct Emit* e, const struct Gbn* m, unsigned code, uint32_t 
 /* Stack transfers use one RAM mapping and one aggregate bus stall, as the
  * interpreter's multiple() does. Validate the whole span before committing
  * SP, low registers or memory. Rare mirrored-end spans use the bus path. */
+static void indirect_target(struct Emit* e, const struct Gbn* m);
 static bool thumb_stack(struct Emit* e, const struct Gbn* m, unsigned code, uint32_t pc) {
 	bool pop = (code & 0x800) != 0, extra = (code & 0x100) != 0;
 	unsigned list = code & 255, count = extra;
@@ -1299,6 +1616,34 @@ static bool thumb_stack(struct Emit* e, const struct Gbn* m, unsigned code, uint
 	unsigned bytes = 4 * count;
 	if (pop) e->read_seen = true;
 	else e->read_only = false;
+#if (GBN_RV32_FAST & 4194304) && (GBN_RV32_FAST & 2)
+	if (hub_ready && m->code_region >= 8) {
+		/* ROM code: the span's checks and time in one leaf call. */
+		get(e, TEMP, 13, pc);
+		if (!pop) imm(e, TEMP, TEMP, 0, -(int) bytes);
+		constant(e, RESULT, bytes | pop);
+		hub_call(e, stack_span);
+		guard(e, RHS, true);
+		if (pop && extra) {
+			word(e, (bytes - 4) << 20 | RHS << 15 | 2 << 12 | RESULT << 7 | 3);
+			indirect_target(e, m);
+		}
+		if (pop) imm(e, TEMP, TEMP, 0, (int) bytes);
+		put_value(e, 13, TEMP);
+		unsigned offset = 0;
+		for (unsigned r = 0; r < 8; ++r) if (list & (1u << r)) {
+			if (pop) {
+				word(e, offset << 20 | RHS << 15 | 2 << 12 | guest[r] << 7 | 3);
+				e->written |= 1u << r;
+				e->thumb_literal_mask &= ~(1u << r);
+			} else word(e, (offset >> 5) << 25 | guest[r] << 20 | RHS << 15 | 2 << 12 | (offset & 31) << 7 | 0x23);
+			offset += 4;
+		}
+		if (!pop && extra)
+			word(e, (offset >> 5) << 25 | guest[14] << 20 | RHS << 15 | 2 << 12 | (offset & 31) << 7 | 0x23);
+		return true;
+	}
+#endif
 	get(e, TEMP, 13, pc);
 	imm(e, LHS, TEMP, 0, pop ? 0 : -(int) bytes);
 	imm(e, RHS, LHS, 5, 24); imm(e, RHS, RHS, 0, -2);
@@ -1367,6 +1712,14 @@ static bool thumb_stack(struct Emit* e, const struct Gbn* m, unsigned code, uint
 /* RESULT holds the raw target. Validate before committing LR or any guest
  * state; other regions use the interpreter's complete mapping transition. */
 static void indirect_target(struct Emit* e, const struct Gbn* m) {
+#if GBN_RV32_FAST & 4194304
+    if (hub_ready && m->code_region >= 8) {
+        word(e, m->code_region << 24 | LHS << 7 | 0x37);
+        hub_call(e, code_target); guard(e, LHS, false);
+        e->dynamic_pc = true;
+        return;
+    }
+#endif
     imm(e, WAIT, RESULT, 5, 24);
     imm(e, WAIT, WAIT, 0, -(int) m->code_region); guard(e, WAIT, false);
     if (m->code_region >= 8) {
@@ -1402,6 +1755,14 @@ static bool instruction(struct Emit* e, const struct Gbn* m, unsigned code, uint
 		nz(e); put(e, rd);
 	} else if (code < 0x2000) {
 		unsigned a = source(e, LHS, rs, pc), b;
+#if (GBN_RV32_FAST & 8388608) && (GBN_RV32_FAST & 16384)
+		if ((code & 0x400) && !(e->live & 3)) {
+			/* C and V dead: an immediate add/sub is one addi. */
+			int v = (int) (code >> 6 & 7);
+			imm(e, RESULT, a, 0, code & 0x200 ? -v : v); nz(e); put(e, rd);
+			return true;
+		}
+#endif
 		if (code & 0x400) { constant(e, RHS, code >> 6 & 7); b = RHS; }
 		else b = source(e, RHS, code >> 6 & 7, pc);
 		arithmetic(e, (code & 0x200) != 0, a, b); put(e, rd);
@@ -1409,6 +1770,13 @@ static bool instruction(struct Emit* e, const struct Gbn* m, unsigned code, uint
 		rd = code >> 8 & 7;
 		unsigned kind = code >> 11 & 3;
 		if (!kind) { constant(e, RESULT, code & 255); nz(e); }
+#if (GBN_RV32_FAST & 8388608) && (GBN_RV32_FAST & 16384)
+		else if (kind == 1 && !(e->live & 3) && !(code & 255)) nz_of(e, source(e, LHS, rd, pc)); /* CMP #0 */
+		else if (!(e->live & 3)) {
+			int v = (int) (code & 255);
+			imm(e, RESULT, source(e, LHS, rd, pc), 0, kind == 2 ? v : -v); nz(e);
+		}
+#endif
 		else { unsigned a = source(e, LHS, rd, pc); constant(e, RHS, code & 255); arithmetic(e, kind != 2, a, RHS); }
 		if (kind != 1) put(e, rd);
 	} else if (code < 0x4400) {
@@ -1494,6 +1862,16 @@ static bool instruction(struct Emit* e, const struct Gbn* m, unsigned code, uint
 		uint32_t target = pc + 4 + (uint32_t) offset;
 		if (target >> 24 != m->code_region || (m->code_region >= 8 && (target & (GBN_ROM_MAX_SIZE - 1)) >= m->rom_size)) return false;
 		e->block->target = target; e->block->branch = true;
+#if (GBN_RV32_FAST & 8388608) && (GBN_RV32_FAST & 128)
+		/* The tail tests the condition itself: N and Z directly. */
+		e->branch_direct = true; e->branch_always = unconditional;
+		unsigned cond = code >> 8 & 15;
+		if (unconditional) ;
+		else if (cond < 2 || (cond >= 4 && cond < 6)) {
+			e->branch_reg = cond < 2 ? IS_ZERO : NEGATIVE; e->branch_clear = cond & 1;
+		} else { condition(e, cond); e->branch_reg = TEMP; e->branch_clear = false; }
+		return true;
+#endif
 		if (unconditional) constant(e, TEMP, 1);
 		else condition(e, code >> 8 & 15);
 		imm(e, TEMP, TEMP, 1, 31); op(e, LIMIT, LIMIT, TEMP, 6, 0);
@@ -1514,6 +1892,10 @@ static bool instruction(struct Emit* e, const struct Gbn* m, unsigned code, uint
             (target & (GBN_ROM_MAX_SIZE - 1)) >= m->rom_size)) return false;
         constant(e, RESULT, (pc + 2) | 1); put_value(e, 14, RESULT);
         e->block->target = target; e->block->branch = true;
+#if (GBN_RV32_FAST & 8388608) && (GBN_RV32_FAST & 128)
+        e->branch_direct = e->branch_always = true;
+        return true;
+#endif
         constant(e, TEMP, 0x80000000u); op(e, LIMIT, LIMIT, TEMP, 6, 0);
     } else if ((code & 0xf800) == 0xf800) {
         /* Independently entered suffix: LR may have changed after an event. */
@@ -1570,6 +1952,9 @@ static bool arm_memory(struct Emit* e, const struct Gbn* m, uint32_t code, uint3
 	if (half && (!form || (!load_value && form != 1))) return false;
 	if (!half && (code & 0x2000010) == 0x2000010) return false;
 	unsigned offset = half ? (code >> 4 & 0xf0) | (code & 15) : code & 4095;
+#if GBN_RV32_FAST & 4194304
+	e->access_start = e->count;
+#endif
 	if (pre) {
 		if (immediate) constant(e, RHS, offset);
 		else {
@@ -1799,6 +2184,18 @@ static void indirect_tail(struct Emit* e, struct GbnRv32* backend) {
     unsigned misses[8], n = 0;
     misses[n++] = e->count; word(e, beq(LIMIT, ZERO, 0));
     misses[n++] = e->count; word(e, beq(NOW, ZERO, 0) | 5u << 12);
+#if (GBN_RV32_FAST & 4194304) && !GBN_RV32_STATS
+    uint32_t table = (uint32_t) (uintptr_t) backend->lookup;
+    if (hub_ready && (!hub_lookup || hub_lookup == table)) {
+        hub_lookup = table;
+        hub_call(e, indirect_lookup); /* returns only on a miss */
+        for (unsigned i = 0; i < n; ++i)
+            b->code[misses[i]] |= beq(0, 0, 4 * (e->count - misses[i])) & 0xfe000f80u;
+        finish_count(e, 0, false); stack(e, RHS, STACK_TARGET, false);
+        e->returns[e->return_count++] = e->count; word(e, 0);
+        return;
+    }
+#endif
     stack(e, RESULT, STACK_TARGET, false);
     imm(e, TEMP, RESULT, 5, 1); constant(e, WAIT, 0x9e3779b1u);
     op(e, TEMP, TEMP, WAIT, 0, 1); imm(e, TEMP, TEMP, 5, GBN_RV32_HASH_SHIFT);
@@ -1960,6 +2357,9 @@ static void prologue_body(struct Emit* e, bool ram) {
 	stack(e, LIMIT, INITIAL_CAP, true); stack(e, FLAGS, INITIAL_DEADLINE, true);
 	load(e, NOW, offsetof(struct Gbn, now));
 	op(e, NOW, NOW, FLAGS, 0, 0x20);
+#if GBN_RV32_FAST & 4194304
+	if (hub_ready) constant(e, 4, hub_base()); /* tp: the memory leaves */
+#endif
 	load(e, PREFETCH, offsetof(struct Gbn, prefetched_pc));
 	for (unsigned i = 0; i < 15; ++i) if (resident(i)) load(e, guest[i], offsetof(struct Gbn, cpu.r) + 4 * i);
 	load(e, FLAGS, offsetof(struct Gbn, cpu.cpsr));
@@ -2230,14 +2630,30 @@ static unsigned finish_body(struct GbnRv32* backend, struct GbnRv32Block* block,
 		constant(e, PREFETCH, 0);
         indirect_tail(e, backend);
 	} else if (block->branch) {
+#if (GBN_RV32_FAST & 8388608) && (GBN_RV32_FAST & 128)
+		if (e->branch_direct) {
+			unsigned untaken = e->count;
+			if (!e->branch_always) word(e, beq(e->branch_reg, ZERO, 0) | (e->branch_clear ? 1u : 0u) << 12);
+			imm(e, NOW, NOW, 0, 2 + m->code_wait + m->code_nonseq);
+			constant(e, PREFETCH, 0);
+			tail(e, backend, block->target, false);
+			if (e->branch_always) goto tails_done; /* no fall-through edge */
+			block->code[untaken] |= beq(0, 0, 4 * (e->count - untaken)) & 0xfe000f80u;
+		} else
+#endif
+		{
 		unsigned untaken = e->count; word(e, 0);
 		imm(e, LIMIT, LIMIT, 1, 1); imm(e, LIMIT, LIMIT, 5, 1);
 		imm(e, NOW, NOW, 0, 2 + (block->thumb ? m->code_wait + m->code_nonseq : m->code_word_wait + m->code_word_nonseq));
 		constant(e, PREFETCH, 0);
 		tail(e, backend, block->target, false);
 		block->code[untaken] = beq(LIMIT, ZERO, 4 * (e->count - untaken)) | 5u << 12;
+		}
 	}
 	if (!e->dynamic_pc) tail(e, backend, block->pc + width * block->instructions, block->fallback);
+#if (GBN_RV32_FAST & 8388608) && (GBN_RV32_FAST & 128)
+tails_done:;
+#endif
 
     unsigned total_instructions = block->instructions;
     for (unsigned i = 0; i < edge_count; ++i) {
@@ -2549,6 +2965,17 @@ static unsigned thumb_flow(unsigned op, unsigned next, uint32_t pc, unsigned* re
 	}
 	return FLOW_STOP;
 }
+#if GBN_RV32_FAST & 16777216
+/* Fast mode: BX, POP {PC} and MOV PC: returns and calls through registers.
+ * Compiled code (AAPCS) reads no flags across them; SWI returns restore
+ * them and stay excluded. */
+static bool thumb_indirect(unsigned op) {
+	return (op & 0xff80) == 0x4700 || (op & 0xff00) == 0xbd00 || (op & 0xff87) == 0x4687;
+}
+#define INDIRECT_LIVE(op) (thumb_indirect(op) ? 0u : FLAGS_ALL)
+#else
+#define INDIRECT_LIVE(op) FLAGS_ALL
+#endif
 static bool thumb_rom_code(const struct Gbn* m, uint32_t pc) {
 	return pc >> 24 >= 8 && pc >> 24 <= 13 && (pc & 0x01ffffffu) + 4 <= m->rom_size;
 }
@@ -2568,7 +2995,7 @@ static unsigned thumb_needed(const struct Gbn* m, uint32_t pc, unsigned depth) {
 		killed |= writes;
 		if (killed == FLAGS_ALL) return needed;
 		if (flow == FLOW_NEXT) continue;
-		unsigned after = FLAGS_ALL;
+		unsigned after = flow == FLOW_STOP ? INDIRECT_LIVE(op) : FLAGS_ALL;
 		if (depth && flow == FLOW_BRANCH)
 			after = thumb_needed(m, target, depth - 1) | thumb_needed(m, pc + 2, depth - 1);
 		else if (depth && (flow == FLOW_JUMP || flow == FLOW_CALL))
@@ -2633,6 +3060,10 @@ restart:;
 #define COLD_RESTORE
 #endif
 	e.written = e.thumb_literal_mask = 0;
+#if GBN_RV32_FAST & 8388608
+	e.insn_start = ~0u;
+	e.branch_direct = e.branch_always = e.branch_clear = false;
+#endif
 	e.read_only = true;
 	e.read_seen = e.dynamic_pc = e.skip_shifter = e.io_guarded = false;
 	memset(e.thumb_literal, 0, sizeof(e.thumb_literal));
@@ -2690,7 +3121,8 @@ restart:;
                 continue;
             }
             end_live = flow == FLOW_BRANCH ? thumb_needed(m, target, 2) | thumb_needed(m, at + 2, 2)
-                : flow == FLOW_JUMP || flow == FLOW_CALL ? thumb_needed(m, target, 2) : FLAGS_ALL;
+                : flow == FLOW_JUMP || flow == FLOW_CALL ? thumb_needed(m, target, 2)
+                : flow == FLOW_STOP ? INDIRECT_LIVE(thumb_rom_half(m, at)) : FLAGS_ALL;
             break;
         }
         unsigned live = end_live;
@@ -2727,6 +3159,12 @@ restart:;
 		unsigned start = e.count, stops = e.stop_count;
 		COLD_SAVE TIME_SAVE
 		e.body_offsets[i] = start;
+#if GBN_RV32_FAST & 4194304
+		e.access_start = ~0u;
+#endif
+#if GBN_RV32_FAST & 8388608
+		e.insn_start = start;
+#endif
 #if GBN_RV32_FAST & 1024
 		TIME_FILL /* also the indices inside a preceding instruction group */
 #endif
@@ -2803,6 +3241,9 @@ restart:;
         }
 		if (block->branch || e.dynamic_pc) break;
 	}
+#if GBN_RV32_FAST & 8388608
+	e.insn_start = ~0u;
+#endif
     unsigned loop_entry;
 #if GBN_RV32_FAST & 8
     e.cv_dead = false;

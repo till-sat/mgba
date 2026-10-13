@@ -8,6 +8,7 @@
 *(.text.gbn_ppu_row_matches_vector .text.gbn_ppu_row_matches_vector.*)
 *(.text.gbn_rvv_equal .text.gbn_rvv_equal.*)
 *(.text.gbn_ppu_row_decode_vector .text.gbn_ppu_row_decode_vector.*)
+*(.text.gbn_hub)
 *(.text.read_byte .text.read_byte.*)
 *(.text.read_word .text.read_word.*)
 *(.text.gbn_rvv_fill32 .text.gbn_rvv_fill32.*)
