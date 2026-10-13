@@ -108,7 +108,11 @@ void gbn_timer_catchup(struct Gbn* m, uint32_t until) {
 		struct GbnTimer* t = &d->timers[best];
 		t->value = t->reload;
 		t->epoch = when;
+#if (GBN_RV32_FAST & 2097152) && (GBN_RV32_FAST & 4096)
+		gbn_audio_tick(m, (unsigned) best, when);
+#else
 		gbn_audio_timer(m, (unsigned) best, when);
+#endif
 		next[best] = when + ((0x10000u - t->reload) << shift(t->control));
 	}
 }

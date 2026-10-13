@@ -468,3 +468,55 @@ void gbn_audio_timer(struct Gbn* m, unsigned timer, uint32_t when) {
 		if (f->size <= 16) gbn_dma_fifo(m, i, when);
 	}
 }
+
+#if (GBN_RV32_FAST & 2097152) && (GBN_RV32_FAST & 4096)
+/* Fast mode: gbn_audio_timer for the batched timer overflows. With the
+ * sample clock detached in its usual state (no routed PSG, no frame step or
+ * full ring before the span) it only stores the 512-cycle samples (FAST
+ * 4096) and pops; anything else takes the general path. */
+__attribute__((noinline)) /* keeps gbn_timer_catchup small enough to inline */
+void gbn_audio_tick(struct Gbn* m, unsigned timer, uint32_t when) {
+	if (timer > 1 || !master(m)) return;
+	struct GbnDevices* d = m->devices;
+	struct GbnAudio* a = &d->audio;
+	const uint16_t* io = d->io;
+	struct GbnEvent* clock = &m->events[GBN_EVENT_AUDIO];
+	const struct GbnEvent* frame = &m->events[GBN_EVENT_AUDIO_FRAME];
+	uint16_t control = io[0x82 / 2];
+	uint32_t first = clock->when;
+	int32_t distance = (int32_t) (when - first);
+	if (a->pcm_detached && distance >= 0) {
+		uint32_t count = 1 + ((uint32_t) distance >> 9);
+		uint32_t last = first + ((count - 1) << 9);
+		if (!a->batched || !a->running || (io[0x80 / 2] & 0xff00) || !frame->active ||
+		    distance > (int32_t) GBN_MAX_DELAY || count > GBN_AUDIO_CAPACITY - a->size ||
+		    (int32_t) (frame->when - first) <= 0 || (int32_t) (frame->when - last) <= 0) {
+			gbn_audio_timer(m, timer, when);
+			return;
+		}
+		int left = 0, right = 0;
+		for (unsigned i = 0; i < 2; ++i) {
+			int sample = a->fifo[i].sample * (control & (4u << i) ? 4 : 2);
+			if (control & (0x100u << (4 * i))) right += sample;
+			if (control & (0x200u << (4 * i))) left += sample;
+		}
+		unsigned bias = io[0x88 / 2] & 0x3ff;
+		struct GbnStereo s = {pcm(left, bias), pcm(right, bias), first};
+		unsigned tail = (a->read + a->size) & (GBN_AUDIO_CAPACITY - 1);
+		for (uint32_t i = 0; i < count; ++i, s.when += 512) {
+			a->samples[tail] = s;
+			tail = (tail + 1) & (GBN_AUDIO_CAPACITY - 1);
+		}
+		a->size += count; a->produced += count;
+		a->psg_pending = true; a->pcm_tie = false;
+		clock->when = s.when;
+	}
+	for (unsigned i = 0; i < 2; ++i) {
+		if (!(control & (0x300u << (4 * i))) || ((control >> (10 + 4 * i)) & 1) != timer) continue;
+		struct GbnFifo* f = &a->fifo[i];
+		if (f->size) { f->sample = (int8_t) f->data[f->read]; f->read = (f->read + 1) & 31; --f->size; }
+		else f->sample = 0;
+		if (f->size <= 16) gbn_dma_fifo(m, i, when);
+	}
+}
+#endif

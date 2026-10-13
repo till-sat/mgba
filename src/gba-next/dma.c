@@ -231,6 +231,19 @@ static void fifo_burst(struct Gbn* m, unsigned channel, unsigned fifo, uint32_t 
 	uint32_t source = c->next_source & ~3u, value = c->latch;
 	unsigned sm = source >= 0x08000000 && source < 0x0e000000 ? 0 : c->control >> 7 & 3;
 	unsigned cycles = 2;
+#if GBN_RV32_FAST & 2097152
+	/* Four incrementing beats within one raw region (the FIFO has room for
+	 * all 16 bytes: it asks at 16 or fewer): one copy, the same time. */
+	const uint8_t* p = sm == 1 || sm == 2 ? NULL : dma_read_pointer(m, source, 4);
+	if (p && f->size <= 16 && dma_read_pointer(m, source + 12, 4) == p + 12) {
+		for (unsigned i = 0; i < 16; ++i) f->data[(f->read + f->size + i) & 31] = p[i];
+		f->size += 16;
+		value = dma_raw_read(p + 12, 4);
+		cycles += 8 + wait_cycles(m, source, 4, false) + wait_cycles(m, c->dest, 4, false) +
+			3 * (wait_cycles(m, source, 4, true) + wait_cycles(m, c->dest, 4, true));
+		source += 16;
+	} else
+#endif
 	for (unsigned beat = 0; beat < 4; ++beat) {
 		const uint8_t* p = dma_read_pointer(m, source, 4);
 		if (p) value = dma_raw_read(p, 4);

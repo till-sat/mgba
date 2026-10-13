@@ -82,6 +82,9 @@ void gbn_audio_write(struct Gbn*, unsigned offset, unsigned width, uint32_t valu
 void gbn_audio_service(struct Gbn*, uint32_t when);
 void gbn_audio_frame(struct Gbn*, uint32_t when);
 void gbn_audio_timer(struct Gbn*, unsigned timer, uint32_t when);
+#if (GBN_RV32_FAST & 2097152) && (GBN_RV32_FAST & 4096)
+void gbn_audio_tick(struct Gbn*, unsigned timer, uint32_t when);
+#endif
 bool gbn_sio_register(unsigned offset);
 enum GbnStatus gbn_sio_write(struct Gbn*, unsigned offset, unsigned width, uint32_t value);
 enum GbnStatus gbn_sio_service(struct Gbn*, uint32_t when);
