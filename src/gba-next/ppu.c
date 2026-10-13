@@ -33,6 +33,24 @@ void gbn_ppu_reference(struct Gbn* m, unsigned offset) {
 	m->devices->ppu.reference[id][axis] = signed28(m->devices->io[base] | (uint32_t) m->devices->io[base + 1] << 16);
 }
 
+bool gbn_attach_ppu_cache(struct Gbn* m, struct GbnPpuCache* cache) {
+    if (!m->devices) return false;
+    if (cache) memset(cache, 0, sizeof(*cache));
+    m->devices->ppu.cache = cache;
+    return true;
+}
+
+bool gbn_attach_ppu_cache_tracked(struct Gbn* m, struct GbnPpuCache* cache) {
+    if (!gbn_attach_ppu_cache(m, cache)) return false;
+    if (cache) cache->tracked_oam = true;
+    return true;
+}
+
+void gbn_ppu_invalidate_oam(struct Gbn* m) {
+    struct GbnPpuCache* cache = m->devices ? m->devices->ppu.cache : NULL;
+    if (cache && cache->tracked_oam) cache->object_valid = false;
+}
+
 bool gbn_attach_pixels(struct Gbn* m, uint16_t* pixels, unsigned stride) {
 	if (!m->devices || (pixels && stride < GBN_SCREEN_WIDTH)) return false;
 	struct GbnPpu* p = &m->devices->ppu;
@@ -250,19 +268,63 @@ static void affine_line(const struct GbnDevices* d, unsigned id, unsigned mode, 
 	}
 }
 
-static inline __attribute__((always_inline)) void objects_body(const struct GbnDevices* d, unsigned y, struct Pixel* output, bool* window, bool aligned) {
-	static const uint8_t widths[3][4] = {{8,16,32,64},{16,32,32,64},{8,8,16,32}};
-	static const uint8_t heights[3][4] = {{8,16,32,64},{8,8,16,32},{16,32,32,64}};
+static const uint8_t widths[3][4] = {{8,16,32,64},{16,32,32,64},{8,8,16,32}};
+static const uint8_t heights[3][4] = {{8,16,32,64},{8,8,16,32},{16,32,32,64}};
+
+/* Geometry alone determines potential membership. The renderer still applies
+ * current display mode/window rules and reads matrices, colors and texels.
+ * Full OAM bytes are compared, so raw CPU-host backing writes stay legal. */
+static void object_membership(const struct GbnDevices* d) {
+    struct GbnPpuCache* cache = d->ppu.cache;
+    if (cache->object_valid && (cache->tracked_oam || !memcmp(cache->object_snapshot, d->oam, GBN_OAM_SIZE))) return;
+    memcpy(cache->object_snapshot, d->oam, GBN_OAM_SIZE);
+    memset(cache->object_counts, 0, sizeof(cache->object_counts));
+    for(unsigned y=0;y<GBN_SCREEN_HEIGHT;++y)cache->object_bounds[y]=240;
+    for (unsigned id = 0; id < 128; ++id) {
+        unsigned a = half(d->oam, id * 8), b = half(d->oam, id * 8 + 2);
+        bool affine = (a & 0x100) != 0;
+        unsigned shape = a >> 14, kind = a >> 10 & 3;
+        if (shape == 3 || kind == 3 || (!affine && (a & 0x200))) continue;
+        unsigned width = widths[shape][b >> 14], height = heights[shape][b >> 14];
+        unsigned bw = width << (affine && (a & 0x200)), bh = height << (affine && (a & 0x200));
+        int left = (int) (b & 511); if (left >= 256) left -= 512;
+        if (left >= 240 || left + (int) bw <= 0) continue;
+        for (unsigned local = 0; local < bh; ++local) {
+            unsigned y = ((a & 255) + local) & 255;
+            if (y < GBN_SCREEN_HEIGHT) {
+                cache->object_ids[y][cache->object_counts[y]++] = (uint8_t) id;
+                unsigned first=left<0?0:(unsigned)left;
+                int right=left+(int)bw+((a&0x1000)?15:0);
+                unsigned last=right>240?240:(unsigned)right;
+                unsigned bounds=cache->object_bounds[y];
+                if(first>(bounds&65535))first=bounds&65535;
+                if(last<(bounds>>16))last=bounds>>16;
+                cache->object_bounds[y]=first|(last<<16);
+            }
+        }
+    }
+    cache->object_valid = true;
+}
+
+static inline __attribute__((always_inline)) unsigned objects_body(const struct GbnDevices* d, unsigned y, struct Pixel* output, bool* window, bool aligned) {
 	unsigned dispcnt = d->io[0];
-	if (!(dispcnt & 0x1000)) return;
+	if (!(dispcnt & 0x1000)) return 240;
+	unsigned first_object = 240, last_object = 0;
 	unsigned mosaic_control = d->io[0x4c / 2];
 	unsigned mosaic_h = (mosaic_control >> 8 & 15) + 1;
 	unsigned mosaic_v = (mosaic_control >> 12 & 15) + 1;
 	unsigned mosaic_y = y % mosaic_v;
 	bool one_dimensional = (dispcnt & 0x40) != 0;
 	int budget = dispcnt & 0x20 ? 954 : 1210;
-	for (unsigned id = 0; id < 128; ++id) {
-		budget -= 2;
+    struct GbnPpuCache* cache = d->ppu.cache;
+    const uint8_t* ids = NULL;
+    unsigned count = 128, scanned = 0;
+    if (cache) { object_membership(d); ids = cache->object_ids[y]; count = cache->object_counts[y]; }
+	for (unsigned at = 0; at < count; ++at) {
+        unsigned id = ids ? ids[at] : at;
+        /* Invisible/disabled entries still consume their two scan cycles. */
+        budget -= (int) (2 * (id + 1 - scanned));
+        scanned = id + 1;
 		if (budget <= 0) break;
 		unsigned a = text_half(d->oam, id * 8, aligned), b = text_half(d->oam, id * 8 + 2, aligned), c = text_half(d->oam, id * 8 + 4, aligned);
 		bool affine = (a & 0x100) != 0;
@@ -284,6 +346,60 @@ static inline __attribute__((always_inline)) void objects_body(const struct GbnD
 		int end = left + (int) bw;
 		if (a & 0x1000) {
 			if (end % (int) mosaic_h) end += mosaic_h - end % (int) mosaic_h;
+		}
+        if (kind != 2) {
+            unsigned first = left < 0 ? 0 : (unsigned) left;
+            unsigned last = end > 240 ? 240 : (unsigned) end;
+            if (first < first_object) first_object = first;
+            if (last > last_object) last_object = last;
+        }
+		/* A regular 4bpp sprite consumes contiguous tile-row spans. Decode
+		 * geometry and tile mapping once per span, including blank rows. */
+		if (!affine && !(a & 0x1000) && depth == 4) {
+			int screen = left < 0 ? 0 : left;
+			int limit = end < 240 ? end : 240;
+			int pixels = limit - screen;
+			if (pixels > budget) {
+				limit = screen + budget;
+				budget = -1;
+			} else budget -= pixels;
+			unsigned ty = b & 0x2000 ? height - 1 - local_y : local_y;
+			bool flip = (b & 0x1000) != 0;
+			int tx = flip ? (int) width - 1 - (screen - left) : screen - left;
+			unsigned row = ty / 8 * stride * 8 + (ty & 7) * 4;
+			const uint8_t* palette = d->palette + 0x200 + (c >> 12) * 32;
+			while (screen < limit) {
+				int count = flip ? (tx & 7) + 1 : 8 - (tx & 7);
+				if (count > limit - screen) count = limit - screen;
+				unsigned lo = tile * 32 + (unsigned) tx / 8 * 32;
+				unsigned address = row + (one_dimensional ? lo & 0x7fff :
+					(lo & 0x3ff) + (tile * 32 & 0x7c00));
+				const uint8_t* bytes = d->vram + 0x10000 + (address & 0x7fff);
+				uint32_t packed;
+#if defined(__GNUC__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+				if (!((uintptr_t) bytes & 3)) {
+					__builtin_memcpy(&packed, __builtin_assume_aligned(bytes, 4), sizeof(packed));
+				} else
+#endif
+				packed = bytes[0] | (uint32_t) bytes[1] << 8 |
+					(uint32_t) bytes[2] << 16 | (uint32_t) bytes[3] << 24;
+				tx += flip ? -count : count;
+				int next = screen + count;
+				if (!packed) { screen = next; continue; }
+				if (flip) packed <<= (7 - ((tx + count) & 7)) * 4;
+				else packed >>= ((tx - count) & 7) * 4;
+				for (; screen < next; ++screen) {
+					unsigned index = flip ? packed >> 28 : packed & 15;
+					if (flip) packed <<= 4; else packed >>= 4;
+					if (!index) continue;
+					if (kind == 2) { window[screen] = true; continue; }
+					if (key >= output[screen].key) continue;
+					output[screen] = (struct Pixel) {
+						text_half(palette, index * 2, aligned) & 0x7fff,
+						(uint8_t) key, 4, kind == 1};
+				}
+			}
+			continue;
 		}
 		int cost = affine ? 2 : 1;
 		if (affine) budget -= 10;
@@ -323,25 +439,26 @@ static inline __attribute__((always_inline)) void objects_body(const struct GbnD
 			output[screen] = (struct Pixel) {text_half(d->palette, 0x200 + index * 2, aligned) & 0x7fff, (uint8_t) key, 4, kind == 1};
 		}
 	}
+    return first_object | last_object << 16;
 }
 
-static __attribute__((noinline)) void objects_unaligned(const struct GbnDevices* d,
+static __attribute__((noinline)) unsigned objects_unaligned(const struct GbnDevices* d,
         unsigned y, struct Pixel* output, bool* window) {
-    objects_body(d, y, output, window, false);
+    return objects_body(d, y, output, window, false);
 }
 #if defined(__GNUC__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-static __attribute__((noinline)) void objects_aligned(const struct GbnDevices* d,
+static __attribute__((noinline)) unsigned objects_aligned(const struct GbnDevices* d,
         unsigned y, struct Pixel* output, bool* window) {
-    objects_body(d, y, output, window, true);
+    return objects_body(d, y, output, window, true);
 }
 #endif
-static void objects(const struct GbnDevices* d, unsigned y, struct Pixel* output, bool* window) {
+static unsigned objects(const struct GbnDevices* d, unsigned y, struct Pixel* output, bool* window) {
 #if defined(__GNUC__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     if (!(((uintptr_t) d->oam | (uintptr_t) d->palette) & 1)) {
-        objects_aligned(d, y, output, window); return;
+        return objects_aligned(d, y, output, window);
     }
 #endif
-    objects_unaligned(d, y, output, window);
+    return objects_unaligned(d, y, output, window);
 }
 
 static bool inside(unsigned point, unsigned bounds) {
@@ -635,6 +752,93 @@ static bool indexed_text(const struct GbnDevices* d, unsigned id, unsigned y, ui
 #endif
     return indexed_text_unaligned(d, id, y, output);
 }
+/* Cache complete tile rows, including both clipped screen edges. The scroll
+ * texel becomes a pointer offset, so sub-tile scrolling does not force decoding.
+ * Exact map bytes plus previously resolved VRAM words validate every input;
+ * neither DMA nor raw backing-memory writes require an invalidation hook. */
+static inline __attribute__((always_inline)) bool cached_indexed_body(
+        struct GbnDevices* d, unsigned id, unsigned y, uint8_t** output, bool aligned) {
+    unsigned control = d->io[4 + id], size = control >> 14;
+    unsigned sy = (y + d->io[9 + id * 2]) & (size & 2 ? 511 : 255);
+    unsigned map_row = (control >> 8 & 31) * 0x800
+        + (sy >> 8) * (size & 1 ? 2 : 1) * 0x800 + (sy & 248) * 8;
+    unsigned xmask = size & 1 ? 511 : 255;
+    unsigned sx = d->io[8 + id * 2] & xmask;
+    unsigned phase = sx & 7;
+    unsigned character = (control >> 2 & 3) * 0x4000;
+    struct GbnIndexedRow* row = &d->ppu.cache->rows[id][sy & 255];
+    unsigned first = 32 - ((sx >> 3) & 31);
+    if (first > 31) first = 31;
+    const uint8_t* map = d->vram
+        + ((map_row + (sx >> 8) * 0x800 + (sx & 248) / 4) & 0xffff);
+    unsigned next_x = (sx + first * 8) & xmask;
+    const uint8_t* next_map = d->vram
+        + ((map_row + (next_x >> 8) * 0x800 + (next_x & 248) / 4) & 0xffff);
+    bool hit = row->valid && row->character == character
+        && !memcmp(map, row->map, first * 2)
+        && (first == 31 || !memcmp(next_map, row->map + first, (31 - first) * 2));
+    if (hit) for (unsigned i = 0; i < row->samples; ++i) {
+        unsigned address = (unsigned) row->address[i] * 4;
+        uint32_t packed;
+#if defined(__GNUC__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        if (aligned) __builtin_memcpy(&packed,
+            __builtin_assume_aligned(d->vram + address, 4), sizeof(packed));
+        else
+#endif
+        packed = (uint32_t) text_half(d->vram, address, false)
+            | (uint32_t) text_half(d->vram, address + 2, false) << 16;
+        if (packed != row->words[i]) { hit = false; break; }
+    }
+    if (!hit) {
+        memcpy(row->map, map, first * 2);
+        if (first < 31) memcpy(row->map + first, next_map, (31 - first) * 2);
+        uint32_t opaque30 = 0, opaque31 = 0;
+        bool transparent_tail = false;
+        row->samples = 0;
+        for (unsigned i = 0; i < 31; ++i) {
+            unsigned tile = text_half((const uint8_t*) row->map, i * 2, true);
+            unsigned address = character + (tile & 0x3ff) * 32
+                + ((sy & 7) ^ (tile & 0x800 ? 7 : 0)) * 4;
+            uint32_t packed = indexed_tile(d, tile, sy & 7, character,
+                row->indices + i * 8, 0, 8, (31 - i) * 8, aligned, &transparent_tail);
+            if (i < 30) opaque30 |= packed;
+            opaque31 |= packed;
+            if (address < 0x10000) {
+                /* Repeated blank/solid tile runs need only one observation
+                 * of their common VRAM word. Map equality proves the run. */
+                unsigned n = row->samples;
+                if (!n || row->address[n - 1] != address / 4) {
+                    row->address[n] = address / 4;
+                    row->words[n] = packed;
+                    row->samples = n + 1;
+                }
+            }
+        }
+        row->character = character;
+        row->opaque30 = opaque30 != 0; row->opaque31 = opaque31 != 0;
+        row->valid = true;
+
+    }
+    *output = row->indices + phase;
+    return phase ? row->opaque31 : row->opaque30;
+}
+static __attribute__((noinline)) bool cached_indexed_unaligned(struct GbnDevices* d,
+        unsigned id, unsigned y, uint8_t** output) {
+    return cached_indexed_body(d, id, y, output, false);
+}
+#if defined(__GNUC__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+static __attribute__((noinline)) bool cached_indexed_aligned(struct GbnDevices* d,
+        unsigned id, unsigned y, uint8_t** output) {
+    return cached_indexed_body(d, id, y, output, true);
+}
+#endif
+static bool cached_indexed_text(struct GbnDevices* d, unsigned id, unsigned y, uint8_t** output) {
+#if defined(__GNUC__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    if (!((uintptr_t) d->vram & 3)) return cached_indexed_aligned(d, id, y, output);
+#endif
+    return cached_indexed_unaligned(d, id, y, output);
+}
+
 static inline __attribute__((always_inline)) void indexed_span_body(
         const struct IndexedBackground* layers, unsigned count, const struct Pixel* objects,
         unsigned start, unsigned end, const uint8_t* palette, bool aligned,
@@ -688,40 +892,94 @@ static inline bool indexed_supported(const struct GbnDevices* d, unsigned mode) 
         if ((d->io[0] & (0x100u << id)) && (d->io[4 + id] & 0xc0)) return false;
     return true;
 }
-static __attribute__((noinline)) void indexed_line(const struct GbnDevices* d, unsigned y, uint16_t* output) {
+/* Rectangular windows have at most four horizontal cuts. Preserve exact
+ * WIN0/WIN1 priority and offscreen/wrapped coordinates without constructing
+ * or scanning a 240-byte mask row. OBJ-window coverage keeps the pixel path. */
+static unsigned rectangle_edges(const struct GbnDevices* d,unsigned y,unsigned* edges) {
+    unsigned count=2;edges[0]=0;edges[1]=240;
+    for(unsigned id=0;id<2;++id) if((d->io[0]&(0x2000u<<id)) && inside(y,d->io[0x44/2+id])) {
+        unsigned range=d->io[0x40/2+id];
+        unsigned a=range>>8,b=range&255;
+        if(a && a<240)edges[count++]=a;
+        if(b && b<240)edges[count++]=b;
+    }
+    for(unsigned i=1;i<count;++i) {
+        unsigned value=edges[i],at=i;
+        while(at && edges[at-1]>value){edges[at]=edges[at-1];--at;}
+        edges[at]=value;
+    }
+    return count;
+}
+static unsigned rectangle_mask(const struct GbnDevices* d,unsigned x,unsigned y) {
+    if(!(d->io[0]&0xe000))return 0x3f;
+    for(unsigned id=0;id<2;++id) if((d->io[0]&(0x2000u<<id)) &&
+        inside(y,d->io[0x44/2+id]) && inside(x,d->io[0x40/2+id]))
+        return d->io[0x48/2]>>(id*8)&0x3f;
+    return d->io[0x4a/2]&0x3f;
+}
+static inline __attribute__((always_inline)) void indexed_range(
+        const struct GbnDevices* d,const struct IndexedBackground* layers,unsigned count,
+        const struct Pixel* obj,bool have_objects,unsigned object_bounds,
+        unsigned start,unsigned end,unsigned mask,uint16_t backdrop,uint16_t* output) {
+    struct IndexedBackground visible[4];unsigned active=0;
+    for(unsigned i=0;i<count;++i)if(mask&layers[i].mask)visible[active++]=layers[i];
+    unsigned first=object_bounds&65535,last=object_bounds>>16;
+    if(have_objects && (mask&16) && first<end && last>start) {
+        unsigned a=first>start?first:start,b=last<end?last:end;
+        if(start<a)indexed_span(visible,active,NULL,start,a,d->palette,backdrop,output);
+        indexed_span(visible,active,obj,a,b,d->palette,backdrop,output);
+        if(b<end)indexed_span(visible,active,NULL,b,end,d->palette,backdrop,output);
+    }else indexed_span(visible,active,NULL,start,end,d->palette,backdrop,output);
+}
+static __attribute__((noinline)) void indexed_line(struct GbnDevices* d, unsigned y, uint16_t* output) {
     _Alignas(4) uint8_t storage[4][GBN_SCREEN_WIDTH + 8];
     uint8_t* indices[4];
     for (unsigned id = 0; id < 4; ++id) indices[id] = storage[id] + (d->io[8 + id * 2] & 7);
     struct IndexedBackground layers[4]; unsigned count = 0;
     for (unsigned id = 0; id < 4; ++id) {
-        if (!(d->io[0] & (0x100u << id)) || !indexed_text(d, id, y, indices[id])) continue;
+        if (!(d->io[0] & (0x100u << id)) || !(d->ppu.cache ? cached_indexed_text(d, id, y, &indices[id])
+            : indexed_text(d, id, y, indices[id]))) continue;
         struct IndexedBackground layer = {indices[id], (uint8_t) ((d->io[4 + id] & 3) * 8 + id + 1), (uint8_t) id, (uint8_t) (1u << id)};
         unsigned at = count++;
         while (at && layers[at - 1].key > layer.key) { layers[at] = layers[at - 1]; --at; }
         layers[at] = layer;
     }
     struct Pixel obj[GBN_SCREEN_WIDTH]; bool object_window[GBN_SCREEN_WIDTH];
+    unsigned object_bounds = 240;
     bool have_objects = (d->io[0] & 0x1000) != 0;
-    if (have_objects) {
-        memset(object_window, 0, sizeof(object_window));
-        for (unsigned x = 0; x < GBN_SCREEN_WIDTH; ++x) obj[x] = (struct Pixel) {0, 255, 4, false};
-        objects(d, y, obj, object_window);
+    if(have_objects) {
+        unsigned first=0,last=240;
+        if(d->ppu.cache && d->ppu.cache->tracked_oam) {
+            object_membership(d);
+            unsigned bounds=d->ppu.cache->object_bounds[y];
+            first=bounds&65535;last=bounds>>16;
+            if(first>=last)have_objects=false;
+        }
+        if(have_objects) {
+            if(d->io[0]&0x8000)memset(object_window,0,sizeof(object_window));
+            for(unsigned x=first;x<last;++x)obj[x]=(struct Pixel){0,255,4,false};
+            object_bounds=objects(d,y,obj,object_window);
+        }
+    }
+    uint16_t backdrop=half(d->palette,0)&0x7fff;
+    if(!(d->io[0]&0x8000) || !have_objects) {
+        unsigned edges[6],count_edges=rectangle_edges(d,y,edges);
+        for(unsigned i=0;i+1<count_edges;++i)if(edges[i]<edges[i+1])
+            indexed_range(d,layers,count,obj,have_objects,object_bounds,
+                edges[i],edges[i+1],rectangle_mask(d,edges[i],y),backdrop,output);
+        return;
     }
     uint8_t masks[GBN_SCREEN_WIDTH];
-    unsigned uniform = line_masks(d, y, object_window, have_objects, masks);
-    uint16_t backdrop = half(d->palette, 0) & 0x7fff;
-    for (unsigned start = 0; start < GBN_SCREEN_WIDTH;) {
-        unsigned mask = masks[start], end = start + 1;
-        if (uniform) end = GBN_SCREEN_WIDTH;
-        else while (end < GBN_SCREEN_WIDTH && masks[end] == mask) ++end;
-        struct IndexedBackground visible[4]; unsigned active = 0;
-        for (unsigned i = 0; i < count; ++i)
-            if (mask & layers[i].mask) visible[active++] = layers[i];
-        indexed_span(visible, active, have_objects && (mask & 16) ? obj : NULL, start, end, d->palette, backdrop, output);
-        start = end;
+    unsigned uniform=line_masks(d,y,object_window,have_objects,masks);
+    for(unsigned start=0;start<240;) {
+        unsigned mask=masks[start],end=start+1;
+        if(uniform)end=240;
+        else while(end<240 && masks[end]==mask)++end;
+        indexed_range(d,layers,count,obj,have_objects,object_bounds,start,end,mask,backdrop,output);
+        start=end;
     }
-
 }
+
 #endif
 
 enum GbnStatus gbn_ppu_line(struct Gbn* m, unsigned y) {

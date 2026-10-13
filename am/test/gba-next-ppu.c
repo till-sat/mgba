@@ -10,6 +10,7 @@
 
 static struct Gbn m;
 static struct GbnDevices d;
+static struct GbnPpuCache test_cache;
 static struct GBAVideoSoftwareRenderer reference;
 static uint8_t ewram[GBN_EWRAM_SIZE], iwram[GBN_IWRAM_SIZE];
 static uint16_t memory[(GBN_PALETTE_SIZE + GBN_VRAM_SIZE + GBN_OAM_SIZE) / 2];
@@ -45,6 +46,7 @@ static void setup(void) {
 	reference.d.init(&reference.d);
 	for (unsigned i = 0; i < sizeof(pixels) / sizeof(*pixels); ++i) pixels[i] = 0xbeef;
 	CHECK(!gbn_attach_pixels(&m, pixels, 239));
+	CHECK(gbn_attach_ppu_cache(&m, &test_cache));
 	CHECK(gbn_attach_pixels(&m, pixels, 248));
 	for (unsigned offset = 8; offset < 0x56; offset += 2) if (offset != 0x4e) reg(offset, d.io[offset / 2]);
 }
@@ -214,6 +216,7 @@ static void unaligned_video(void) {
 			memcpy(o, video + GBN_PALETTE_SIZE + GBN_VRAM_SIZE, GBN_OAM_SIZE);
 			CHECK(gbn_attach_devices(&m, &d, p, v, o));
 			memcpy(d.io, registers, sizeof(registers));
+			CHECK(gbn_attach_ppu_cache(&m, &test_cache));
 			CHECK(gbn_attach_pixels(&m, pixels, 248));
 			for (unsigned y = 0; y < 160; ++y) {
 				CHECK(gbn_ppu_line(&m, y) == GBN_STEP);
@@ -363,6 +366,65 @@ static unsigned priority_composition(void) {
 	return 32;
 }
 
+static void cache_lifetime(void) {
+	struct Gbn unattached = {0};
+	CHECK(!gbn_attach_ppu_cache(&unattached, &test_cache));
+	setup(); reg(0, 0x0f00);
+	compare(0, 300, 0); /* Cache cold, then populated. */
+	CHECK(d.ppu.cache == &test_cache);
+	CHECK(gbn_attach_ppu_cache(&m, NULL) && !d.ppu.cache);
+	compare(0, 301, 0); /* The uncached fallback has the same pixels. */
+	memset(&test_cache, 0xa5, sizeof(test_cache));
+	CHECK(gbn_attach_ppu_cache(&m, &test_cache));
+	for (unsigned bg = 0; bg < 4; ++bg) for (unsigned y = 0; y < 256; ++y)
+		CHECK(!test_cache.rows[bg][y].valid);
+	compare(0, 302, 0); /* Reattaching resets arbitrary previous contents. */
+	reference.d.deinit(&reference.d);
+	CHECK(gbn_attach_devices(&m, &d, (uint8_t*) memory,
+		(uint8_t*) memory + GBN_PALETTE_SIZE, (uint8_t*) memory + GBN_PALETTE_SIZE + GBN_VRAM_SIZE));
+	CHECK(!d.ppu.cache);
+	printf("PASS decoded-row cache lifetime: attach/detach, uncached fallback, reset and device replacement\n");
+}
+
+/* Geometry cache invalidation is visible at the next scanline. CPU byte
+ * stores to OAM are ignored by the bus and must not invalidate unchanged data. */
+static void tracked_oam_writes(void) {
+    setup();reg(0,0x1000);
+    memset(d.vram+0x10000,0x11,32);
+    store(d.palette,0,0x001f);store(d.palette,0x202,0x03e0);
+    store(d.oam,0,10);store(d.oam,2,16);store(d.oam,4,0);
+    CHECK(gbn_attach_ppu_cache_tracked(&m,&test_cache));
+    CHECK(test_cache.tracked_oam && !test_cache.object_valid);
+    for(unsigned y=0;y<=10;++y)CHECK(gbn_ppu_line(&m,y)==GBN_STEP);
+    CHECK(pixels[10*248+16]==0x03e0 && pixels[10*248+80]==0x001f);
+    CHECK(test_cache.object_valid);
+    uint32_t cycles;
+    CHECK(gbn_write(&m,0x07000000,1,0xff,&cycles)==GBN_STEP);
+    CHECK(test_cache.object_valid && d.oam[0]==10);
+    CHECK(gbn_write(&m,0x07000000,4,(80u<<16)|11,&cycles)==GBN_STEP);
+    CHECK(!test_cache.object_valid);
+    CHECK(gbn_ppu_line(&m,11)==GBN_STEP);
+    CHECK(pixels[11*248+80]==0x03e0 && pixels[11*248+16]==0x001f);
+    store(iwram,0,12);store(iwram,2,120);store(iwram,4,0);store(iwram,6,0);
+    CHECK(gbn_write(&m,0x040000d4,4,0x03000000,&cycles)==GBN_STEP);
+    CHECK(gbn_write(&m,0x040000d8,4,0x07000000,&cycles)==GBN_STEP);
+    CHECK(gbn_write(&m,0x040000dc,4,0x84000002,&cycles)==GBN_STEP);
+    m.now+=3;CHECK(gbn_service_events(&m)==GBN_STEP);
+    CHECK(!test_cache.object_valid);
+    CHECK(gbn_ppu_line(&m,12)==GBN_STEP);
+    CHECK(pixels[12*248+120]==0x03e0 && pixels[12*248+80]==0x001f);
+    store(d.oam,0,13);store(d.oam,2,160);gbn_ppu_invalidate_oam(&m);
+    CHECK(!test_cache.object_valid && gbn_ppu_line(&m,13)==GBN_STEP);
+    CHECK(pixels[13*248+160]==0x03e0 && pixels[13*248+120]==0x001f);
+    CHECK(gbn_attach_ppu_cache(&m,&test_cache) && !test_cache.tracked_oam);
+    CHECK(gbn_ppu_line(&m,14)==GBN_STEP && test_cache.object_valid);
+    store(d.oam,0,15);store(d.oam,2,200); /* Ordinary API permits raw changes. */
+    CHECK(gbn_ppu_line(&m,15)==GBN_STEP);
+    CHECK(pixels[15*248+200]==0x03e0 && pixels[15*248+160]==0x001f);
+    reference.d.deinit(&reference.d);
+    puts("PASS OAM membership cache: CPU word writes, ignored bytes, DMA spans, explicit notifications and ordinary raw backing changes");
+}
+
 int main(void) {
 	unsigned cases = 0;
 	for (unsigned mode = 0; mode < 6; ++mode) for (unsigned trial = 0; trial < 8; ++trial) {
@@ -505,6 +567,7 @@ int main(void) {
 	uniform_rows();
 	palette_pairs();
 	unaligned_video();
+	cache_lifetime(); tracked_oam_writes();
 	CHECK(gbn_attach_pixels(&m, NULL, 0));
 	printf("PASS independent PPU: %u background/bitmap/affine/effect frames, %u pixel comparisons, forced blank and output stride/bounds\n", cases, comparisons);
 	return 0;

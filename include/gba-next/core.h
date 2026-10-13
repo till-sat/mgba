@@ -92,9 +92,10 @@ struct GbnAudio {
 	struct GbnFifo fifo[2];
 	uint8_t wave[32], frame;
 	uint32_t frame_when, produced, dropped;
-	bool running;
+	bool running, batched, psg_pending; /* Optional CPU-clock coalescing; all PCM samples remain. */
 	struct GbnStereo samples[GBN_AUDIO_CAPACITY];
 	unsigned read, size;
+    bool timeline, pcm_detached, pcm_tie; /* Experimental; default false. */
 };
 
 struct GbnSio {
@@ -115,11 +116,30 @@ struct GbnSave {
 
 #define GBN_SCREEN_WIDTH 240u
 #define GBN_SCREEN_HEIGHT 160u
+/* Exact input snapshots allow cached decoding even after raw host/DMA writes.
+ * 31 tiles cover a 240-pixel scanline with two clipped edge tiles. */
+struct GbnIndexedRow {
+    uint16_t map[31], character;
+    uint16_t address[31];
+    uint32_t words[31];
+    uint8_t samples;
+    bool valid, opaque30, opaque31;
+    _Alignas(4) uint8_t indices[31 * 8];
+};
+/* Optional caller-owned decoded text rows. Keep alive while attached. */
+struct GbnPpuCache {
+    struct GbnIndexedRow rows[4][256];
+    uint8_t object_snapshot[GBN_OAM_SIZE];
+    uint8_t object_ids[GBN_SCREEN_HEIGHT][128], object_counts[GBN_SCREEN_HEIGHT];
+    uint32_t object_bounds[GBN_SCREEN_HEIGHT];
+    bool object_valid, tracked_oam;
+};
 struct GbnPpu {
 	uint16_t* pixels; /* GBA BGR555: red occupies bits 0..4. Caller-owned. */
 	unsigned stride;
 	int32_t reference[2][2]; /* Current BG2/BG3 affine scanline origins. */
 	uint32_t frames, lines, seen[5];
+	struct GbnPpuCache* cache;
 };
 
 struct GbnDevices {
@@ -200,7 +220,22 @@ void gbn_video_start(struct Gbn*, bool skip_bios);
 /* NULL detaches output. Stride is in uint16 pixels. Scanline sampling currently
  * occurs at HBlank entry; sub-scanline register changes/contention are pending. */
 bool gbn_attach_pixels(struct Gbn*, uint16_t*, unsigned stride);
+/* NULL detaches; attaching initializes the cache. Devices themselves stay small. */
+bool gbn_attach_ppu_cache(struct Gbn*, struct GbnPpuCache*);
+/* Optional OAM write tracking. Direct OAM backing writes must notify before
+ * the next render. VRAM rows continue to validate their exact source bytes. */
+bool gbn_attach_ppu_cache_tracked(struct Gbn*, struct GbnPpuCache*);
+void gbn_ppu_invalidate_oam(struct Gbn*);
 void gbn_audio_start(struct Gbn*);
+void gbn_audio_set_batched(struct Gbn*, bool enabled);
+/* Optional built-in-device timeline: HALT skips PCM-only frontend returns.
+ * All samples remain. Custom scheduling or explicit PCM clock mutation
+ * restores the ordinary queue and disables the option; enable it again only
+ * after custom events have been removed. Audio observations materialize PCM. */
+void gbn_audio_set_timeline(struct Gbn*, bool enabled);
+void gbn_audio_timeline_materialize(struct Gbn*);
+/* Resolve deferred oscillator representation for raw-state diagnostics. */
+void gbn_audio_sync(struct Gbn*);
 unsigned gbn_audio_rate(const struct Gbn*);
 unsigned gbn_audio_read(struct Gbn*, struct GbnStereo* output, unsigned capacity);
 void gbn_set_keys(struct Gbn*, uint16_t pressed);

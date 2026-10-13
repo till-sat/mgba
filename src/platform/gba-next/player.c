@@ -17,6 +17,7 @@ extern uint8_t _rom_tail_start[];
 #endif
 static struct Gbn machine;
 static struct GbnDevices devices;
+static struct GbnPpuCache ppu_cache;
 static struct GbnSave save;
 static uint8_t ewram[GBN_EWRAM_SIZE], iwram[GBN_IWRAM_SIZE];
 static uint8_t palette[GBN_PALETTE_SIZE], vram[GBN_VRAM_SIZE], oam[GBN_OAM_SIZE];
@@ -115,6 +116,7 @@ int main(void) {
 	gbn_init(&machine, ewram, iwram);
 	bool ready = gbn_attach_rom(&machine, _rom_start, rom_size) &&
 		gbn_attach_devices(&machine, &devices, palette, vram, oam) &&
+		gbn_attach_ppu_cache_tracked(&machine, &ppu_cache) &&
 		gbn_attach_pixels(&machine, pixels, GBN_SCREEN_WIDTH);
 	gbn_use_builtin_bios(&machine);
 	enum GbnSaveType save_type = gbn_detect_save(_rom_start, rom_size);
@@ -134,6 +136,8 @@ int main(void) {
 	if (!ready) { fputs("Cannot initialize independent GBA core\n", stderr); am_shutdown(); return 1; }
 	gbn_video_start(&machine, true);
 	gbn_audio_start(&machine);
+	gbn_audio_set_batched(&machine, true);
+	gbn_audio_set_timeline(&machine, true);
 	printf("GBA next: ROM=%" PRIu32 " bytes; CPU=%s; audio=%u Hz; save=RAM\n", rom_size,
 		GBN_RV32 ? "RV32 native" : "interpreter", audio.rate);
 	puts("Arrows: move; Z/X: A/B; A/S: L/R; Enter: Start; Backspace: Select; Esc: quit");
@@ -167,9 +171,9 @@ int main(void) {
 		if (devices.halted) continue;
 		uint32_t executed;
 #if GBN_RV32
-		status = gbn_rv32_run_batch(&backend, 256, &executed);
+		status = gbn_rv32_run_batch(&backend, 4096, &executed);
 #else
-		status = gbn_run_batch(&machine, 256, &executed);
+		status = gbn_run_batch(&machine, 4096, &executed);
 #endif
 		if (status != GBN_STEP && status != GBN_EVENT) break;
 	}

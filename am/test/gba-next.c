@@ -1608,6 +1608,82 @@ static void check_audio(void) {
 	printf("PASS audio: %u register comparisons, %u PSG stereo observations; timer/FIFO DMA, signed PCM, buffer bounds and rate changes\n", registers, samples);
 }
 
+
+/* Partition PSG advancement at every FIFO write in the reference, then
+ * compare at architectural observations. A same-value SOUNDBIAS write is an
+ * independent eager observation and leaves the mixer configuration intact. */
+static void check_fifo_observers(void) {
+	static struct Gbn eager, deferred;
+	static struct GbnDevices eager_devices, deferred_devices;
+	unsigned observations = 0;
+	for (unsigned wrap = 0; wrap < 2; ++wrap) for (unsigned mode = 0; mode < 6; ++mode)
+	for (unsigned trial = 0; trial < 64; ++trial) {
+		gbn_init(&eager, ewram, iwram);
+		CHECK(gbn_attach_devices(&eager, &eager_devices, palette, vram, oam));
+		eager.now = wrap ? 0xffffff00u : 0;
+		gbn_audio_start(&eager);
+		eager_devices.io[0x84 / 2] = trial & 8 ? 0 : 0x80;
+		eager_devices.io[0x70 / 2] = 0x80 | (trial & 3) * 0x20;
+		eager_devices.io[0x80 / 2] = 0xff77;
+		eager_devices.io[0x82 / 2] = 0x7707;
+		eager_devices.io[0x88 / 2] = 0x200 | (trial & 3) << 14;
+		struct GbnAudio* a = &eager_devices.audio;
+		for (unsigned id = 0; id < 4; ++id) {
+			struct GbnPsgChannel* c = &a->psg[id];
+			c->enabled = c->dac = !(trial & 16);
+			c->updated = eager.now + (id == 2 && (trial & 4) ? 24 : 0);
+			c->frequency = trial & 1 ? 2047 : 0;
+			c->duty = trial & 3; c->phase = trial & 7;
+			c->volume = id == 2 ? 1 + trial % 7 : trial & 15;
+			c->noise = (trial & 3) << 4 | (trial & 1 ? 8 : 0);
+			c->lfsr = (uint16_t) random_word() & 0x7fff;
+			c->length = 1 + trial % 63; c->length_enable = (trial & 32) != 0;
+			c->envelope = 0x19; c->envelope_ticks = 2;
+			c->remainder = trial & 7;
+		}
+		for (unsigned n = 0; n < sizeof(a->wave); ++n) a->wave[n] = (uint8_t) random_word();
+		for (unsigned id = 0; id < 2; ++id) {
+			a->fifo[id].read = trial & 31; a->fifo[id].size = trial % 33;
+			for (unsigned n = 0; n < 32; ++n) a->fifo[id].data[n] = (uint8_t) random_word();
+		}
+		deferred = eager; deferred_devices = eager_devices; deferred.devices = &deferred_devices;
+		for (unsigned tick = 0; tick < 8; ++tick) {
+			uint32_t start = eager.now;
+			for (unsigned which = 0; which < 2; ++which) {
+				struct Gbn* m = which ? &deferred : &eager;
+				gbn_schedule_at(m, GBN_EVENT_AUDIO, start + (mode == 3 ? 32 : 256), 0x18);
+				gbn_schedule_at(m, GBN_EVENT_AUDIO_FRAME, start + (mode == 4 ? 48 : 32768), 0x10);
+				if (mode == 1) gbn_cancel(m, GBN_EVENT_AUDIO);
+				if (mode == 2) gbn_cancel(m, GBN_EVENT_AUDIO_FRAME);
+				if (mode == 5) m->devices->audio.running = false;
+			}
+			for (unsigned n = 0; n < 12; ++n) {
+				eager.now = deferred.now = start + 1 + n * 11;
+				unsigned width = 1u << (n % 3), offset = 0xa0 + 4 * (n & 1);
+				uint32_t value = random_word();
+				gbn_audio_write(&eager, 0x88, 2, eager_devices.io[0x88 / 2]);
+				gbn_audio_write(&eager, offset, width, value);
+				gbn_audio_write(&deferred, offset, width, value);
+				CHECK(!memcmp(eager_devices.audio.fifo, deferred_devices.audio.fifo,
+					sizeof(eager_devices.audio.fifo)));
+				for (unsigned reg = 0x90; reg < 0xa0; reg += 2)
+					CHECK(gbn_audio_reg_read(&eager, reg) == gbn_audio_reg_read(&deferred, reg));
+				if (n == 4 || n == 8) {
+					gbn_audio_timer(&eager, n & 1, eager.now);
+					gbn_audio_timer(&deferred, n & 1, deferred.now);
+				}
+			}
+			eager.now = deferred.now = start + 512;
+			if (tick & 1) { gbn_audio_frame(&eager, eager.now); gbn_audio_frame(&deferred, deferred.now); }
+			gbn_audio_service(&eager, eager.now); gbn_audio_service(&deferred, deferred.now);
+			CHECK(!memcmp(&eager_devices.audio, &deferred_devices.audio, sizeof(struct GbnAudio)));
+			CHECK(!memcmp(eager.events, deferred.events, sizeof(eager.events)));
+			++observations;
+		}
+	}
+	printf("PASS FIFO observer partition: %u complete PSG/PCM/event comparisons; wave reads, full FIFOs, clock wrap, startup and cancelled/overdue clocks\n", observations);
+}
+
 static void check_sio(void) {
 	unsigned cases = 0;
 	static const uint16_t rcnt[] = {0x8000, 0, 0x4000, 0xc000};
@@ -2098,10 +2174,11 @@ int main(void) {
 	check_device_registers();
 	check_video_events();
 	check_dma();
-	check_dma_spans();
+	check_dma_spans(); check_dma_first_spans();
 	check_builtin_bios();
 	check_timers();
 	check_audio();
+	check_fifo_observers();
 	check_sio();
 	check_saves();
 	check_waits();

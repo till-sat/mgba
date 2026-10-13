@@ -111,6 +111,21 @@ test-gba-next-rv32: $(BUILD_DIR)/gba-next-rv32-test.elf $(SPIKE_PLUGIN)
 
 -include $(BUILD_DIR)/am/test/gba-next-rv32.d
 
+$(BUILD_DIR)/am/test/gba-next-audio-timeline.o: am/test/gba-next-audio-timeline.c Makefile $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config | $(RUNTIME_READY)
+	@mkdir -p "$(@D)"
+	$(CC) $(GBN_CPPFLAGS) -DAUDIO_TEST_NATIVE=1 -Isrc/gba-next -Iam/include $(PROJECT_CFLAGS) $(CPPFLAGS) $(CFLAGS) $(LTO) -MMD -MP -c "$<" -o "$@"
+
+$(BUILD_DIR)/gba-next-audio-timeline-test.elf: $(BUILD_DIR)/am/test/gba-next-audio-timeline.o $(GBN_LIBRARY) $(AM_LIBRARY) $(BOOT_OBJECT) $(LINK_SCRIPT) $(RUNTIME_READY)
+	$(CC) $(PROJECT_CFLAGS) $(CFLAGS) $(LTO) $(PLATFORM_LDFLAGS) $(LDFLAGS) -o "$@" \
+		$(BOOT_OBJECT) $(BUILD_DIR)/am/test/gba-next-audio-timeline.o \
+		-Wl,--start-group $(GBN_LIBRARY) $(AM_LIBRARY) $(PLATFORM_LIBS) -Wl,--end-group
+
+.PHONY: test-gba-next-audio-timeline
+test-gba-next-audio-timeline: $(BUILD_DIR)/gba-next-audio-timeline-test.elf $(SPIKE_PLUGIN)
+	timeout 180 $(SPIKE_COMMAND) --device=am_protosoc,0 "$<"
+
+-include $(BUILD_DIR)/am/test/gba-next-audio-timeline.d
+
 $(BUILD_DIR)/am/test/gba-next-ppu.o: am/test/gba-next-ppu.c Makefile $(PLATFORM_MAKEFILE) $(BUILD_DIR)/.build-config | $(RUNTIME_READY)
 	@mkdir -p "$(@D)"
 	$(CC) $(PROJECT_CPPFLAGS) $(CPPFLAGS) $(PROJECT_CFLAGS) $(CFLAGS) $(LTO) -MMD -MP -c "$<" -o "$@"

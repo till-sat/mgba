@@ -614,7 +614,10 @@ static void compare_device_write(uint32_t cap,unsigned tag) {
 	after=devices; devices=saved;
 	enum GbnStatus b=gbn_rv32_run_batch(&backend,cap,&got);
 	if(a!=b || want!=got || memcmp(&machine,&reference,sizeof(machine)) || memcmp(&devices,&after,sizeof(devices))) {
-		printf("FAIL native device write tag=%08x status=%u/%u count=%u/%u\n",tag,b,a,got,want);exit(1);
+		printf("FAIL native device write tag=%08x status=%u/%u count=%u/%u\n",tag,b,a,got,want);
+        for(unsigned z=0;z<sizeof(machine);++z)if(((uint8_t*)&machine)[z]!=((uint8_t*)&reference)[z]){printf("machine byte=%u got=%02x want=%02x event_dma=%u now=%u/%u next=%d/%d\n",z,((uint8_t*)&machine)[z],((uint8_t*)&reference)[z],(unsigned)((uint8_t*)&machine.events[GBN_EVENT_DMA]-(uint8_t*)&machine),machine.now,reference.now,machine.next_event,reference.next_event);break;}
+        for(unsigned z=0;z<sizeof(devices);++z)if(((uint8_t*)&devices)[z]!=((uint8_t*)&after)[z]){printf("device byte=%u got=%02x want=%02x\n",z,((uint8_t*)&devices)[z],((uint8_t*)&after)[z]);break;}
+        exit(1);
 	}
 	++comparisons;
 }
@@ -1143,17 +1146,49 @@ static void resident_flag_paths(void) {
 
 #include "gba-next-rv32-calls.h"
 #include "gba-next-rv32-open-bus.h"
+#include "gba-next-rv32-proof.h"
+#include "mixer-native-proof.h"
+#include "dma-start-proof.h"
+#include "mixer-packet-proof.h"
+
+static void hot_trace_size(void) {
+    static const uint32_t code[] = {0xe009019eu,0xe0809bc9u,0xe00c099au,0xe3ccc8ffu,0xe08c6466u,0xe00c099bu,0xe3ccc8ffu,0xe08c7467u,0xe08ee004u,0xe1b09baeu,0xa000007u,0xe3cee5feu,0xe0522009u,0xdaffffceu,0xe2599001u,0x800001u,0x11b300d9u,0xe1f310d1u,0xe0411000u,0xe2955101u,0x3affffeau,0xe5857630u,0xe4856004u,0xe2588004u,0xcaffffe4u,0xe2433001u,0xe8bd1010u,0xe584e01cu,0xe5842018u,0xe5843028u,0xe59d8000u,0xe28f0001u};
+    setup(); memcpy(iwram+0xbac,code,sizeof(code));
+    for (unsigned r=0;r<15;++r) machine.cpu.r[r]=r*17+1;
+    machine.cpu.cpsr=31; CHECK(gbn_enter_arm(&machine,0x03000bac)==GBN_STEP);
+    compare(1,0x7230000);
+    for (unsigned i=0;i<GBN_RV32_SLOTS;++i) if(backend.blocks[i].valid && backend.blocks[i].pc==0x03000bac) {
+        printf("Hot ARM trace: instructions=%u words=%u branch=%u fallback=%u\n",backend.blocks[i].instructions,backend.blocks[i].words,backend.blocks[i].branch,backend.blocks[i].fallback);
+    }
+    printf("AM probe complete\n");return;
+}
+
+#include "packet-time-proof.h"
 
 int main(void) {
+    immediate_io_reads(); immediate_dma_writes(); consecutive_io_prefetch(); grouped_io_boundaries();
+#ifdef GBN_IO_FOCUSED
+    open_bus_stale_prefetch(); open_bus_boundaries(); open_bus_ram_tail();
+    io_reads(); dma_reads(); dma_writes();
+    printf("PASS focused Thumb IO backend: %u state comparisons\n",comparisons);
+    return 0;
+#endif
+    packet_time_boundaries();
+#ifdef GBN_PACKET_TIME_FOCUSED
+    resident_packets(); packet_guard_boundaries(); packet_lookahead_changes(); packet_guest_region_edges(); packet_rotation_suffixes();
+    printf("PASS focused packet-time backend: %u state comparisons\n",comparisons);
+    return 0;
+#endif
 	CHECK(gbn_rv32_available());
 	open_bus_stale_prefetch(); open_bus_reads(); open_bus_boundaries(); open_bus_ram_tail(); open_bus_writeback();
-	encodings(); streams(); invalidation(); memory_paths(); resident_blocks(); arm_encodings(); arm_streams(); interpreter_bridge(); ram_code(); ram_dma(); arm_self_modification(); arm_multiply(); arm_transfers(); io_reads(); dma_reads(); dma_writes(); fixed_loops(); native_chains(); cache_pressure(); cost();
+	encodings(); streams(); invalidation(); memory_paths(); resident_blocks(); arm_encodings(); arm_streams(); interpreter_bridge(); ram_code(); ram_dma(); arm_self_modification(); arm_multiply(); arm_transfers(); io_reads(); dma_reads(); dma_writes(); native_dma_start_boundaries(); native_dma_start_misses(); fixed_loops(); native_chains(); cache_pressure(); cost();
 	stack_encodings(); stack_boundaries(); stack_streams(); stack_self_modification(); stack_returns();
 	resident_flag_paths();
 	call_encodings(); call_boundaries();
 	return_chains(); return_cache_changes();
 	bx_encodings(); bx_calls();
 	indirect_wrong_descriptor();
+	proof_epochs(); prefetch_boundaries(); arm_trace_boundaries(); arm_internal_edges(); arm_bulk_boundaries(); single_list_transfers(); batched_audio_cpu(); hot_trace_size(); fused_native_arithmetic(); resident_packets(); packet_guard_boundaries(); packet_lookahead_changes(); packet_guest_region_edges(); packet_rotation_suffixes();
 	printf("Native cache storage: %u bytes; code arena=%u bytes\n", (unsigned) sizeof(backend), (unsigned) sizeof(backend.code));
 	printf("PASS independent RV32 native backend: %u state comparisons\n", comparisons);
 	return 0;

@@ -29,22 +29,35 @@ _Static_assert(GBN_RV32_SLOTS >= 2 && !(GBN_RV32_SLOTS & (GBN_RV32_SLOTS - 1)), 
 _Static_assert(GBN_RV32_WAYS && !(GBN_RV32_WAYS & (GBN_RV32_WAYS - 1)) &&
 	GBN_RV32_WAYS <= 256 && GBN_RV32_WAYS <= GBN_RV32_SLOTS, "Cache ways must be a power of two and fit replacement counters");
 _Static_assert(GBN_RV32_SEGMENT_WORDS >= GBN_RV32_WORDS, "A block must fit in one arena segment");
+_Static_assert(offsetof(struct GbnRv32Block, generation) == 16 && sizeof(struct GbnRv32Block) % 16 == 0,
+	"Native edge and proof fields must share an aligned 16-byte prefix");
+/* NOW holds the modular difference now - deadline throughout a native frame.
+ * Event guards can test its sign directly; only entry/return convert time. */
 enum { ZERO = 0, RA = 1, SP = 2, LHS = 5, RHS = 6, RESULT = 7,
-	NOW = 8, DEADLINE = 9, MACHINE = 10, LIMIT = 11, FLAGS = 12, TEMP = 13,
-	PREFETCH = 18, WAIT = 19, COMPLETED = 20, NEGATIVE = 21, IS_ZERO = 22,
-	PROLOGUE_WORDS = 27,
-	FRAME_BYTES = 80, SNAPSHOT_FLAGS = 52, SNAPSHOT_PREFETCH = 56, SNAPSHOT_NOW = 60,
-	STACK_TARGET = 64 };
-static const unsigned guest[] = {14, 15, 16, 17, 28, 29, 30, 31};
+	NOW = 8, HOST_S1 = 9, MACHINE = 10, LIMIT = 11, FLAGS = 12, TEMP = 13,
+	PREFETCH = 18, WAIT = 19, HOST_S4 = 20, NEGATIVE = 21, IS_ZERO = 22,
+	RAM_EPOCH = 25, CONTEXT = 26, PROLOGUE_WORDS = 38,
+	FRAME_BYTES = 144, SNAPSHOT_FLAGS = 80, SNAPSHOT_PREFETCH = 84, SNAPSHOT_NOW = 88,
+    STACK_TARGET = 92, SAVED_NEGATIVE = 96, SAVED_ZERO = 100,
+    SAVED_EPOCH = 104, SAVED_CONTEXT = 108, SAVED_S7 = 112, SAVED_S8 = 116,
+    SAVED_S11 = 120, SAVED_RA = 124, INITIAL_CAP = 128, INITIAL_DEADLINE = 132 };
+/* Guest SP stays in the machine. Every other integer register shares one
+ * native frame across chains, including LR. gp/tp retain their ABI values. */
+static const unsigned guest[] = {14, 15, 16, 17, 28, 29, 30, 31, 23, 24, 27, 20, 9, 0, 1};
+static bool resident(unsigned r) { return r < 15 && r != 13; }
 struct Emit {
 	struct GbnRv32Block* block;
 	unsigned count;
 	struct { unsigned at, instruction; bool fallback; } stops[10 * GBN_RV32_INSNS];
 	unsigned stop_count;
-	unsigned returns[2], return_count;
+	unsigned returns[GBN_RV32_INSNS + 2], return_count;
 	uint32_t written;
-	bool read_only, read_seen, dynamic_pc;
-	unsigned loop_jump;
+	bool read_only, read_seen, dynamic_pc, skip_shifter;
+	unsigned loop_jumps[GBN_RV32_INSNS + 1], loop_jump_count;
+	unsigned body_offsets[GBN_RV32_INSNS], source_count;
+	uint32_t thumb_literal[8];
+	unsigned thumb_literal_mask;
+	bool io_guarded;
 };
 
 static void word(struct Emit* e, uint32_t v) { e->block->code[e->count++] = v; }
@@ -79,20 +92,21 @@ static void guard(struct Emit* e, unsigned reg, bool reject_zero) {
 	stop(e, reg, ZERO, reject_zero ? 0 : 1, true);
 }
 static void get(struct Emit* e, unsigned dest, unsigned r, uint32_t pc) {
-	if (r < 8) imm(e, dest, guest[r], 0, 0);
+	if (resident(r)) imm(e, dest, guest[r], 0, 0);
 	else if (r == 15) constant(e, dest, pc + (e->block->thumb ? 4 : 8));
 	else load(e, dest, offsetof(struct Gbn, cpu.r) + 4 * r);
 }
-/* Low guest registers already reside in host registers. Use them directly
- * as read operands; high registers and PC use the designated scratch register. */
+/* All non-SP integer guest registers reside in host registers. Use them
+ * directly as read operands; SP and PC use the designated scratch register. */
 static unsigned source(struct Emit* e, unsigned scratch, unsigned r, uint32_t pc) {
-	if (r < 8) return guest[r];
+	if (resident(r)) return guest[r];
 	get(e, scratch, r, pc);
 	return scratch;
 }
 static void put_value(struct Emit* e, unsigned r, unsigned value) {
 	e->written |= 1u << r;
-	if (r < 8) { if (guest[r] != value) imm(e, guest[r], value, 0, 0); }
+	e->thumb_literal_mask &= ~(1u << r);
+	if (resident(r)) { if (guest[r] != value) imm(e, guest[r], value, 0, 0); }
 	else store(e, value, offsetof(struct Gbn, cpu.r) + 4 * r);
 }
 static void put(struct Emit* e, unsigned r) { put_value(e, r, RESULT); }
@@ -110,19 +124,21 @@ static void packed_flags(struct Emit* e, unsigned dest) {
 /* Inputs may alias their assigned LHS/RHS scratch registers, respectively;
  * neither is overwritten until all uses of that original operand complete. */
 static void arithmetic(struct Emit* e, bool subtract, unsigned a, unsigned b) {
-	op(e, RESULT, a, b, 0, subtract ? 0x20 : 0);
-	/* Carry first, while both operands are intact. */
-	op(e, TEMP, subtract ? a : RESULT, subtract ? b : a, 3, 0);
-	if (subtract) imm(e, TEMP, TEMP, 4, 1);
-	op(e, RHS, a, b, 4, 0);
-	if (!subtract) imm(e, RHS, RHS, 4, -1);
-	op(e, LHS, a, RESULT, 4, 0); op(e, LHS, LHS, RHS, 7, 0);
-	imm(e, LHS, LHS, 5, 31); imm(e, LHS, LHS, 1, 28);
-	imm(e, TEMP, TEMP, 1, 29);
-	/* ARM7 ADD/SUB also clear reserved PSR bits 24..27 in our oracle. */
-	imm(e, FLAGS, FLAGS, 1, 8); imm(e, FLAGS, FLAGS, 5, 8);
-	op(e, FLAGS, FLAGS, LHS, 6, 0); op(e, FLAGS, FLAGS, TEMP, 6, 0);
-	nz(e);
+    op(e,RESULT,a,b,0,subtract?0x20:0);
+    op(e,TEMP,subtract?a:RESULT,subtract?b:a,3,0);
+    if(subtract)imm(e,TEMP,TEMP,4,1);
+    /* Overflow from signed order, with the original operands still live:
+     * ADD: (signed result < signed a) XOR sign(b).
+     * SUB: (signed a < signed b) XOR sign(result). */
+    if(subtract) {
+        op(e,LHS,a,b,2,0);nz(e);op(e,LHS,LHS,NEGATIVE,4,0);
+    } else {
+        op(e,LHS,RESULT,a,2,0);imm(e,RHS,b,5,31);
+        op(e,LHS,LHS,RHS,4,0);nz(e);
+    }
+    imm(e,LHS,LHS,1,28);imm(e,TEMP,TEMP,1,29);
+    imm(e,FLAGS,FLAGS,1,8);imm(e,FLAGS,FLAGS,5,8);
+    op(e,FLAGS,FLAGS,LHS,6,0);op(e,FLAGS,FLAGS,TEMP,6,0);
 }
 static void arithmetic_carry(struct Emit* e, bool subtract, unsigned a, unsigned b) {
 	imm(e, WAIT, FLAGS, 5, 29); imm(e, WAIT, WAIT, 7, 1);
@@ -147,15 +163,21 @@ static void arithmetic_carry(struct Emit* e, bool subtract, unsigned a, unsigned
 	nz(e);
 }
 static void multiply_wait(struct Emit* e, unsigned multiplier, bool accumulate) {
-	/* ARM7 early termination: each upper signed byte group equal to 0 or
-	 * -1 removes one cycle. This also handles positive 0xff and -0x100. */
-	constant(e, WAIT, accumulate ? 5 : 4);
-	for (unsigned shift = 8; shift <= 24; shift += 8) {
-		imm(e, TEMP, multiplier, 5, 0x400 | (int) shift);
-		imm(e, TEMP, TEMP, 0, 1); imm(e, TEMP, TEMP, 3, 2);
-		op(e, WAIT, WAIT, TEMP, 0, 0x20);
-	}
+    /* Complement negative operands, then count significant byte groups.
+     * Each ARM7 early-exit class gets a short path; gp/tp remain untouched. */
+    constant(e, WAIT, accumulate ? 2 : 1);
+    imm(e, TEMP, multiplier, 5, 0x400 | 31);
+    op(e, TEMP, TEMP, multiplier, 4, 0);
+    unsigned exits[3];
+    for (unsigned i = 0; i < 3; ++i) {
+        imm(e, TEMP, TEMP, 5, 8);
+        exits[i] = e->count; word(e, 0);
+        imm(e, WAIT, WAIT, 0, 1);
+    }
+    for (unsigned i = 0; i < 3; ++i)
+        e->block->code[exits[i]] = beq(TEMP, ZERO, 4 * (e->count - exits[i]));
 }
+
 static void condition(struct Emit* e, unsigned cond) {
 	/* Boolean branch result in TEMP; N and Z already have boolean form. */
 	if (cond < 2) imm(e, TEMP, IS_ZERO, 0, 0);
@@ -209,19 +231,46 @@ static void ram_wait(struct Emit* e, const struct Gbn* m, uint32_t pc) {
 	imm(e, RESULT, LHS, 3, 16);
 	op(e, RESULT, ZERO, RESULT, 0, 0x20);
 	imm(e, LHS, LHS, 5, 1); op(e, LHS, LHS, RESULT, 7, 0); /* previous */
-	/* extra = wait > seq+1 ? (wait-2)/seq : 0; seq is 1,2,4 or 8. */
+	/* Short waits add no prefetch slots and no uncovered CPU time.
+	 * Longer waits either fit the queue (also zero uncovered time), or
+	 * saturate it. Only the saturated path needs a residual-time update. */
+	imm(e, RESULT, WAIT, 3, (int) seq + 2);
+	unsigned short_wait = e->count; word(e, 0);
 	imm(e, RHS, WAIT, 0, -2); imm(e, RHS, RHS, 5, (int) shift);
-	imm(e, RESULT, WAIT, 3, (int) seq + 2); imm(e, RESULT, RESULT, 0, -1);
-	op(e, RHS, RHS, RESULT, 7, 0);
 	constant(e, RESULT, 7); op(e, RESULT, RESULT, LHS, 0, 0x20);
-	word(e, beq(RESULT, RHS, 8) | 7u << 12); /* bgeu remaining,extra,+8 */
-	imm(e, RHS, RESULT, 0, 0);
+	unsigned fits = e->count; word(e, 0);
+	imm(e, RHS, RESULT, 1, (int) shift); imm(e, RHS, RHS, 0, (int) seq + 1);
+	op(e, WAIT, WAIT, RHS, 0, 0x20); op(e, NOW, NOW, WAIT, 0, 0);
+	imm(e, PREFETCH, TEMP, 0, 14);
+	unsigned full_done = e->count; word(e, 0);
+	e->block->code[fits] = beq(RESULT, RHS, 4 * (e->count - fits)) | 7u << 12;
 	op(e, LHS, LHS, RHS, 0, 0); imm(e, LHS, LHS, 1, 1);
 	op(e, PREFETCH, TEMP, LHS, 0, 0);
-	imm(e, RHS, RHS, 1, (int) shift); imm(e, RHS, RHS, 0, (int) seq + 1);
-	op(e, WAIT, WAIT, RHS, 0, 0x20);
-	imm(e, RESULT, WAIT, 5, 0x41f); imm(e, RESULT, RESULT, 4, -1);
-	op(e, WAIT, WAIT, RESULT, 7, 0); op(e, NOW, NOW, WAIT, 0, 0);
+	unsigned fits_done = e->count; word(e, 0);
+	e->block->code[short_wait] = beq(RESULT, ZERO, 4 * (e->count - short_wait)) | 1u << 12;
+	imm(e, LHS, LHS, 1, 1); op(e, PREFETCH, TEMP, LHS, 0, 0);
+	e->block->code[full_done] = beq(ZERO, ZERO, 4 * (e->count - full_done));
+	e->block->code[fits_done] = beq(ZERO, ZERO, 4 * (e->count - fits_done));
+}
+
+/* Device accesses use a one- or two-cycle bus wait.  With ROM prefetch on and
+ * at least one sequential code wait, both values always take ram_wait's short
+ * path: no uncovered NOW time is added and only the preceding prefetch slot
+ * is advanced.  Emit that path directly; the zero-wait/WAIT=2 corner and all
+ * RAM/non-prefetch cases retain the full formula. */
+static void io_wait(struct Emit* e, const struct Gbn* m, uint32_t pc, unsigned wait) {
+	if (m->code_region < 8 || !(m->waitcnt & 0x4000) || (wait == 2 && !m->code_wait)) {
+		ram_wait(e, m, pc);
+		return;
+	}
+	constant(e, TEMP, pc + (e->block->thumb ? 4 : 8));
+	op(e, LHS, PREFETCH, TEMP, 0, 0x20);
+	imm(e, RESULT, LHS, 3, 16);
+	op(e, RESULT, ZERO, RESULT, 0, 0x20);
+	imm(e, LHS, LHS, 5, 1);
+	op(e, LHS, LHS, RESULT, 7, 0);
+	imm(e, LHS, LHS, 1, 1);
+	op(e, PREFETCH, TEMP, LHS, 0, 0);
 }
 
 static void writeback(struct Emit* e, unsigned rn, int adjustment) {
@@ -231,18 +280,11 @@ static void writeback(struct Emit* e, unsigned rn, int adjustment) {
 	put(e, rn);
 }
 static void access_value(struct Emit* e, uint32_t pc, unsigned rd, unsigned kind, unsigned width, unsigned rn, int adjustment) {
-	unsigned fn = width == 4 ? 2 : width == 2 ? 1 : 0;
-	if (kind <= 2) {
-		get(e, RESULT, rd, pc);
-		word(e, RESULT << 20 | LHS << 15 | fn << 12 | 0x23);
-		writeback(e, rn, adjustment);
-	} else {
-		/* When base == destination the loaded value wins over writeback. */
-		writeback(e, rn, adjustment);
-		if (width < 4 && kind != 3 && kind != 7) fn |= 4;
-		word(e, LHS << 15 | fn << 12 | RESULT << 7 | 3);
-		put(e, rd);
-	}
+    (void)kind; /* Loads use the guarded shared leaf path. */
+    unsigned fn=width==4?2:width==2?1:0;
+    get(e,RESULT,rd,pc);
+    word(e,RESULT<<20|LHS<<15|fn<<12|0x23);
+    writeback(e,rn,adjustment);
 }
 
 /* Effective address is in LHS. All guards precede data or base writeback. */
@@ -318,6 +360,8 @@ static const uint8_t native_io_readable[0x210 / 2] = {
 };
 _Static_assert(offsetof(struct GbnDevices, io) == 0 && _Alignof(struct GbnDevices) >= 4,
 	"Native IO loads require an aligned register array at the device base");
+
+#include "dma-start-native.h"
 
 /* Whole-word DMA address writes have no scheduling side effects. Counts and
  * controls remain on the bus path. The flag selects the 27-bit address mask. */
@@ -438,18 +482,567 @@ static void open_bus_value(struct Emit* e, const struct Gbn* m, uint32_t pc,
     put(e,rd);
 }
 
+/* Preserve the resident guest frame. a3 is the original data address;
+ * t2 returns an unsigned value, t0 the bus/internal wait and t1 the kind:
+ * 0=miss, 1=RAM/stored IO, -1=ROM, 2=open bus handled with the caller PC.
+ * s3 is the private link; gp/tp, guest LR and all resident state stay intact. */
+__attribute__((naked, noinline, used)) static void read_byte(void) {
+    __asm__ volatile(
+        "srli t1,a3,24\n\t"
+        "addi t1,t1,-2\n\t"
+        "sltiu t2,t1,2\n\t"
+        "beqz t2,3f\n\t"
+        "beqz t1,0f\n\t"
+        "lw t2,%c[iwram](a0)\n\t"
+        "li t0,32767\n\t"
+        "li t1,2\n\t"
+        "j 2f\n\t"
+        "0: lw t2,%c[ewram](a0)\n\t"
+        "li t0,262143\n\t"
+        "lbu t1,%c[ewram_wait](a0)\n\t"
+        "addi t1,t1,1\n\t"
+        "addi t1,t1,1\n\t"
+        "2: beqz t2,9f\n\t"
+        "and t0,a3,t0\n\t"
+        "add t0,t0,t2\n\t"
+        "lbu t2,0(t0)\n\t"
+        "mv t0,t1\n\t"
+        "li t1,1\n\t"
+        "j 8f\n\t"
+        "3: srli t1,a3,24\n\t"
+        "addi t1,t1,-8\n\t"
+        "sltiu t2,t1,6\n\t"
+        "beqz t2,4f\n\t"
+        "lw t2,%c[rom](a0)\n\t"
+        "beqz t2,9f\n\t"
+        "li t0,33554431\n\t"
+        "and t0,a3,t0\n\t"
+        "lw t1,%c[rom_size](a0)\n\t"
+        "addi t0,t0,1\n\t"
+        "bltu t1,t0,9f\n\t"
+        "addi t0,t0,-1\n\t"
+        "add t0,t0,t2\n\t"
+        "lbu t2,0(t0)\n\t"
+        "srli t0,a3,25\n\t"
+        "addi t0,t0,-4\n\t"
+        "add t0,a0,t0\n\t"
+        "lbu t1,%c[rom_nonseq](t0)\n\t"
+        "addi t0,t1,2\n\t"
+        "li t1,-1\n\t"
+        "j 8f\n\t"
+        "4: srli t1,a3,24\n\t"
+        "addi t1,t1,-4\n\t"
+        "bnez t1,9f\n\t"
+        "li t0,67108864\n\t"
+        "sub t0,a3,t0\n\t"
+        "sltiu t1,t0,%c[io_bytes]\n\t"
+        "beqz t1,9f\n\t"
+        "srli t1,t0,1\n\t"
+        "la t2,%[table]\n\t"
+        "add t1,t1,t2\n\t"
+        "lbu t1,0(t1)\n\t"
+        "andi t1,t1,21\n\t"
+        "beqz t1,9f\n\t"
+        "lw t2,%c[devices](a0)\n\t"
+        "beqz t2,9f\n\t"
+        "andi t2,t1,16\n\t"
+        "bnez t2,7f\n\t"
+        "andi t2,t1,4\n\t"
+        "bnez t2,6f\n\t"
+        "lw t2,%c[devices](a0)\n\t"
+        "add t0,t0,t2\n\t"
+        "lbu t2,0(t0)\n\t"
+        "li t0,2\n\t"
+        "li t1,1\n\t"
+        "j 8f\n\t"
+        "6: li t2,0\n\t"
+        "li t0,2\n\t"
+        "li t1,1\n\t"
+        "j 8f\n\t"
+        "7: li t0,2\n\t"
+        "li t1,2\n\t"
+        "j 8f\n\t"
+        "9: li t1,0\n\t"
+        "8: jalr zero,s3,0\n\t"
+        : : [iwram] "i" (offsetof(struct Gbn, iwram)),
+            [ewram] "i" (offsetof(struct Gbn, ewram)),
+            [ewram_wait] "i" (offsetof(struct Gbn, ewram_wait)),
+            [rom] "i" (offsetof(struct Gbn, rom)), [rom_size] "i" (offsetof(struct Gbn, rom_size)),
+            [rom_nonseq] "i" (offsetof(struct Gbn, rom_nonseq)),
+            [rom_seq] "i" (offsetof(struct Gbn, rom_seq)),
+            [devices] "i" (offsetof(struct Gbn, devices)),
+            [io_bytes] "i" (sizeof(native_io_readable) * 2), [table] "i" (native_io_readable));
+}
+
+/* Preserve the resident guest frame. a3 is the original data address;
+ * t2 returns an unsigned value, t0 the bus/internal wait and t1 the kind:
+ * 0=miss, 1=RAM/stored IO, -1=ROM, 2=open bus handled with the caller PC.
+ * s3 is the private link; gp/tp, guest LR and all resident state stay intact. */
+__attribute__((naked, noinline, used)) static void read_half(void) {
+    __asm__ volatile(
+        "andi t0,a3,1\n\t"
+        "bnez t0,9f\n\t"
+        "srli t1,a3,24\n\t"
+        "addi t1,t1,-2\n\t"
+        "sltiu t2,t1,2\n\t"
+        "beqz t2,3f\n\t"
+        "beqz t1,0f\n\t"
+        "lw t2,%c[iwram](a0)\n\t"
+        "li t0,32767\n\t"
+        "li t1,2\n\t"
+        "j 2f\n\t"
+        "0: lw t2,%c[ewram](a0)\n\t"
+        "li t0,262143\n\t"
+        "lbu t1,%c[ewram_wait](a0)\n\t"
+        "addi t1,t1,1\n\t"
+        "addi t1,t1,1\n\t"
+        "2: beqz t2,9f\n\t"
+        "and t0,a3,t0\n\t"
+        "add t0,t0,t2\n\t"
+        "andi t2,t0,1\n\t"
+        "bnez t2,9f\n\t"
+        "lhu t2,0(t0)\n\t"
+        "mv t0,t1\n\t"
+        "li t1,1\n\t"
+        "j 8f\n\t"
+        "3: srli t1,a3,24\n\t"
+        "addi t1,t1,-8\n\t"
+        "sltiu t2,t1,6\n\t"
+        "beqz t2,4f\n\t"
+        "li t2,5\n\t"
+        "beq t1,t2,9f\n\t"
+        "lw t2,%c[rom](a0)\n\t"
+        "beqz t2,9f\n\t"
+        "li t0,33554431\n\t"
+        "and t0,a3,t0\n\t"
+        "lw t1,%c[rom_size](a0)\n\t"
+        "addi t0,t0,2\n\t"
+        "bltu t1,t0,9f\n\t"
+        "addi t0,t0,-2\n\t"
+        "add t0,t0,t2\n\t"
+        "andi t2,t0,1\n\t"
+        "bnez t2,9f\n\t"
+        "lhu t2,0(t0)\n\t"
+        "srli t0,a3,25\n\t"
+        "addi t0,t0,-4\n\t"
+        "add t0,a0,t0\n\t"
+        "lbu t1,%c[rom_nonseq](t0)\n\t"
+        "addi t0,t1,2\n\t"
+        "li t1,-1\n\t"
+        "j 8f\n\t"
+        "4: srli t1,a3,24\n\t"
+        "addi t1,t1,-4\n\t"
+        "bnez t1,9f\n\t"
+        "li t0,67108864\n\t"
+        "sub t0,a3,t0\n\t"
+        "sltiu t1,t0,%c[io_bytes]\n\t"
+        "beqz t1,9f\n\t"
+        "srli t1,t0,1\n\t"
+        "la t2,%[table]\n\t"
+        "add t1,t1,t2\n\t"
+        "lbu t1,0(t1)\n\t"
+        "andi t1,t1,21\n\t"
+        "beqz t1,9f\n\t"
+        "lw t2,%c[devices](a0)\n\t"
+        "beqz t2,9f\n\t"
+        "andi t2,t1,16\n\t"
+        "bnez t2,7f\n\t"
+        "andi t2,t1,4\n\t"
+        "bnez t2,6f\n\t"
+        "lw t2,%c[devices](a0)\n\t"
+        "add t0,t0,t2\n\t"
+        "lhu t2,0(t0)\n\t"
+        "li t0,2\n\t"
+        "li t1,1\n\t"
+        "j 8f\n\t"
+        "6: li t2,0\n\t"
+        "li t0,2\n\t"
+        "li t1,1\n\t"
+        "j 8f\n\t"
+        "7: li t0,2\n\t"
+        "li t1,2\n\t"
+        "j 8f\n\t"
+        "9: li t1,0\n\t"
+        "8: jalr zero,s3,0\n\t"
+        : : [iwram] "i" (offsetof(struct Gbn, iwram)),
+            [ewram] "i" (offsetof(struct Gbn, ewram)),
+            [ewram_wait] "i" (offsetof(struct Gbn, ewram_wait)),
+            [rom] "i" (offsetof(struct Gbn, rom)), [rom_size] "i" (offsetof(struct Gbn, rom_size)),
+            [rom_nonseq] "i" (offsetof(struct Gbn, rom_nonseq)),
+            [rom_seq] "i" (offsetof(struct Gbn, rom_seq)),
+            [devices] "i" (offsetof(struct Gbn, devices)),
+            [io_bytes] "i" (sizeof(native_io_readable) * 2), [table] "i" (native_io_readable));
+}
+
+/* Preserve the resident guest frame. a3 is the original data address;
+ * t2 returns an unsigned value, t0 the bus/internal wait and t1 the kind:
+ * 0=miss, 1=RAM/stored IO, -1=ROM, 2=open bus handled with the caller PC.
+ * s3 is the private link; gp/tp, guest LR and all resident state stay intact. */
+__attribute__((naked, noinline, used)) static void read_word(void) {
+    __asm__ volatile(
+        "andi t0,a3,3\n\t"
+        "bnez t0,9f\n\t"
+        "srli t1,a3,24\n\t"
+        "addi t1,t1,-2\n\t"
+        "sltiu t2,t1,2\n\t"
+        "beqz t2,3f\n\t"
+        "beqz t1,0f\n\t"
+        "lw t2,%c[iwram](a0)\n\t"
+        "li t0,32767\n\t"
+        "li t1,2\n\t"
+        "j 2f\n\t"
+        "0: lw t2,%c[ewram](a0)\n\t"
+        "li t0,262143\n\t"
+        "lbu t1,%c[ewram_wait](a0)\n\t"
+        "addi t1,t1,1\n\t"
+        "slli t1,t1,1\n\t"
+        "addi t1,t1,1\n\t"
+        "2: beqz t2,9f\n\t"
+        "and t0,a3,t0\n\t"
+        "add t0,t0,t2\n\t"
+        "andi t2,t0,3\n\t"
+        "bnez t2,9f\n\t"
+        "lw t2,0(t0)\n\t"
+        "mv t0,t1\n\t"
+        "li t1,1\n\t"
+        "j 8f\n\t"
+        "3: srli t1,a3,24\n\t"
+        "addi t1,t1,-8\n\t"
+        "sltiu t2,t1,6\n\t"
+        "beqz t2,4f\n\t"
+        "lw t2,%c[rom](a0)\n\t"
+        "beqz t2,9f\n\t"
+        "li t0,33554431\n\t"
+        "and t0,a3,t0\n\t"
+        "lw t1,%c[rom_size](a0)\n\t"
+        "addi t0,t0,4\n\t"
+        "bltu t1,t0,9f\n\t"
+        "addi t0,t0,-4\n\t"
+        "add t0,t0,t2\n\t"
+        "andi t2,t0,3\n\t"
+        "bnez t2,9f\n\t"
+        "lw t2,0(t0)\n\t"
+        "srli t0,a3,25\n\t"
+        "addi t0,t0,-4\n\t"
+        "add t0,a0,t0\n\t"
+        "lbu t1,%c[rom_nonseq](t0)\n\t"
+        "lbu t0,%c[rom_seq](t0)\n\t"
+        "add t1,t1,t0\n\t"
+        "addi t0,t1,3\n\t"
+        "li t1,-1\n\t"
+        "j 8f\n\t"
+        "4: srli t1,a3,24\n\t"
+        "addi t1,t1,-4\n\t"
+        "bnez t1,9f\n\t"
+        "li t0,67108864\n\t"
+        "sub t0,a3,t0\n\t"
+        "sltiu t1,t0,%c[io_bytes]\n\t"
+        "beqz t1,9f\n\t"
+        "srli t1,t0,1\n\t"
+        "la t2,%[table]\n\t"
+        "add t1,t1,t2\n\t"
+        "lbu t1,0(t1)\n\t"
+        "andi t1,t1,42\n\t"
+        "beqz t1,9f\n\t"
+        "lw t2,%c[devices](a0)\n\t"
+        "beqz t2,9f\n\t"
+        "andi t2,t1,32\n\t"
+        "bnez t2,7f\n\t"
+        "andi t2,t1,8\n\t"
+        "bnez t2,6f\n\t"
+        "lw t2,%c[devices](a0)\n\t"
+        "add t0,t0,t2\n\t"
+        "lw t2,0(t0)\n\t"
+        "li t0,2\n\t"
+        "li t1,1\n\t"
+        "j 8f\n\t"
+        "6: lw t2,%c[devices](a0)\n\t"
+        "add t0,t0,t2\n\t"
+        "lw t2,0(t0)\n\t"
+        "srli t2,t2,16\n\t"
+        "slli t2,t2,16\n\t"
+        "li t0,2\n\t"
+        "li t1,1\n\t"
+        "j 8f\n\t"
+        "7: li t0,2\n\t"
+        "li t1,2\n\t"
+        "j 8f\n\t"
+        "9: li t1,0\n\t"
+        "8: jalr zero,s3,0\n\t"
+        : : [iwram] "i" (offsetof(struct Gbn, iwram)),
+            [ewram] "i" (offsetof(struct Gbn, ewram)),
+            [ewram_wait] "i" (offsetof(struct Gbn, ewram_wait)),
+            [rom] "i" (offsetof(struct Gbn, rom)), [rom_size] "i" (offsetof(struct Gbn, rom_size)),
+            [rom_nonseq] "i" (offsetof(struct Gbn, rom_nonseq)),
+            [rom_seq] "i" (offsetof(struct Gbn, rom_seq)),
+            [devices] "i" (offsetof(struct Gbn, devices)),
+            [io_bytes] "i" (sizeof(native_io_readable) * 2), [table] "i" (native_io_readable));
+}
+
+static void loaded_value(struct Emit* e, unsigned rd, unsigned kind, unsigned rn, int adjustment) {
+    if (kind == 3 || kind == 7) {
+        unsigned shift = kind == 3 ? 24 : 16;
+        imm(e, RESULT, RESULT, 1, shift); imm(e, RESULT, RESULT, 5, 0x400 | shift);
+    }
+    if (rn != 15) {
+        /* Writeback uses RESULT; preserve the loaded value until afterward.
+         * ARM base/destination aliases keep the value loaded from memory. */
+        imm(e, WAIT, RESULT, 0, 0);
+        writeback(e, rn, adjustment);
+        put_value(e, rd, WAIT);
+    } else put(e, rd);
+}
+
+/* Return the immutable classification for an immediate IO read.  The table
+ * is compile-time metadata only; the emitted path still checks the live
+ * devices pointer and the exact guest address before its first effect. */
+static bool static_io_info(uint32_t address, unsigned kind, unsigned* width,
+        unsigned* offset, unsigned* flags) {
+	if (address >> 24 != 4) return false;
+	*width = kind == 4 ? 4 : kind == 5 || kind == 7 ? 2 : 1;
+	*offset = address - 0x04000000u;
+	if (*offset >= sizeof(native_io_readable) * 2 ||
+			*offset + *width > sizeof(((struct GbnDevices*)0)->io)) return false;
+	if (*width == 4 && (address & 3)) return false;
+	if (*width == 2 && (address & 1)) return false;
+	*flags = native_io_readable[*offset >> 1];
+	unsigned stored = *width == 4 ? 2u : 1u;
+	unsigned fixed = *width == 4 ? 8u : 4u;
+	unsigned open = *width == 4 ? 32u : 16u;
+	return (*flags & (stored | fixed | open)) != 0;
+}
+
+/* The programmed DMA addresses are ordinary masked stores. Prove the exact
+ * address before either store, and preserve the active cursor, latch and
+ * schedule. Count/control writes still use the existing DMA startup path. */
+static bool static_dma_store(struct Emit* e, const struct Gbn* m, uint32_t pc,
+        uint32_t address, unsigned rd, bool exact) {
+	unsigned offset = address - 0x040000b0u;
+	if (offset >= 48 || (offset & 3)) return false;
+	unsigned field = native_dma_address_field[offset >> 2];
+	if (!field) return false;
+	if (!exact) {
+		constant(e, RESULT, address);
+		stop(e, LHS, RESULT, 1, true);
+	}
+	unsigned devices = RESULT;
+	load(e, devices, offsetof(struct Gbn, devices));
+	if (!e->io_guarded) { guard(e, devices, true); e->io_guarded = true; }
+	get(e, WAIT, rd, pc);
+	constant(e, RHS, field & 0x8000 ? 0x07fffffeu : 0x0ffffffeu);
+	op(e, WAIT, WAIT, RHS, 7, 0);
+	unsigned displacement = field & 2047;
+	word(e, (displacement >> 5) << 25 | WAIT << 20 | devices << 15 |
+		2 << 12 | (displacement & 31) << 7 | 0x23);
+	displacement = offset + 0xb0;
+	word(e, (displacement >> 5) << 25 | WAIT << 20 | devices << 15 |
+		2 << 12 | (displacement & 31) << 7 | 0x23);
+	e->read_only = false;
+	constant(e, WAIT, 1); io_wait(e, m, pc, 1);
+	return true;
+}
+
+/* Specialize a Thumb immediate IO load, guarded against its actual address.
+ * Stored values stay live; open-bus reads still select the current DMA latch
+ * or pipeline halfword. Dynamic registers retain the complete bus path. */
+static bool static_io_read(struct Emit* e, const struct Gbn* m, uint32_t pc,
+        uint32_t address, unsigned rd, unsigned kind, unsigned rn, int adjustment,
+	bool exact) {
+	unsigned width, offset, flags;
+	if (!static_io_info(address, kind, &width, &offset, &flags)) return false;
+	unsigned fixed = width == 4 ? 8u : 4u;
+	unsigned open = width == 4 ? 32u : 16u;
+	e->read_seen = true;
+	if (!exact) {
+		constant(e, RESULT, address);
+		stop(e, LHS, RESULT, 1, true);
+	}
+	unsigned devices = RESULT;
+	load(e, devices, offsetof(struct Gbn, devices));
+	if (!e->io_guarded) { guard(e, devices, true); e->io_guarded = true; }
+	if (flags & open) {
+		constant(e, LHS, address);
+		imm(e, TEMP, LHS, 0, 0);
+		open_bus_value(e, m, pc, rd, kind, width, rn, adjustment);
+		constant(e, WAIT, 2);
+		loaded_value(e, rd, kind, rn, adjustment);
+		io_wait(e, m, pc, 2);
+		return true;
+	}
+	if (flags & fixed) {
+		if (width == 4) {
+			/* DMA count/control word: the low count half reads as zero,
+			 * while the high control half remains visible. */
+			word(e, (offsetof(struct GbnDevices, io) + offset) << 20 |
+				devices << 15 | 2 << 12 | RESULT << 7 | 3);
+			imm(e, RESULT, RESULT, 5, 16);
+			imm(e, RESULT, RESULT, 1, 16);
+		} else constant(e, RESULT, 0);
+	} else {
+		unsigned fn = width == 4 ? 2 : width == 2 ? (kind == 7 ? 1 : 5) : (kind == 3 ? 0 : 4);
+		word(e, (offsetof(struct GbnDevices, io) + offset) << 20 |
+			devices << 15 | fn << 12 | RESULT << 7 | 3);
+	}
+	loaded_value(e, rd, kind, rn, adjustment);
+	constant(e, WAIT, 2);
+	io_wait(e, m, pc, 2);
+	return true;
+}
+
+/* One body for a consecutive run of pure word IO operations. The entry
+ * proves every address and instruction boundary before any guest effect.
+ * A miss executes the first instruction through the interpreter; there is
+ * no duplicated native slow body or persistent proof register. */
+static unsigned thumb_io_group(struct Emit* e, struct GbnRv32* backend,
+        const struct Gbn* m, unsigned first, unsigned first_code) {
+	if (!e->block->thumb || m->code_region < 8 || !(m->waitcnt & 0x4000) || !m->code_wait) return 0;
+	struct { unsigned code, offset, flags, field; } ops[8];
+	uint32_t pc = e->block->pc + 2 * first;
+	unsigned n = 0, rs = first_code >> 3 & 7;
+	bool exact = (e->thumb_literal_mask & 1u << rs) != 0, open = false;
+	if (!exact && (e->written & 1u << rs)) return 0;
+	uint32_t base = exact ? e->thumb_literal[rs] : m->cpu.r[rs];
+	if ((base + (first_code >> 6 & 31) * 4) >> 24 != 4) return 0;
+	while (n < 8 && first + n < GBN_RV32_INSNS) {
+		uint32_t address = pc + 2 * n;
+		unsigned offset = address & m->code_mask;
+		if (address >> 24 != m->code_region || offset >= m->rom_size || m->rom_size - offset < 2) break;
+		unsigned code = n ? fetch(m, address, 2) : first_code, rn = code >> 3 & 7, rd = code & 7;
+		if ((code & 0xf000) != 0x6000 || ((code & 0x800) && rd == rn)) break;
+		if (rn != rs) break;
+		uint32_t effective = base + (code >> 6 & 31) * 4;
+		unsigned flags = 0, field = 0;
+		if (code & 0x800) {
+			unsigned width;
+			if (!static_io_info(effective, 4, &width, &offset, &flags)) break;
+		} else {
+			offset = effective - 0x040000b0u;
+			if (offset >= 48 || (offset & 3) || !(field = native_dma_address_field[offset >> 2])) break;
+			offset += 0xb0;
+		}
+		ops[n].code = code; ops[n].offset = offset;
+		ops[n].flags = flags; ops[n].field = field;
+		open |= (flags & 32) != 0;
+		++n;
+	}
+	/* Bound the body plus the existing tail, exit stubs and entry proof.
+	 * Each operation uses at most nine words; the fixed prefix/suffix uses
+	 * fewer than 80, including optional diagnostics and large immediates. */
+	if (n < 3 || e->count + 180 + 340 + 13 * (first + n) >= GBN_RV32_WORDS) return 0;
+	constant(e, RESULT, first + n); stop(e, LIMIT, RESULT, 6, true);
+	unsigned last_start = (n - 1) * (1u + m->code_wait);
+	if (last_start < 2048) imm(e, RESULT, NOW, 0, last_start);
+	else { constant(e, RESULT, last_start); op(e, RESULT, NOW, RESULT, 0, 0); }
+	stop(e, RESULT, ZERO, 5, true);
+	if (!exact) { constant(e, RESULT, base); stop(e, guest[rs], RESULT, 1, true); }
+	load(e, TEMP, offsetof(struct Gbn, devices)); guard(e, TEMP, true); e->io_guarded = true;
+	/* These pure accesses cannot change DMA access/valid/PC/bus. Preserve
+	 * the snapshot in scratch registers only for the duration of this run. */
+	if (open) {
+		word(e, offsetof(struct GbnDevices, dma_access) << 20 | TEMP << 15 | 4 << 12 | WAIT << 7 | 3);
+		word(e, offsetof(struct GbnDevices, dma_bus_valid) << 20 | TEMP << 15 | 4 << 12 | RESULT << 7 | 3);
+		word(e, offsetof(struct GbnDevices, dma_pc) << 20 | TEMP << 15 | 2 << 12 | LHS << 7 | 3);
+		word(e, beq(RESULT, ZERO, 8) | 1u << 12); constant(e, LHS, 0);
+		word(e, offsetof(struct GbnDevices, dma_bus) << 20 | TEMP << 15 | 5 << 12 | RHS << 7 | 3);
+		imm(e, RESULT, RHS, 1, 16); op(e, RHS, RHS, RESULT, 6, 0);
+	}
+	for (unsigned j = 0; j < n; ++j) {
+		unsigned rd = ops[j].code & 7, off = ops[j].offset;
+		if (!(ops[j].code & 0x800)) {
+			constant(e, RESULT, ops[j].field & 0x8000 ? 0x07fffffeu : 0x0ffffffeu);
+			op(e, RESULT, guest[rd], RESULT, 7, 0);
+			unsigned field = ops[j].field & 2047;
+			word(e, (field >> 5) << 25 | RESULT << 20 | TEMP << 15 | 2 << 12 | (field & 31) << 7 | 0x23);
+			word(e, (off >> 5) << 25 | RESULT << 20 | TEMP << 15 | 2 << 12 | (off & 31) << 7 | 0x23);
+			e->read_only = false;
+		} else {
+			if (ops[j].flags & 32) {
+				constant(e, RESULT, pc + 2 * j + 2);
+				unsigned active = e->count; word(e, 0);
+				unsigned visible = e->count; word(e, 0);
+				uint32_t value = fetch(m, pc + 2 * j + 4, 2) & 65535;
+				constant(e, guest[rd], value | value << 16);
+				unsigned done = e->count; word(e, 0);
+				e->block->code[active] = beq(WAIT, ZERO, 4 * (e->count - active)) | 1u << 12;
+				e->block->code[visible] = beq(LHS, RESULT, 4 * (e->count - visible));
+				imm(e, guest[rd], RHS, 0, 0);
+				e->block->code[done] = beq(ZERO, ZERO, 4 * (e->count - done));
+			} else if (ops[j].flags & 8) {
+				word(e, (off + 2) << 20 | TEMP << 15 | 5 << 12 | guest[rd] << 7 | 3);
+				imm(e, guest[rd], guest[rd], 1, 16);
+			} else word(e, off << 20 | TEMP << 15 | 2 << 12 | guest[rd] << 7 | 3);
+			put_value(e, rd, guest[rd]); e->read_seen = true;
+		}
+	}
+	/* Repeated short waits clamp the same original queue against increasing
+	 * fetch PCs. At the final PC, only 16-2*(n-1) bytes of that initial range
+	 * can survive. Eight accesses drain it completely. */
+	uint32_t fetch_pc = pc + 2 * (n - 1) + 4;
+	if (n == 8) constant(e, PREFETCH, fetch_pc);
+	else {
+		constant(e, TEMP, fetch_pc); op(e, LHS, PREFETCH, TEMP, 0, 0x20);
+		imm(e, RESULT, LHS, 3, 16 - 2 * (n - 1)); op(e, RESULT, ZERO, RESULT, 0, 0x20);
+		op(e, LHS, LHS, RESULT, 7, 0); imm(e, LHS, LHS, 7, -2); op(e, PREFETCH, TEMP, LHS, 0, 0);
+	}
+	unsigned elapsed = n * (1u + m->code_wait);
+	if (elapsed < 2048) imm(e, NOW, NOW, 0, elapsed);
+	else { constant(e, RESULT, elapsed); op(e, NOW, NOW, RESULT, 0, 0); }
+#if GBN_RV32_STATS
+	constant(e, LHS, (uint32_t)(uintptr_t)&backend->fused_thumb_io_instructions);
+	word(e, LHS << 15 | 2 << 12 | TEMP << 7 | 3); imm(e, RESULT, TEMP, 0, n);
+	op(e, WAIT, RESULT, TEMP, 3, 0); word(e, RESULT << 20 | LHS << 15 | 2 << 12 | 0x23);
+	word(e, 4u << 20 | LHS << 15 | 2 << 12 | TEMP << 7 | 3); op(e, TEMP, TEMP, WAIT, 0, 0);
+	word(e, TEMP << 20 | LHS << 15 | 2 << 12 | 4u << 7 | 0x23);
+#else
+	(void)backend;
+#endif
+	e->block->instructions += n;
+	return n;
+}
+
+static void leaf_read(struct Emit* e, const struct Gbn* m, uint32_t pc,
+        unsigned rd, unsigned kind, unsigned rn, int adjustment) {
+    unsigned width = kind == 4 ? 4 : kind == 5 || kind == 7 ? 2 : 1;
+    e->read_seen = true;
+    imm(e, TEMP, LHS, 0, 0);
+    constant(e, WAIT, (uint32_t) (uintptr_t) (width == 4 ? read_word : width == 2 ? read_half : read_byte));
+    word(e, WAIT << 15 | WAIT << 7 | 0x67);
+    guard(e, RHS, true);
+    constant(e, WAIT, 2);
+    unsigned open = e->count; word(e, 0);
+    unsigned cartridge = 0;
+    bool prefetched = m->code_region >= 8 && (m->waitcnt & 0x4000);
+    if (prefetched) { cartridge = e->count; word(e, 0); }
+    loaded_value(e, rd, kind, rn, adjustment);
+    imm(e, WAIT, LHS, 0, 0); ram_wait(e, m, pc);
+    unsigned done[2], done_count = 0;
+    done[done_count++] = e->count; word(e, 0);
+    if (prefetched) {
+        e->block->code[cartridge] = beq(RHS, ZERO, 4 * (e->count - cartridge)) | 4u << 12;
+        loaded_value(e, rd, kind, rn, adjustment);
+        imm(e, NOW, NOW, 0, (int) m->code_nonseq - (int) m->code_wait);
+        op(e, NOW, NOW, LHS, 0, 0);
+        done[done_count++] = e->count; word(e, 0);
+    }
+    e->block->code[open] = beq(RHS, WAIT, 4 * (e->count - open));
+    open_bus_value(e, m, pc, rd, kind, width, rn, adjustment);
+    constant(e, WAIT, 2); ram_wait(e, m, pc);
+    for (unsigned i = 0; i < done_count; ++i)
+        e->block->code[done[i]] = beq(ZERO, ZERO, 4 * (e->count - done[i]));
+}
+
 static void direct_access(struct Emit* e, const struct Gbn* m, uint32_t pc, unsigned rd, unsigned kind, unsigned rn, int adjustment) {
-	if (kind <= 2) e->read_only = false;
-	else e->read_seen = true;
+    if (kind > 2) { leaf_read(e, m, pc, rd, kind, rn, adjustment); return; }
+	e->read_only = false;
 	static const unsigned widths[] = {4, 2, 1, 1, 4, 2, 1, 2};
 	unsigned width = widths[kind];
 	imm(e, TEMP, LHS, 0, 0); /* original address */
 	imm(e, RHS, LHS, 5, 24); imm(e, RHS, RHS, 0, -2);
 	imm(e, RESULT, RHS, 3, 2); /* region 2 or 3 */
 	unsigned cartridge = 0;
-	if (kind > 2 || width == 4) { cartridge = e->count; word(e, 0); }
+	if (width == 4) { cartridge = e->count; word(e, 0); }
 	else guard(e, RESULT, true);
-	if (kind <= 2 && m->code_region < 8) {
+	if (m->code_region < 8) {
 		/* A RAM block may store data in its own RAM bank, but a write near
 		 * this block or its prefetched tail must use the interpreter. This
 		 * covers code changed during a native self-loop too. Modular distance
@@ -462,14 +1055,17 @@ static void direct_access(struct Emit* e, const struct Gbn* m, uint32_t pc, unsi
 		constant(e, WAIT, mask); op(e, RESULT, RESULT, WAIT, 7, 0);
 		imm(e, RESULT, RESULT, 3, (GBN_RV32_INSNS + 2) * (e->block->thumb ? 2 : 4) + (e->block->pc & 3));
 		guard(e, RESULT, false);
+		/* Other-bank stores skip this invalidation. A later guard failure
+		 * may conservatively advance the epoch without committing a store. */
+		imm(e, RAM_EPOCH, RAM_EPOCH, 0, 1);
 		e->block->code[other_bank] = beq(RHS, RESULT, 4 * (e->count - other_bank)) | 1u << 12;
 		/* RESULT was the bank discriminator at the branch, before clobbering. */
 	}
 	load(e, RESULT, offsetof(struct Gbn, ewram)); constant(e, LHS, GBN_EWRAM_SIZE - 1);
-	constant(e, WAIT, (m->ewram_wait + 1u) * (width == 4 ? 2u : 1u) + (kind > 2));
+	constant(e, WAIT, (m->ewram_wait + 1u) * (width == 4 ? 2u : 1u));
 	unsigned choose = e->count; word(e, 0);
 	load(e, RESULT, offsetof(struct Gbn, iwram)); constant(e, LHS, GBN_IWRAM_SIZE - 1);
-	constant(e, WAIT, 1u + (kind > 2));
+	constant(e, WAIT, 1u);
 	e->block->code[choose] = beq(RHS, ZERO, 4 * (e->count - choose));
 	guard(e, RESULT, true); /* absent RAM */
 	if (width > 1) {
@@ -481,83 +1077,14 @@ static void direct_access(struct Emit* e, const struct Gbn* m, uint32_t pc, unsi
 	op(e, LHS, TEMP, LHS, 7, 0); op(e, LHS, LHS, RESULT, 0, 0);
 	access_value(e, pc, rd, kind, width, rn, adjustment);
 	ram_wait(e, m, pc);
-	if (kind <= 2) {
 		if (width == 4) {
 			unsigned done = e->count; word(e, 0);
 			e->block->code[cartridge] = beq(RESULT, ZERO, 4 * (e->count - cartridge));
+			dma_start_emit(e, m, pc, rd, rn, adjustment);
 			dma_address_store(e, m, pc, rd, rn, adjustment);
 			e->block->code[done] = beq(ZERO, ZERO, 4 * (e->count - done));
 		}
 		return;
-	}
-	unsigned done = e->count; word(e, 0);
-	e->block->code[cartridge] = beq(RESULT, ZERO, 4 * (e->count - cartridge));
-	imm(e, RHS, TEMP, 5, 24); imm(e, RHS, RHS, 0, -8);
-	imm(e, RESULT, RHS, 3, 6);
-	unsigned not_cartridge = e->count; word(e, 0);
-	if (width == 2) {
-		/* WS2 halfword reads may be EEPROM transactions. Keep the complete
-		 * window on the bus path, including changes of attached save type. */
-		constant(e, RESULT, 5); stop(e, RHS, RESULT, 0, true);
-	}
-	load(e, RESULT, offsetof(struct Gbn, rom)); guard(e, RESULT, true);
-	if (width > 1) {
-		op(e, RHS, RESULT, TEMP, 6, 0); imm(e, RHS, RHS, 7, (int) width - 1); guard(e, RHS, false);
-	}
-	constant(e, LHS, GBN_ROM_MAX_SIZE - 1); op(e, LHS, TEMP, LHS, 7, 0);
-	load(e, RHS, offsetof(struct Gbn, rom_size)); imm(e, WAIT, LHS, 0, (int) width);
-	op(e, RHS, RHS, WAIT, 3, 0); guard(e, RHS, false); /* ROM bounds; open bus stays in C. */
-	op(e, LHS, LHS, RESULT, 0, 0);
-	/* Data and instruction fetches may use different ROM wait windows.
-	 * Read the data window waits at runtime so cached blocks need no extra
-	 * invalidation when another window's WAITCNT fields change. */
-	imm(e, RHS, TEMP, 5, 25); imm(e, RHS, RHS, 0, -4); op(e, RHS, MACHINE, RHS, 0, 0);
-	word(e, offsetof(struct Gbn, rom_nonseq) << 20 | RHS << 15 | 4 << 12 | WAIT << 7 | 3);
-	if (width == 4) {
-		word(e, offsetof(struct Gbn, rom_seq) << 20 | RHS << 15 | 4 << 12 | RESULT << 7 | 3);
-		op(e, WAIT, WAIT, RESULT, 0, 0);
-	}
-	imm(e, WAIT, WAIT, 0, width == 4 ? 3 : 2);
-	access_value(e, pc, rd, kind, width, rn, adjustment);
-	imm(e, NOW, NOW, 0, (int) m->code_nonseq - (int) m->code_wait);
-	op(e, NOW, NOW, WAIT, 0, 0);
-
-	unsigned rom_done = e->count; word(e, 0);
-	e->block->code[not_cartridge] = beq(RESULT, ZERO, 4 * (e->count - not_cartridge));
-	imm(e, RHS, TEMP, 5, 24); imm(e, RHS, RHS, 0, -4);
-	guard(e, RHS, false);
-	/* Reads of stored IO state need no C call. Events are checked before
-	 * every guest instruction, so LCD/IRQ/key state is current at this read. */
-	constant(e, LHS, 0x04000000u); op(e, LHS, TEMP, LHS, 0, 0x20);
-	imm(e, RESULT, LHS, 3, (int) sizeof(native_io_readable) * 2); guard(e, RESULT, true);
-	if (width > 1) { imm(e, RHS, TEMP, 7, (int) width - 1); guard(e, RHS, false); }
-	imm(e, RHS, LHS, 5, 1); constant(e, RESULT, (uint32_t) (uintptr_t) native_io_readable);
-	op(e, RHS, RHS, RESULT, 0, 0);
-	word(e, RHS << 15 | 4 << 12 | RHS << 7 | 3);
-	imm(e, RHS, RHS, 7, width == 4 ? 42 : 21); guard(e, RHS, true);
-	load(e, RESULT, offsetof(struct Gbn, devices)); guard(e, RESULT, true);
-	op(e, LHS, LHS, RESULT, 0, 0);
-	imm(e, WAIT, RHS, 7, width == 4 ? 32 : 16);
-	unsigned open_bus = e->count; word(e, 0);
-	imm(e, RHS, RHS, 7, width == 4 ? 8 : 4);
-	unsigned zero_count = e->count; word(e, 0);
-	access_value(e, pc, rd, kind, width, rn, adjustment);
-	unsigned io_done = e->count; word(e, 0);
-	e->block->code[zero_count] = beq(RHS, ZERO, 4 * (e->count - zero_count)) | 1u << 12;
-	writeback(e, rn, adjustment);
-	if (width == 4) {
-		word(e, LHS << 15 | 2 << 12 | RESULT << 7 | 3);
-		imm(e, RESULT, RESULT, 5, 16); imm(e, RESULT, RESULT, 1, 16);
-	} else constant(e, RESULT, 0);
-	put(e, rd);
-    unsigned zero_done = e->count; word(e, 0);
-    e->block->code[open_bus] = beq(WAIT, ZERO, 4 * (e->count - open_bus)) | 1u << 12;
-    open_bus_value(e, m, pc, rd, kind, width, rn, adjustment);
-    e->block->code[zero_done] = beq(ZERO, ZERO, 4 * (e->count - zero_done));
-	e->block->code[io_done] = beq(ZERO, ZERO, 4 * (e->count - io_done));
-	constant(e, WAIT, 2); ram_wait(e, m, pc);
-	e->block->code[done] = beq(ZERO, ZERO, 4 * (e->count - done));
-	e->block->code[rom_done] = beq(ZERO, ZERO, 4 * (e->count - rom_done));
 }
 
 /* Direct RAM operations stay in this block, retaining the live registers and
@@ -565,6 +1092,10 @@ static void direct_access(struct Emit* e, const struct Gbn* m, uint32_t pc, unsi
  * instruction for IO, unaligned or unmapped accesses. */
 static bool memory(struct Emit* e, const struct Gbn* m, unsigned code, uint32_t pc) {
 	unsigned rd = code & 7, rs = code >> 3 & 7, kind;
+	uint32_t effective = 0, base_value = 0;
+	bool thumb_immediate = false;
+	bool thumb_exact = false;
+	unsigned thumb_scale = 0;
 	if ((code & 0xf800) == 0x4800) {
 		e->read_seen = true;
 		kind = 4; rd = code >> 8 & 7;
@@ -578,6 +1109,7 @@ static bool memory(struct Emit* e, const struct Gbn* m, unsigned code, uint32_t 
 		uint32_t value = m->rom[offset] | (uint32_t) m->rom[offset + 1] << 8 |
 			(uint32_t) m->rom[offset + 2] << 16 | (uint32_t) m->rom[offset + 3] << 24;
 		constant(e, RESULT, value); put(e, rd);
+		e->thumb_literal[rd] = value; e->thumb_literal_mask |= 1u << rd;
 		/* ROM word read + internal cycle + fetch_break, same ROM window. */
 		imm(e, NOW, NOW, 0, 3 + 2 * m->code_nonseq);
 		return true;
@@ -585,14 +1117,28 @@ static bool memory(struct Emit* e, const struct Gbn* m, unsigned code, uint32_t 
 		kind = code >> 9 & 7;
 		get(e, LHS, rs, pc); get(e, RHS, code >> 6 & 7, pc); op(e, LHS, LHS, RHS, 0, 0);
 	} else if (code >= 0x6000 && code < 0x9000) {
-		unsigned scale;
-		if (code < 0x8000) { kind = (code & 0x1000 ? 2 : 0) + (code & 0x800 ? 4 : 0); scale = code & 0x1000 ? 1 : 4; }
-		else { kind = code & 0x800 ? 5 : 1; scale = 2; }
-		get(e, LHS, rs, pc); imm(e, LHS, LHS, 0, (int) (code >> 6 & 31) * (int) scale);
+		thumb_exact = (e->thumb_literal_mask & 1u << rs) != 0;
+		thumb_immediate = thumb_exact || !(e->written & 1u << rs);
+		if (code < 0x8000) { kind = (code & 0x1000 ? 2 : 0) + (code & 0x800 ? 4 : 0); thumb_scale = code & 0x1000 ? 1 : 4; }
+		else { kind = code & 0x800 ? 5 : 1; thumb_scale = 2; }
+		base_value = e->thumb_literal_mask & 1u << rs ? e->thumb_literal[rs] : m->cpu.r[rs];
+		effective = base_value + (code >> 6 & 31) * thumb_scale;
+		if (!thumb_exact) {
+			get(e, LHS, rs, pc);
+			imm(e, LHS, LHS, 0, (int) (code >> 6 & 31) * (int) thumb_scale);
+		}
 	} else if ((code & 0xf000) == 0x9000) {
 		kind = code & 0x800 ? 4 : 0; rd = code >> 8 & 7;
 		get(e, LHS, 13, pc); imm(e, LHS, LHS, 0, (int) (code & 255) * 4);
 	} else return false;
+	if (thumb_immediate) {
+		if (kind > 2 && static_io_read(e, m, pc, effective, rd, kind, 15, 0, thumb_exact)) return true;
+		if (kind == 0 && static_dma_store(e, m, pc, effective, rd, thumb_exact)) return true;
+	}
+	if (thumb_exact) {
+		get(e, LHS, rs, pc);
+		imm(e, LHS, LHS, 0, (int) (code >> 6 & 31) * (int) thumb_scale);
+	}
 	direct_access(e, m, pc, rd, kind, 15, 0);
 	return true;
 }
@@ -622,6 +1168,7 @@ static bool thumb_stack(struct Emit* e, const struct Gbn* m, unsigned code, uint
 		constant(e, WAIT, mask); op(e, RESULT, RESULT, WAIT, 7, 0);
 		imm(e, RESULT, RESULT, 3, (GBN_RV32_INSNS + 2) * 2 + (e->block->pc & 3) + bytes - 4);
 		guard(e, RESULT, false);
+		imm(e, RAM_EPOCH, RAM_EPOCH, 0, 1);
 		e->block->code[other_bank] = beq(RHS, RESULT, 4 * (e->count - other_bank)) | 1u << 12;
 	}
 	load(e, RESULT, offsetof(struct Gbn, ewram)); constant(e, WAIT, GBN_EWRAM_SIZE - 1);
@@ -660,6 +1207,7 @@ static bool thumb_stack(struct Emit* e, const struct Gbn* m, unsigned code, uint
 		if (pop) {
 			word(e, offset << 20 | RHS << 15 | 2 << 12 | guest[r] << 7 | 3);
 			e->written |= 1u << r;
+			e->thumb_literal_mask &= ~(1u << r);
 		} else word(e, (offset >> 5) << 25 | guest[r] << 20 | RHS << 15 | 2 << 12 | (offset & 31) << 7 | 0x23);
 		offset += 4;
 	}
@@ -760,6 +1308,15 @@ static bool instruction(struct Emit* e, const struct Gbn* m, unsigned code, uint
 		imm(e, RESULT, LHS, 0, code & 128 ? -offset : offset); put(e, 13);
 	} else if ((code & 0xf600) == 0xb400) {
 		return thumb_stack(e, m, code, pc);
+	} else if ((code & 0xf000) == 0xc000 && (code & 255) && !((code & 255) & ((code & 255) - 1))) {
+        /* A one-register RAM LDM/STM has the same bus/internal/fetch cost as
+         * the corresponding word transfer. LDM's loaded base wins writeback.
+         * ROM multiple timing differs, so preserve its interpreter path. */
+        unsigned base=code>>8&7,reg=(unsigned)__builtin_ctz(code&255);
+        get(e,LHS,base,pc);
+        imm(e,RHS,LHS,5,24);imm(e,RHS,RHS,0,-2);imm(e,RESULT,RHS,3,2);
+        guard(e,RESULT,true);
+        direct_access(e,m,pc,reg,(code&0x800)?4:0,base,4);
 	} else if ((code & 0xf800) == 0xe000 || ((code & 0xf000) == 0xd000 && (code >> 8 & 15) < 14)) {
 		bool unconditional = (code & 0xf800) == 0xe000;
 		int32_t offset = unconditional ? (int32_t) (code << 21) >> 20 : (int32_t) (code << 24) >> 23;
@@ -819,6 +1376,20 @@ static void arm_shift_imm(struct Emit* e, unsigned kind, unsigned amount) {
 	}
 }
 
+/* A proven pure segment may discard an intermediate shifter carry.
+ * Preserve the shifted operand, including RRX's incoming CPSR carry. */
+static void arm_shift_value(struct Emit* e, unsigned kind, unsigned amount) {
+    if (!kind) { if (amount) imm(e, RHS, RHS, 1, (int) amount); }
+    else if (kind == 3) {
+        if (!amount) arm_shift_imm(e, kind, amount);
+        else {
+            imm(e, TEMP, RHS, 1, (int) (32 - amount));
+            imm(e, RHS, RHS, 5, (int) amount); op(e, RHS, RHS, TEMP, 6, 0);
+        }
+    } else if (kind == 1 && !amount) constant(e, RHS, 0);
+    else imm(e, RHS, RHS, 5, (int) (amount ? amount : 31) | (kind == 2 ? 0x400 : 0));
+}
+
 static bool arm_memory(struct Emit* e, const struct Gbn* m, uint32_t code, uint32_t pc, bool half) {
 	unsigned rn = code >> 16 & 15, rd = code >> 12 & 15, form = code >> 5 & 3;
 	bool pre = (code & 0x1000000) != 0, load_value = (code & 0x100000) != 0;
@@ -843,6 +1414,42 @@ static bool arm_memory(struct Emit* e, const struct Gbn* m, uint32_t code, uint3
 	return true;
 }
 
+/* ARM immediates can use RV32 immediates directly. Carry remains an exact
+ * separately observable ARM shifter result even when S is clear. */
+static bool arm_immediate(struct Emit* e, uint32_t code, uint32_t pc) {
+    if(!(code&0x2000000) || (code&0x100000)) return false;
+    unsigned kind=code>>21&15,rd=code>>12&15,rn=code>>16&15;
+    if(rd==15 || (kind>=5 && kind<=11)) return false;
+    unsigned rotation=code>>7&30;
+    uint32_t value=code&255;
+    if(rotation) value=value>>rotation | value<<(32-rotation);
+    uint32_t operand=kind==2 ? 0u-value : kind==14 ? ~value : value;
+    int immediate=(int32_t)operand;
+    bool simple=immediate>=-2048 && immediate<2048;
+    bool mask=(kind==0 || kind==14) && operand;
+    unsigned direction=0,shift=0;
+    if(mask && !(operand&(operand+1))) {direction=1;shift=(unsigned)__builtin_clz(operand);}
+    else if(mask && !(~operand&(~operand+1))) {direction=2;shift=(unsigned)__builtin_ctz(operand);}
+    if(kind!=13 && kind!=15 && !((kind==0 || kind==1 || kind==2 || kind==4 || kind==12 || kind==14) && simple)
+            && !direction) return false;
+    if(!e->skip_shifter) {
+    if(rotation) constant(e,WAIT,value>>31);
+    else {imm(e,WAIT,FLAGS,5,29);imm(e,WAIT,WAIT,7,1);}
+    store(e,WAIT,offsetof(struct Gbn,cpu.shifter_carry));
+    }
+    unsigned dest=resident(rd)?guest[rd]:RESULT;
+    if(kind==13 || kind==15) constant(e,dest,kind==13?value:~value);
+    else {
+        unsigned a=source(e,LHS,rn,pc);
+        if(simple) imm(e,dest,a,kind==0 || kind==14 ? 7 : kind==1 ? 4 : kind==12 ? 6 : 0,immediate);
+        else {
+            imm(e,dest,a,direction==1?1:5,(int)shift);
+            imm(e,dest,dest,direction==1?5:1,(int)shift);
+        }
+    }
+    put_value(e,rd,dest);return true;
+}
+
 static bool arm_instruction(struct Emit* e, const struct Gbn* m, uint32_t code, uint32_t pc) {
 	unsigned cond = code >> 28;
 	if (cond == 15) return true; /* ARMv4 NV never executes, including undefined opcodes. */
@@ -858,9 +1465,9 @@ static bool arm_instruction(struct Emit* e, const struct Gbn* m, uint32_t code, 
 		unsigned rd = code >> 16 & 15, rn = code >> 12 & 15;
 		bool accumulate = (code & 0x200000) != 0;
 		if (rd != 15 && (!accumulate || rn != 15)) {
-			get(e, LHS, code & 15, pc); get(e, RHS, code >> 8 & 15, pc);
-			multiply_wait(e, RHS, accumulate); op(e, RESULT, LHS, RHS, 0, 1);
-			if (accumulate) { get(e, TEMP, rn, pc); op(e, RESULT, RESULT, TEMP, 0, 0); }
+			unsigned a = source(e, LHS, code & 15, pc), b = source(e, RHS, code >> 8 & 15, pc);
+            multiply_wait(e, b, accumulate); op(e, RESULT, a, b, 0, 1);
+			if (accumulate) { unsigned addend = source(e, TEMP, rn, pc); op(e, RESULT, RESULT, addend, 0, 0); }
 			put(e, rd);
 			if (code & 0x100000) {
 				nz(e); load(e, TEMP, offsetof(struct Gbn, cpu.shifter_carry));
@@ -879,29 +1486,38 @@ static bool arm_instruction(struct Emit* e, const struct Gbn* m, uint32_t code, 
 		/* PSR transfers, interworking and register-controlled shifts
 		 * retain the interpreter's banking and exception semantics for now. */
 		if ((test && !set) || rd == 15 || (!(code & 0x2000000) && (code & 16))) return false;
-		if (code & 0x2000000) {
+        if(arm_immediate(e,code,pc))goto arm_done;
+        bool arithmetic_op = (kind >= 2 && kind <= 7) || kind == 10 || kind == 11;
+        bool need_carry = !e->skip_shifter || (set && !arithmetic_op);
+        unsigned a, b = RHS;
+        if (code & 0x2000000) {
 			unsigned rotation = code >> 7 & 30;
 			uint32_t value = code & 255;
 			if (rotation) value = value >> rotation | value << (32 - rotation);
 			constant(e, RHS, value);
-			if (rotation) constant(e, WAIT, value >> 31);
-			else { imm(e, WAIT, FLAGS, 5, 29); imm(e, WAIT, WAIT, 7, 1); }
-		} else {
-			get(e, RHS, code & 15, pc);
-			arm_shift_imm(e, code >> 5 & 3, code >> 7 & 31);
-		}
-		store(e, WAIT, offsetof(struct Gbn, cpu.shifter_carry));
-		get(e, LHS, rn, pc);
-		bool arithmetic_op = (kind >= 2 && kind <= 7) || kind == 10 || kind == 11;
+            if (need_carry) {
+                if (rotation) constant(e, WAIT, value >> 31);
+                else { imm(e, WAIT, FLAGS, 5, 29); imm(e, WAIT, WAIT, 7, 1); }
+            }
+        } else if (!(code & 0xff0)) {
+            b = source(e, RHS, code & 15, pc);
+            if (need_carry) { imm(e, WAIT, FLAGS, 5, 29); imm(e, WAIT, WAIT, 7, 1); }
+        } else {
+            get(e, RHS, code & 15, pc);
+            if (need_carry) arm_shift_imm(e, code >> 5 & 3, code >> 7 & 31);
+            else arm_shift_value(e, code >> 5 & 3, code >> 7 & 31);
+        }
+        if (!e->skip_shifter) store(e, WAIT, offsetof(struct Gbn, cpu.shifter_carry));
+        a = source(e, LHS, rn, pc);
 		if (arithmetic_op) {
 			bool reverse = kind == 3 || kind == 7;
 			bool subtract = kind == 2 || kind == 3 || kind == 6 || kind == 7 || kind == 10;
 			bool carry_in = kind >= 5 && kind <= 7;
-			if (reverse) { imm(e, TEMP, LHS, 0, 0); imm(e, LHS, RHS, 0, 0); imm(e, RHS, TEMP, 0, 0); }
+			if (reverse) { imm(e, TEMP, a, 0, 0); imm(e, LHS, b, 0, 0); imm(e, RHS, TEMP, 0, 0); a = LHS; b = RHS; }
 			if (set) {
-				if (carry_in) arithmetic_carry(e, subtract, LHS, RHS); else arithmetic(e, subtract, LHS, RHS);
+				if (carry_in) arithmetic_carry(e, subtract, a, b); else arithmetic(e, subtract, a, b);
 			} else {
-				op(e, RESULT, LHS, RHS, 0, subtract ? 0x20 : 0);
+				op(e, RESULT, a, b, 0, subtract ? 0x20 : 0);
 				if (carry_in) {
 					imm(e, WAIT, FLAGS, 5, 29); imm(e, WAIT, WAIT, 7, 1);
 					if (subtract) imm(e, WAIT, WAIT, 4, 1);
@@ -909,9 +1525,9 @@ static bool arm_instruction(struct Emit* e, const struct Gbn* m, uint32_t code, 
 				}
 			}
 		} else {
-			if (kind == 14 || kind == 15) imm(e, RHS, RHS, 4, -1);
-			if (kind == 13 || kind == 15) imm(e, RESULT, RHS, 0, 0);
-			else op(e, RESULT, LHS, RHS, kind == 1 || kind == 9 ? 4 : kind == 12 ? 6 : 7, 0);
+			if (kind == 14 || kind == 15) { imm(e, RHS, b, 4, -1); b = RHS; }
+			if (kind == 13 || kind == 15) imm(e, RESULT, b, 0, 0);
+			else op(e, RESULT, a, b, kind == 1 || kind == 9 ? 4 : kind == 12 ? 6 : 7, 0);
 			if (set) {
 				constant(e, TEMP, ~0x20000000u); op(e, FLAGS, FLAGS, TEMP, 7, 0);
 				imm(e, WAIT, WAIT, 1, 29); op(e, FLAGS, FLAGS, WAIT, 6, 0); nz(e);
@@ -919,6 +1535,7 @@ static bool arm_instruction(struct Emit* e, const struct Gbn* m, uint32_t code, 
 		}
 		if (!test) put(e, rd);
 	} else return false;
+arm_done:
 	if (skip) e->block->code[skip] = beq(TEMP, ZERO, 4 * (e->count - skip));
 	return true;
 }
@@ -965,13 +1582,13 @@ static void merge_loop(struct Emit* e, struct GbnRv32* backend) {
 	stack(e, TEMP, SNAPSHOT_PREFETCH, false);
 	mismatches[n++] = e->count; word(e, beq(PREFETCH, TEMP, 0) | 1u << 12);
 	stack(e, TEMP, SNAPSHOT_NOW, false); op(e, TEMP, NOW, TEMP, 0, 0x20);
-	op(e, RHS, DEADLINE, NOW, 0, 0x20); op(e, RHS, RHS, TEMP, 5, 1); /* divu: full time intervals */
+	op(e, RHS, ZERO, NOW, 0, 0x20); op(e, RHS, RHS, TEMP, 5, 1); /* divu: full time intervals */
 	constant(e, WAIT, e->block->instructions); op(e, LHS, LIMIT, WAIT, 5, 1);
 	word(e, beq(LHS, RHS, 8) | 6u << 12); /* bltu cap,time,+8 */
 	imm(e, LHS, RHS, 0, 0);
 	op(e, TEMP, LHS, TEMP, 0, 1); op(e, NOW, NOW, TEMP, 0, 0);
 	op(e, RESULT, LHS, WAIT, 0, 1);
-	op(e, COMPLETED, COMPLETED, RESULT, 0, 0); op(e, LIMIT, LIMIT, RESULT, 0, 0x20);
+	op(e, LIMIT, LIMIT, RESULT, 0, 0x20);
 #if GBN_RV32_STATS
 	constant(e, LHS, (uint32_t) (uintptr_t) &backend->merged_instructions);
 	word(e, LHS << 15 | 2 << 12 | TEMP << 7 | 3);
@@ -987,21 +1604,27 @@ static void merge_loop(struct Emit* e, struct GbnRv32* backend) {
 		e->block->code[mismatches[i]] |= beq(0, 0, 4 * (e->count - mismatches[i])) & 0xfe000f80u;
 }
 
-/* All native entries share a register layout and one stack frame. A warm
- * successor receives the live register file, remaining cap and deadline. The
- * cache descriptor is checked at the edge, so replacing a slot or recycling
- * the arena needs no executable-code patching or reverse-link maintenance. */
+/* All native entries share one register frame, including the immutable
+ * context tag and RAM-write epoch. Edges check the destination PC and live
+ * chain pointer; the target entry proves its context and RAM bytes. Replacing
+ * a descriptor or recycling code needs no executable patching or reverse links. */
 /* Dynamic successors use the same keyed descriptors and RAM snapshot entry
  * as direct edges. STACK_TARGET preserves the guest PC through all scratch
- * registers and miss paths; no new cache, write barrier or mutable code. */
+ * registers and miss paths; the entry proof is shared with direct edges. */
+/* The initial cap minus the remaining cap gives the completed chain count.
+ * Compute it only on return; x20 can hold guest r11 instead of a second counter. */
+static void finish_count(struct Emit* e, unsigned partial, bool fallback) {
+    stack(e, TEMP, INITIAL_CAP, false);
+    op(e, TEMP, TEMP, LIMIT, 0, 0x20);
+    constant(e, LIMIT, partial | (fallback ? 0x80000000u : 0));
+    op(e, LIMIT, LIMIT, TEMP, 0, 0);
+}
 static void indirect_tail(struct Emit* e, struct GbnRv32* backend) {
     struct GbnRv32Block* b = e->block;
-    imm(e, COMPLETED, COMPLETED, 0, b->instructions);
     imm(e, LIMIT, LIMIT, 0, -(int) b->instructions);
     unsigned misses[8], n = 0;
     misses[n++] = e->count; word(e, beq(LIMIT, ZERO, 0));
-    op(e, TEMP, NOW, DEADLINE, 0, 0x20);
-    misses[n++] = e->count; word(e, beq(TEMP, ZERO, 0) | 5u << 12);
+    misses[n++] = e->count; word(e, beq(NOW, ZERO, 0) | 5u << 12);
     stack(e, RESULT, STACK_TARGET, false);
     imm(e, TEMP, RESULT, 5, 1); constant(e, WAIT, 0x9e3779b1u);
     op(e, TEMP, TEMP, WAIT, 0, 1); imm(e, TEMP, TEMP, 5, GBN_RV32_HASH_SHIFT);
@@ -1014,14 +1637,6 @@ static void indirect_tail(struct Emit* e, struct GbnRv32* backend) {
     misses[n++] = e->count; word(e, beq(RHS, ZERO, 0));
     word(e, offsetof(struct GbnRv32Block, pc) << 20 | LHS << 15 | 2 << 12 | TEMP << 7 | 3);
     misses[n++] = e->count; word(e, beq(TEMP, RESULT, 0) | 1u << 12);
-    const unsigned offsets[] = {offsetof(struct GbnRv32Block, generation),
-        offsetof(struct GbnRv32Block, mask), offsetof(struct GbnRv32Block, timing)};
-    const uint32_t values[] = {b->generation, b->mask, b->timing};
-    for (unsigned i = 0; i < 3; ++i) {
-        word(e, offsets[i] << 20 | LHS << 15 | 2 << 12 | TEMP << 7 | 3);
-        constant(e, WAIT, values[i]);
-        misses[n++] = e->count; word(e, beq(TEMP, WAIT, 0) | 1u << 12);
-    }
 #if GBN_RV32_STATS
     constant(e, LHS, (uint32_t) (uintptr_t) &backend->chained_blocks);
     word(e, LHS << 15 | 2 << 12 | TEMP << 7 | 3);
@@ -1034,29 +1649,38 @@ static void indirect_tail(struct Emit* e, struct GbnRv32* backend) {
     word(e, RHS << 15 | 0x67);
     for (unsigned i = 0; i < n; ++i)
         b->code[misses[i]] |= beq(0, 0, 4 * (e->count - misses[i])) & 0xfe000f80u;
-    constant(e, LIMIT, 0); stack(e, RHS, STACK_TARGET, false);
+    finish_count(e, 0, false); stack(e, RHS, STACK_TARGET, false);
     e->returns[e->return_count++] = e->count; word(e, 0);
 }
 
 static void tail(struct Emit* e, struct GbnRv32* backend, uint32_t pc, bool fallback) {
 	struct GbnRv32Block* b = e->block;
-	imm(e, COMPLETED, COMPLETED, 0, b->instructions);
+    /* The entry proof covers the entire contiguous source span. Native
+     * stores overlapping it already fall back, so an internal ARM edge can
+     * jump directly to the target's exact cap/event guards. Rebase LIMIT to
+     * keep initial_cap - LIMIT + source_index equal to retired instructions. */
+    uint32_t offset = pc - b->pc;
+    if (!fallback && !b->thumb && offset && !(offset & 3)
+            && offset / 4 < e->source_count) {
+        unsigned target = offset / 4;
+        imm(e, LIMIT, LIMIT, 0, (int) target - (int) b->instructions);
+        word(e, beq(ZERO, ZERO, 4 * (e->body_offsets[target] - e->count)));
+        return;
+    }
 	imm(e, LIMIT, LIMIT, 0, -(int) b->instructions);
 	unsigned misses[10], n = 0;
 	if (!fallback && (pc >> 24) == (b->pc >> 24)) {
 		misses[n++] = e->count; word(e, beq(LIMIT, ZERO, 0));
-		op(e, TEMP, NOW, DEADLINE, 0, 0x20);
-		misses[n++] = e->count; word(e, beq(TEMP, ZERO, 0) | 5u << 12);
+		misses[n++] = e->count; word(e, beq(NOW, ZERO, 0) | 5u << 12);
 		if (pc == b->pc) {
 			/* Stores overlapping this block already leave through the bus.
 			 * A self-loop therefore needs neither another key nor byte check. */
 			if (mergeable(e)) {
 				merge_loop(e, backend);
 				misses[n++] = e->count; word(e, beq(LIMIT, ZERO, 0));
-				op(e, TEMP, NOW, DEADLINE, 0, 0x20);
-				misses[n++] = e->count; word(e, beq(TEMP, ZERO, 0) | 5u << 12);
+				misses[n++] = e->count; word(e, beq(NOW, ZERO, 0) | 5u << 12);
 			}
-			e->loop_jump = e->count; word(e, 0);
+			e->loop_jumps[e->loop_jump_count++] = e->count; word(e, 0);
 		} else {
 			unsigned slot = block_index(pc);
 			constant(e, LHS, (uint32_t) (uintptr_t) &backend->lookup[slot]);
@@ -1064,14 +1688,9 @@ static void tail(struct Emit* e, struct GbnRv32* backend, uint32_t pc, bool fall
 			misses[n++] = e->count; word(e, beq(LHS, ZERO, 0));
 			word(e, offsetof(struct GbnRv32Block, chain) << 20 | LHS << 15 | 2 << 12 | RHS << 7 | 3);
 			misses[n++] = e->count; word(e, beq(RHS, ZERO, 0));
-			const unsigned offsets[] = {offsetof(struct GbnRv32Block, pc), offsetof(struct GbnRv32Block, generation),
-				offsetof(struct GbnRv32Block, mask), offsetof(struct GbnRv32Block, timing)};
-			const uint32_t values[] = {pc, b->generation, b->mask, b->timing};
-			for (unsigned i = 0; i < 4; ++i) {
-				word(e, offsets[i] << 20 | LHS << 15 | 2 << 12 | TEMP << 7 | 3);
-				constant(e, WAIT, values[i]);
-				misses[n++] = e->count; word(e, beq(TEMP, WAIT, 0) | 1u << 12);
-			}
+			word(e, offsetof(struct GbnRv32Block, pc) << 20 | LHS << 15 | 2 << 12 | TEMP << 7 | 3);
+			constant(e, WAIT, pc);
+			misses[n++] = e->count; word(e, beq(TEMP, WAIT, 0) | 1u << 12);
 #if GBN_RV32_STATS
 			constant(e, LHS, (uint32_t) (uintptr_t) &backend->chained_blocks);
 			word(e, LHS << 15 | 2 << 12 | TEMP << 7 | 3);
@@ -1086,7 +1705,7 @@ static void tail(struct Emit* e, struct GbnRv32* backend, uint32_t pc, bool fall
 	}
 	for (unsigned i = 0; i < n; ++i)
 		b->code[misses[i]] |= beq(0, 0, 4 * (e->count - misses[i])) & 0xfe000f80u;
-	constant(e, LIMIT, fallback ? 0x80000000u : 0);
+	finish_count(e, 0, fallback);
 	constant(e, RHS, pc);
 	e->returns[e->return_count++] = e->count; word(e, 0);
 }
@@ -1118,8 +1737,9 @@ static void allocate_code(struct GbnRv32* backend, struct GbnRv32Block* block, u
 		}
 		backend->segments[backend->code_segment] = NULL;
 	}
+    const uint32_t* generated = block->code;
 	block->code = backend->code + backend->code_used;
-	memcpy(block->code, backend->scratch, block->words * sizeof(uint32_t));
+	memcpy(block->code, generated, block->words * sizeof(uint32_t));
 	backend->code_used += block->words;
 	block->arena_prev = NULL;
 	block->arena_next = backend->segments[backend->code_segment];
@@ -1130,23 +1750,287 @@ static void allocate_code(struct GbnRv32* backend, struct GbnRv32Block* block, u
 	block->chain = block->code + chain;
 }
 
+/* Tags are assigned only after comparing the complete immutable key.
+ * A hash collision evicts the intern-table entry, never aliases two keys:
+ * a repeated evicted key gets a new tag (a conservative chain miss).
+ * Before tag wrap, retire every descriptor so an old immediate cannot match. */
+static uint32_t context_tag(struct GbnRv32* backend, uint32_t generation, uint32_t mask, uint32_t key) {
+	uint32_t hash = generation * 0x9e3779b1u ^ mask * 0x85ebca6bu ^ key * 0xc2b2ae35u;
+	struct GbnRv32Key* entry = &backend->keys[(hash ^ (hash >> 16)) & (GBN_RV32_KEYS - 1)];
+	if (entry->tag && entry->generation == generation && entry->mask == mask && entry->timing == key)
+		return entry->tag;
+	if (backend->next_context_tag == UINT32_MAX) {
+		for (unsigned i = 0; i < GBN_RV32_SLOTS; ++i) {
+			backend->blocks[i].valid = false; backend->blocks[i].chain = NULL;
+		}
+		memset(backend->keys, 0, sizeof(backend->keys));
+		backend->next_context_tag = 0;
+	}
+	*entry = (struct GbnRv32Key) {generation, mask, key, ++backend->next_context_tag};
+	return entry->tag;
+}
+
+struct ArmEdge { unsigned at, count; uint32_t pc, target; bool link; };
+
+/* One finalizer serves exact size probes and the executable block. */
+static unsigned finish_body(struct GbnRv32* backend, struct GbnRv32Block* block,
+        struct Emit* e, unsigned prologue_words, struct ArmEdge* edges,
+        unsigned edge_count, unsigned* entry) {
+    const struct Gbn* m = backend->machine;
+    unsigned width = block->thumb ? 2 : 4;
+	e->source_count = block->instructions;
+	block->loop = block->branch && block->target == block->pc;
+	if (e->dynamic_pc) {
+		imm(e, NOW, NOW, 0, 2 + m->code_wait + m->code_nonseq);
+		constant(e, PREFETCH, 0);
+        indirect_tail(e, backend);
+	} else if (block->branch) {
+		unsigned untaken = e->count; word(e, 0);
+		imm(e, LIMIT, LIMIT, 1, 1); imm(e, LIMIT, LIMIT, 5, 1);
+		imm(e, NOW, NOW, 0, 2 + (block->thumb ? m->code_wait + m->code_nonseq : m->code_word_wait + m->code_word_nonseq));
+		constant(e, PREFETCH, 0);
+		tail(e, backend, block->target, false);
+		block->code[untaken] = beq(LIMIT, ZERO, 4 * (e->count - untaken)) | 5u << 12;
+	}
+	if (!e->dynamic_pc) tail(e, backend, block->pc + width * block->instructions, block->fallback);
+
+    unsigned total_instructions = block->instructions;
+    for (unsigned i = 0; i < edge_count; ++i) {
+        struct ArmEdge* edge = &edges[i];
+        block->code[edge->at] = beq(TEMP, ZERO, 4 * (e->count - edge->at)) | 1u << 12;
+        block->instructions = edge->count;
+        if (edge->link) { constant(e, RESULT, edge->pc + 4); put(e, 14); }
+        imm(e, NOW, NOW, 0, 2 + m->code_word_wait + m->code_word_nonseq);
+        constant(e, PREFETCH, 0);
+        tail(e, backend, edge->target, false);
+    }
+    block->instructions = total_instructions;
+
+	unsigned loop_entry = prologue_words;
+	if (mergeable(e)) {
+		loop_entry = e->count;
+		for (unsigned i = 0; i < 8; ++i) if (e->written & (1u << i)) stack(e, guest[i], 20 + 4 * i, true);
+		packed_flags(e, RHS); stack(e, RHS, SNAPSHOT_FLAGS, true);
+		stack(e, PREFETCH, SNAPSHOT_PREFETCH, true); stack(e, NOW, SNAPSHOT_NOW, true);
+		word(e, beq(ZERO, ZERO, 4 * (prologue_words - e->count)));
+	}
+	for (unsigned i = 0; i < e->loop_jump_count; ++i)
+        block->code[e->loop_jumps[i]] = beq(ZERO, ZERO, 4 * (loop_entry - e->loop_jumps[i]));
+	unsigned chain = loop_entry;
+	if (block->instructions) {
+		chain = e->count;
+		if (m->code_region < 8) {
+			constant(e, LHS, (uint32_t) (uintptr_t) &block->checked_epoch);
+			word(e, LHS << 15 | 2 << 12 | TEMP << 7 | 3);
+			word(e, beq(TEMP, RAM_EPOCH, 4 * (loop_entry - e->count)));
+		}
+		/* The live frame's tag proves the complete generation/mask/timing
+		 * tuple-> A RAM epoch hit additionally proves unchanged code bytes. */
+		constant(e, TEMP, block->context_tag);
+		stop(e, TEMP, CONTEXT, 1, false); e->stops[e->stop_count - 1].instruction = 0;
+		if (m->code_region < 8) {
+			const uint8_t* bytes = m->code + (block->pc & m->code_mask);
+			constant(e, LHS, (uint32_t) (uintptr_t) bytes);
+			for (unsigned off = 0, size = (block->instructions > block->proof_instructions ? block->instructions : block->proof_instructions) * width; off < size;) {
+				uintptr_t address = (uintptr_t) bytes + off;
+				unsigned size_left = size - off;
+				unsigned chunk = !(address & 3) && size_left >= 4 ? 4 : !(address & 1) && size_left >= 2 ? 2 : 1;
+				unsigned fn = chunk == 4 ? 2 : chunk == 2 ? 5 : 4;
+				word(e, off << 20 | LHS << 15 | fn << 12 | RHS << 7 | 3);
+				uint32_t value = 0;
+				for (unsigned i = 0; i < chunk; ++i) value |= (uint32_t) bytes[off + i] << (8 * i);
+				constant(e, TEMP, value);
+				stop(e, RHS, TEMP, 1, false); e->stops[e->stop_count - 1].instruction = 0;
+				off += chunk;
+			}
+			constant(e, LHS, (uint32_t) (uintptr_t) &block->checked_epoch);
+			word(e, RAM_EPOCH << 20 | LHS << 15 | 2 << 12 | 0x23);
+		}
+		word(e, beq(ZERO, ZERO, 4 * (loop_entry - e->count)));
+	}
+	unsigned epilogue = e->count;
+	for (unsigned i = 0; i < 15; ++i) if (resident(i)) store(e, guest[i], offsetof(struct Gbn, cpu.r) + 4 * i);
+	packed_flags(e, TEMP); store(e, TEMP, offsetof(struct Gbn, cpu.cpsr));
+	stack(e, TEMP, INITIAL_DEADLINE, false);
+	op(e, NOW, NOW, TEMP, 0, 0);
+	store(e, NOW, offsetof(struct Gbn, now));
+	store(e, PREFETCH, offsetof(struct Gbn, prefetched_pc));
+	imm(e, MACHINE, LIMIT, 0, 0);
+	imm(e, LIMIT, RHS, 0, 0); /* uint64 return: a0=count/reason, a1=next guest PC */
+	stack(e, NOW, 0, false); stack(e, HOST_S1, 4, false);
+	stack(e, PREFETCH, 8, false); stack(e, WAIT, 12, false); stack(e, HOST_S4, 16, false);
+	stack(e, NEGATIVE, SAVED_NEGATIVE, false); stack(e, IS_ZERO, SAVED_ZERO, false);
+	if (m->code_region < 8) stack(e, RAM_EPOCH, SAVED_EPOCH, false);
+	stack(e, CONTEXT, SAVED_CONTEXT, false);
+    stack(e, 23, SAVED_S7, false); stack(e, 24, SAVED_S8, false);
+    stack(e, 27, SAVED_S11, false); stack(e, RA, SAVED_RA, false);
+	imm(e, SP, SP, 0, FRAME_BYTES); word(e, RA << 15 | 0x67);
+	for (unsigned i = 0; i < e->return_count; ++i)
+		block->code[e->returns[i]] = beq(ZERO, ZERO, 4 * (epilogue - e->returns[i]));
+	unsigned stubs[GBN_RV32_INSNS][2];
+	memset(stubs, 0, sizeof(stubs));
+	for (unsigned i = 0; i < e->stop_count; ++i) {
+		unsigned index = e->stops[i].instruction, slow = e->stops[i].fallback;
+		if (!stubs[index][slow]) {
+			stubs[index][slow] = e->count;
+			finish_count(e, index, slow);
+			constant(e, RHS, block->pc + width * index);
+			word(e, beq(ZERO, ZERO, 4 * (epilogue - e->count)));
+		}
+		unsigned at = e->stops[i].at;
+		block->code[at] |= beq(0, 0, 4 * (stubs[index][slow] - at)) & 0xfe000f80u;
+	}
+	block->words = (uint16_t) e->count;
+    *entry = loop_entry;
+    return chain;
+}
+
+/* Probes use isolated output: finalization patches guard/edge offsets in
+ * the prefix. No executable code or live descriptor is published here. */
+static bool body_fits(struct GbnRv32* backend, const struct Emit* body,
+        unsigned prologue_words, struct ArmEdge* edges, unsigned edge_count) {
+    uint32_t code[4096];
+    struct GbnRv32Block block = *body->block;
+    struct Emit probe = *body;
+    block.code = code; probe.block = &block;
+    memcpy(code, body->block->code, body->count * sizeof(*code));
+    unsigned entry;
+    finish_body(backend, &block, &probe, prologue_words, edges, edge_count, &entry);
+    return block.words <= GBN_RV32_WORDS;
+}
+
+static bool arm_pure(uint32_t code) {
+    if (code >> 28 != 14) return false;
+    if ((code & 0x0fc000f0) == 0x00000090) {
+        return (code >> 16 & 15) != 15 && (!(code & 0x200000) || (code >> 12 & 15) != 15);
+    }
+    if ((code & 0x0c000000) || (code >> 12 & 15) == 15) return false;
+    if (!(code & 0x2000000) && (code & 16)) return false;
+    unsigned kind = code >> 21 & 15;
+    return !(kind >= 8 && kind <= 11 && !(code & 0x100000));
+}
+
+#include "mixer-native-emitter.h"
+#include "mixer-packet-emitter.h"
+
+/* A short fast body has no observable instruction boundary inside it. The
+ * original body remains native and exact when cap/time proof fails. All
+ * candidates are lowered into temporary storage before committing, so the
+ * arena/branch bounds include both bodies and every existing exit stub. */
+static unsigned arm_bulk(struct Emit* e, const struct Gbn* m, unsigned first,
+        unsigned ram_guard_words, unsigned edge_count) {
+    if (e->block->thumb) return 0;
+    uint32_t ops[8], words[GBN_RV32_WORDS];
+    unsigned n = 0, size = m->code_region >= 8 ? m->rom_size :
+        m->code_region == 2 ? GBN_EWRAM_SIZE : GBN_IWRAM_SIZE;
+    uint32_t pc = e->block->pc + 4 * first;
+    while (n < 8 && first + n < GBN_RV32_INSNS) {
+        uint32_t address = pc + 4 * n, offset = address & m->code_mask;
+        if (address >> 24 != m->code_region || offset >= size || size - offset < 4 ||
+                (m->code_region < 8 && offset != (e->block->pc & m->code_mask) + 4 * (first + n))) break;
+        ops[n] = fetch(m, address, 4);
+        if (!arm_pure(ops[n])) break;
+        ++n;
+    }
+    while (n >= 3) {
+        struct GbnRv32Block temporary = *e->block;
+        temporary.code = words;
+        struct Emit probe = *e;
+        probe.block = &temporary; probe.count = probe.stop_count = 0;
+        probe.skip_shifter = false;
+        unsigned j;
+        for (j = 0; j < n; ++j) {
+            if (!arm_instruction(&probe, m, ops[j], pc + 4 * j)) break;
+            imm(&probe, NOW, NOW, 0, 1 + m->code_word_wait);
+            ++temporary.instructions;
+        }
+        if (j != n) { n = j; continue; }
+        unsigned full_words = probe.count;
+        bool carry_live[8], need = true;
+        unsigned worst = n * (1 + m->code_word_wait);
+        for (j = n; j--;) {
+            bool multiply = (ops[j] & 0x0fc000f0) == 0x00000090;
+            carry_live[j] = false;
+            if (multiply) {
+                if (ops[j] & 0x100000) need = true; /* MULS reads the preceding carry. */
+                worst += (ops[j] & 0x200000) ? 5 : 4;
+                if (m->code_nonseq > m->code_wait) worst += m->code_nonseq - m->code_wait;
+            } else { carry_live[j] = need; need = false; }
+        }
+        probe.count = probe.stop_count = 0;
+        temporary.instructions = e->block->instructions;
+        for (j = 0; j < n; ++j) {
+            probe.skip_shifter = !carry_live[j];
+            (void) arm_instruction(&probe, m, ops[j], pc + 4 * j);
+            imm(&probe, NOW, NOW, 0, 1 + m->code_word_wait);
+            ++temporary.instructions;
+        }
+        unsigned fast_words = probe.count;
+        unsigned reserve = 340 + 64 * edge_count + (13 + ram_guard_words) * (first + n);
+        if (e->count + 9 + fast_words + full_words + 3 * (n - 1) + reserve >= GBN_RV32_WORDS) {
+            --n; continue;
+        }
+        constant(e, TEMP, first + n);
+        unsigned cap = e->count; word(e, 0);
+        if (worst < 2048) imm(e, TEMP, NOW, 0, (int) worst);
+        else { constant(e, TEMP, worst); op(e, TEMP, NOW, TEMP, 0, 0); }
+        unsigned time = e->count; word(e, 0);
+        memcpy(e->block->code + e->count, words, fast_words * sizeof(*words));
+        e->count += fast_words;
+        unsigned done = e->count; word(e, 0);
+        unsigned slow = e->count;
+        e->block->code[cap] = beq(LIMIT, TEMP, 4 * (slow - cap)) | 6u << 12;
+        e->block->code[time] = beq(TEMP, ZERO, 4 * (slow - time)) | 5u << 12;
+        for (j = 0; j < n; ++j) {
+            if (j) e->body_offsets[first + j] = e->count;
+            if (j) {
+                constant(e, TEMP, first + j); stop(e, LIMIT, TEMP, 0, false);
+                stop(e, NOW, ZERO, 5, false);
+            }
+            (void) arm_instruction(e, m, ops[j], pc + 4 * j);
+            imm(e, NOW, NOW, 0, 1 + m->code_word_wait);
+            ++e->block->instructions;
+        }
+        e->block->code[done] = beq(ZERO, ZERO, 4 * (e->count - done));
+        return n;
+    }
+    return 0;
+}
+
 static void compile(struct GbnRv32* backend, struct GbnRv32Block* block) {
 	const struct Gbn* m = backend->machine;
 	unlink_code(backend, block);
-	block->code = backend->scratch; block->chain = NULL;
+	/* Oversized private workspace permits a rejected next instruction to be
+     * lowered safely; only blocks fitting the unchanged 1024-word cap publish. */
+    uint32_t work[4096];
+    block->code = work; block->chain = NULL;
 	block->pc = m->cpu.pc; block->mask = m->code_mask;
-	block->generation = m->rom_generation; block->valid = true;
-	block->timing = timing(m);
+	block->generation = m->rom_generation;
+	block->timing = timing(m); block->checked_epoch = 0;
+	block->context_tag = context_tag(backend, block->generation, block->mask, block->timing);
+	block->valid = true;
 	block->thumb = (m->cpu.cpsr & 0x20) != 0;
 	unsigned width = block->thumb ? 2 : 4;
-	block->branch = false; block->fallback = false; block->loop = false; block->instructions = 0;
+	block->branch = false; block->fallback = false; block->loop = false; block->instructions = 0; block->proof_instructions = 0;
 	block->pipe[0] = fetch(m, block->pc, width); block->pipe[1] = fetch(m, block->pc + width, width);
-	struct Emit e = {.block = block, .count = PROLOGUE_WORDS, .read_only = true};
+	unsigned prologue_words = PROLOGUE_WORDS + 2 + (m->code_region < 8 ? 2 : 0);
+	/* Entries in stops/returns/loop_jumps/body_offsets are written before
+	 * use, and their counters delimit the live prefix. Do not clear the
+	 * entire 4 KiB scratch table on every block compilation. */
+	struct Emit e;
+	e.block = block; e.count = prologue_words;
+	e.stop_count = e.return_count = e.loop_jump_count = e.source_count = 0;
+	e.written = e.thumb_literal_mask = 0;
+	e.read_only = true;
+	e.read_seen = e.dynamic_pc = e.skip_shifter = e.io_guarded = false;
+	memset(e.thumb_literal, 0, sizeof(e.thumb_literal));
 	unsigned ram_guard_words = 0;
 	if (m->code_region < 8) {
 		uintptr_t address = (uintptr_t) m->code + (block->pc & m->code_mask);
 		ram_guard_words = (address & 1) ? 3 * width : (address & 3) ? 2 * width : 4;
 	}
+    struct ArmEdge edges[GBN_RV32_INSNS];
+    unsigned edge_count = 0;
 	for (unsigned i = 0; i < GBN_RV32_INSNS; ++i) {
 		uint32_t pc = block->pc + width * i, offset = pc & m->code_mask;
 		unsigned size = m->code_region >= 8 ? m->rom_size : m->code_region == 2 ? GBN_EWRAM_SIZE : GBN_IWRAM_SIZE;
@@ -1154,105 +2038,91 @@ static void compile(struct GbnRv32* backend, struct GbnRv32Block* block) {
 		if (m->code_region < 8 && offset != (block->pc & m->code_mask) + width * i) break;
 		/* Reserve one lowering, two guarded successor edges, the common
 		 * return, both stop reasons at each instruction and RAM validation. */
-		if (e.count + 320 + (10 + ram_guard_words) * (i + 1) >= GBN_RV32_WORDS) break;
+        bool exact = e.count + 340 + 64 * edge_count
+            + (13 + ram_guard_words) * (i + 1) >= GBN_RV32_WORDS;
+        if (block->thumb && exact) break;
+        /* Lowering appends stop/body arrays. Only these scalar fields and
+         * the descriptor need restoring if the exact final size rejects it. */
+		uint32_t saved_written = e.written;
+		uint32_t saved_thumb_literal[8]; memcpy(saved_thumb_literal, e.thumb_literal, sizeof(saved_thumb_literal));
+		unsigned saved_thumb_literal_mask = e.thumb_literal_mask;
+		bool saved_io_guarded=e.io_guarded;
+        bool saved_read_only = e.read_only, saved_read_seen = e.read_seen;
+        bool saved_dynamic_pc = e.dynamic_pc;
+        struct GbnRv32Block saved_block = *block;
+        unsigned saved_edges = edge_count;
+        unsigned saved_returns=e.return_count,saved_loops=e.loop_jump_count;
 		unsigned start = e.count, stops = e.stop_count;
+		e.body_offsets[i] = start;
 		if (i) {
 			constant(&e, TEMP, i); stop(&e, LIMIT, TEMP, 0, false);
-			op(&e, TEMP, NOW, DEADLINE, 0, 0x20);
-			stop(&e, TEMP, ZERO, 5, false);
+			stop(&e, NOW, ZERO, 5, false);
 		}
-		uint32_t code = fetch(m, pc, width);
+		uint32_t code = block->thumb ? fetch(m, pc, width) : 0;
+		unsigned bulk_count = block->thumb && (code & 0xf000) == 0x6000 ?
+			thumb_io_group(&e,backend,m,i,code) : 0;
+		if (bulk_count) { i += bulk_count - 1; goto check_size; }
+		arm_mixer_packet(&e,backend,m,i);
+		bulk_count=arm_mixer_bulk(&e,backend,m,i,ram_guard_words,edge_count);
+		if(!bulk_count)bulk_count=arm_bulk(&e,m,i,ram_guard_words,edge_count);
+		if (bulk_count) { i += bulk_count - 1; goto check_size; }
+		if (!block->thumb) code = fetch(m, pc, width);
+        /* Keep a conditional branch's fallthrough in this native block.
+         * A taken edge gets its own exact partial count and refill below. */
+        if (!block->thumb && code >> 28 < 14 && (code & 0x0e000000u) == 0x0a000000u) {
+            uint32_t target = pc + 8 + (uint32_t) ((int32_t) (code << 8) >> 6);
+            if (target >> 24 != m->code_region || (m->code_region >= 8
+                    && (target & (GBN_ROM_MAX_SIZE - 1)) >= m->rom_size)) {
+                e.count = start; e.stop_count = stops; block->fallback = true; break;
+            }
+            exact |= e.count + 340 + 64 * (edge_count + 1)
+                    + (13 + ram_guard_words) * (i + 1) >= GBN_RV32_WORDS;
+            condition(&e, code >> 28);
+            imm(&e, NOW, NOW, 0, 1 + m->code_word_wait);
+            struct ArmEdge* edge = &edges[edge_count++];
+            *edge = (struct ArmEdge) {.at = e.count, .count = i + 1,
+                .pc = pc, .target = target, .link = (code & 0x1000000) != 0};
+            word(&e, 0);
+            ++block->instructions;
+            goto check_size;
+        }
+
 		if (!(block->thumb ? instruction(&e, m, code, pc) : arm_instruction(&e, m, code, pc))) {
 			e.count = start; e.stop_count = stops;
 			block->fallback = true; break;
 		}
 		imm(&e, NOW, NOW, 0, 1 + (block->thumb ? m->code_wait : m->code_word_wait));
 		++block->instructions;
+    check_size:
+        if (exact && !body_fits(backend, &e, prologue_words, edges, edge_count)) {
+            e.count = start; e.stop_count = stops; e.written = saved_written;
+            memcpy(e.thumb_literal, saved_thumb_literal, sizeof(saved_thumb_literal));
+            e.thumb_literal_mask = saved_thumb_literal_mask;
+			e.io_guarded=saved_io_guarded;
+            e.read_only = saved_read_only; e.read_seen = saved_read_seen;
+            e.dynamic_pc = saved_dynamic_pc;
+            *block = saved_block; edge_count = saved_edges;
+            e.return_count=saved_returns;e.loop_jump_count=saved_loops;
+            break;
+        }
 		if (block->branch || e.dynamic_pc) break;
 	}
-	block->loop = block->branch && block->target == block->pc;
-	if (e.dynamic_pc) {
-		imm(&e, NOW, NOW, 0, 2 + m->code_wait + m->code_nonseq);
-		constant(&e, PREFETCH, 0);
-        indirect_tail(&e, backend);
-	} else if (block->branch) {
-		unsigned untaken = e.count; word(&e, 0);
-		imm(&e, LIMIT, LIMIT, 1, 1); imm(&e, LIMIT, LIMIT, 5, 1);
-		imm(&e, NOW, NOW, 0, 2 + (block->thumb ? m->code_wait + m->code_nonseq : m->code_word_wait + m->code_word_nonseq));
-		constant(&e, PREFETCH, 0);
-		tail(&e, backend, block->target, false);
-		block->code[untaken] = beq(LIMIT, ZERO, 4 * (e.count - untaken)) | 5u << 12;
-	}
-	if (!e.dynamic_pc) tail(&e, backend, block->pc + width * block->instructions, block->fallback);
-
-	unsigned loop_entry = PROLOGUE_WORDS;
-	if (mergeable(&e)) {
-		loop_entry = e.count;
-		for (unsigned i = 0; i < 8; ++i) if (e.written & (1u << i)) stack(&e, guest[i], 20 + 4 * i, true);
-		packed_flags(&e, RHS); stack(&e, RHS, SNAPSHOT_FLAGS, true);
-		stack(&e, PREFETCH, SNAPSHOT_PREFETCH, true); stack(&e, NOW, SNAPSHOT_NOW, true);
-		word(&e, beq(ZERO, ZERO, 4 * (PROLOGUE_WORDS - e.count)));
-	}
-	if (e.loop_jump) block->code[e.loop_jump] = beq(ZERO, ZERO, 4 * (loop_entry - e.loop_jump));
-	unsigned chain = loop_entry;
-	if (m->code_region < 8 && block->instructions) {
-		/* A previous native block may have changed this RAM code. Check its
-		 * snapshot before consuming any instruction. Host allocations need
-		 * not be aligned; pick the largest safe host load for each chunk. */
-		chain = e.count;
-		const uint8_t* bytes = m->code + (block->pc & m->code_mask);
-		constant(&e, LHS, (uint32_t) (uintptr_t) bytes);
-		for (unsigned off = 0, size = block->instructions * width; off < size;) {
-			uintptr_t address = (uintptr_t) bytes + off;
-			unsigned size_left = size - off;
-			unsigned chunk = !(address & 3) && size_left >= 4 ? 4 : !(address & 1) && size_left >= 2 ? 2 : 1;
-			unsigned fn = chunk == 4 ? 2 : chunk == 2 ? 5 : 4;
-			word(&e, off << 20 | LHS << 15 | fn << 12 | RHS << 7 | 3);
-			uint32_t value = 0;
-			for (unsigned i = 0; i < chunk; ++i) value |= (uint32_t) bytes[off + i] << (8 * i);
-			constant(&e, TEMP, value);
-			stop(&e, RHS, TEMP, 1, false); e.stops[e.stop_count - 1].instruction = 0;
-			off += chunk;
-		}
-		word(&e, beq(ZERO, ZERO, 4 * (loop_entry - e.count)));
-	}
-	unsigned epilogue = e.count;
-	for (unsigned i = 0; i < 8; ++i) store(&e, guest[i], offsetof(struct Gbn, cpu.r) + 4 * i);
-	packed_flags(&e, TEMP); store(&e, TEMP, offsetof(struct Gbn, cpu.cpsr));
-	store(&e, NOW, offsetof(struct Gbn, now));
-	store(&e, PREFETCH, offsetof(struct Gbn, prefetched_pc));
-	op(&e, MACHINE, LIMIT, COMPLETED, 0, 0);
-	imm(&e, LIMIT, RHS, 0, 0); /* uint64 return: a0=count/reason, a1=next guest PC */
-	stack(&e, NOW, 0, false); stack(&e, DEADLINE, 4, false);
-	stack(&e, PREFETCH, 8, false); stack(&e, WAIT, 12, false); stack(&e, COMPLETED, 16, false);
-	stack(&e, NEGATIVE, 68, false); stack(&e, IS_ZERO, 72, false);
-	imm(&e, SP, SP, 0, FRAME_BYTES); word(&e, RA << 15 | 0x67);
-	for (unsigned i = 0; i < e.return_count; ++i)
-		block->code[e.returns[i]] = beq(ZERO, ZERO, 4 * (epilogue - e.returns[i]));
-	unsigned stubs[GBN_RV32_INSNS][2];
-	memset(stubs, 0, sizeof(stubs));
-	for (unsigned i = 0; i < e.stop_count; ++i) {
-		unsigned index = e.stops[i].instruction, slow = e.stops[i].fallback;
-		if (!stubs[index][slow]) {
-			stubs[index][slow] = e.count;
-			constant(&e, LIMIT, index | (slow ? 0x80000000u : 0));
-			constant(&e, RHS, block->pc + width * index);
-			word(&e, beq(ZERO, ZERO, 4 * (epilogue - e.count)));
-		}
-		unsigned at = e.stops[i].at;
-		block->code[at] |= beq(0, 0, 4 * (stubs[index][slow] - at)) & 0xfe000f80u;
-	}
-	block->words = (uint16_t) e.count;
+    unsigned loop_entry;
+    unsigned chain = finish_body(backend, block, &e, prologue_words, edges, edge_count, &loop_entry);
 	e.count = 0;
 	imm(&e, SP, SP, 0, -FRAME_BYTES);
-	stack(&e, NOW, 0, true); stack(&e, DEADLINE, 4, true);
-	stack(&e, PREFETCH, 8, true); stack(&e, WAIT, 12, true); stack(&e, COMPLETED, 16, true);
-	stack(&e, NEGATIVE, 68, true); stack(&e, IS_ZERO, 72, true);
-	constant(&e, COMPLETED, 0);
+	stack(&e, NOW, 0, true); stack(&e, HOST_S1, 4, true);
+	stack(&e, PREFETCH, 8, true); stack(&e, WAIT, 12, true); stack(&e, HOST_S4, 16, true);
+	stack(&e, NEGATIVE, SAVED_NEGATIVE, true); stack(&e, IS_ZERO, SAVED_ZERO, true);
+	if (m->code_region < 8) { stack(&e, RAM_EPOCH, SAVED_EPOCH, true); imm(&e, RAM_EPOCH, TEMP, 0, 0); }
+	stack(&e, CONTEXT, SAVED_CONTEXT, true); imm(&e, CONTEXT, 14, 0, 0);
+	stack(&e, 23, SAVED_S7, true); stack(&e, 24, SAVED_S8, true);
+    stack(&e, 27, SAVED_S11, true); stack(&e, RA, SAVED_RA, true);
+    stack(&e, LIMIT, INITIAL_CAP, true); stack(&e, FLAGS, INITIAL_DEADLINE, true);
 	load(&e, NOW, offsetof(struct Gbn, now));
-	imm(&e, DEADLINE, FLAGS, 0, 0);
+	op(&e, NOW, NOW, FLAGS, 0, 0x20);
 	load(&e, PREFETCH, offsetof(struct Gbn, prefetched_pc));
-	for (unsigned i = 0; i < 8; ++i) load(&e, guest[i], offsetof(struct Gbn, cpu.r) + 4 * i);
+	for (unsigned i = 0; i < 15; ++i) if (resident(i)) load(&e, guest[i], offsetof(struct Gbn, cpu.r) + 4 * i);
 	load(&e, FLAGS, offsetof(struct Gbn, cpu.cpsr));
 	imm(&e, NEGATIVE, FLAGS, 5, 31); imm(&e, IS_ZERO, FLAGS, 5, 30);
 	imm(&e, IS_ZERO, IS_ZERO, 7, 1);
@@ -1261,7 +2131,7 @@ static void compile(struct GbnRv32* backend, struct GbnRv32Block* block) {
 	if (m->code_region < 8) {
 		unsigned slot = (unsigned) (block - backend->blocks);
 		memcpy(backend->source[slot], m->code + (block->pc & m->code_mask),
-			(block->instructions ? block->instructions : 1) * width);
+			(block->proof_instructions > block->instructions ? block->proof_instructions : block->instructions ? block->instructions : 1) * width);
 	}
 	if (block->instructions) allocate_code(backend, block, chain);
 	else block->code = NULL;
@@ -1305,11 +2175,12 @@ static inline __attribute__((always_inline)) unsigned execute_mode(struct GbnRv3
 	 * external loaders therefore need no new write barrier. A stale pipeline
 	 * is checked separately below and remains in the interpreter until consumed. */
 	if (hit && !rom && memcmp(backend->source[slot], source + (m->cpu.pc & m->code_mask),
-	    (b->instructions ? b->instructions : 1) * width)) hit = false;
+	    (b->proof_instructions > b->instructions ? b->proof_instructions : b->instructions ? b->instructions : 1) * width)) hit = false;
 	if (hit && !b->instructions) return 0;
 	uint32_t deadline = m->now + GBN_MAX_DELAY;
-	if (m->next_event >= 0) {
-		deadline = m->events[m->next_event].when;
+	int next=gbn_cpu_event(m);
+	if (next >= 0) {
+		deadline = m->events[next].when;
 		int32_t distance = (int32_t) (deadline - m->now);
 		if (distance <= 0) return 0;
 	}
@@ -1321,8 +2192,22 @@ static inline __attribute__((always_inline)) unsigned execute_mode(struct GbnRv3
 	if (!b->instructions) return 0;
 	/* Keep the reason bit separate from the accumulated native count. */
 	if (cap > 0x0fffffffu) cap = 0x0fffffffu;
-	typedef uint64_t (*Function)(struct Gbn*, uint32_t, uint32_t);
-	uint64_t result = ((Function) (uintptr_t) b->code)(m, cap, deadline);
+	uint32_t epoch = 0;
+	if (!rom) {
+		/* Reserve one distinct token per possible guest store, plus entry.
+		 * No native instruction increments it more than once. Clear proofs
+		 * before the reserved range would wrap; external changes are checked
+		 * anew at every C entry, including DMA and raw host RAM writes. */
+		if (backend->next_epoch > UINT32_MAX - cap - 1) {
+			for (unsigned i = 0; i < GBN_RV32_SLOTS; ++i) backend->blocks[i].checked_epoch = 0;
+			backend->next_epoch = 0;
+		}
+		epoch = backend->next_epoch + 1;
+		backend->next_epoch += cap + 1;
+		b->checked_epoch = epoch; /* The C entry just validated these bytes. */
+	}
+	typedef uint64_t (*Function)(struct Gbn*, uint32_t, uint32_t, uint32_t, uint32_t);
+	uint64_t result = ((Function) (uintptr_t) b->code)(m, cap, deadline, epoch, b->context_tag);
 	uint32_t count = (uint32_t) result & 0x7fffffffu;
 #if GBN_RV32_STATS
 	++backend->native_entries;

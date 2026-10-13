@@ -3,6 +3,41 @@
 #define GBA_NEXT_INTERNAL_H
 #include <gba-next/core.h>
 struct GbnRv32;
+/* PCM has no guest-visible side effects. A CPU-only interval may cross its
+ * clock, provided sound writes first catch up and the event service retains
+ * the ordinary chronological order at every other device boundary. */
+static inline int gbn_cpu_event(const struct Gbn* m) {
+    int id=m->next_event;
+    if (id==(int)GBN_EVENT_AUDIO && m->devices && m->devices->audio.batched) {
+        unsigned next=m->event_head;
+        if(next==GBN_EVENT_AUDIO) next=m->event_next[next];
+        return next<GBN_EVENT_COUNT?(int)next:-1;
+    }
+    return id;
+}
+void gbn_audio_service_span(struct Gbn*, uint32_t when);
+/* The detached clock is valid for the built-in device schedule. Public
+ * custom scheduling switches back before mutating the real queue, so its
+ * historical equal-key ownership is never reconstructed from a partial list. */
+static inline bool gbn_audio_regular_event(unsigned id, uint8_t priority) {
+    static const uint8_t priorities[GBN_EVENT_COUNT] = {
+        0,0,0,0,0,0x70,0x80,0x10,0x20,0x21,0x22,0x23,0x18,0x40,8,0
+    };
+    return id >= GBN_EVENT_SAVE && id < GBN_EVENT_COUNT && priority == priorities[id];
+}
+void gbn_audio_timeline_queue(struct Gbn*);
+void gbn_audio_timeline_restore(struct Gbn*);
+void gbn_audio_timeline_drain(struct Gbn*, uint32_t when, bool inclusive);
+static inline void gbn_audio_catchup(struct Gbn* m) {
+    if (m->devices && m->devices->audio.pcm_detached) {
+        gbn_audio_timeline_materialize(m);
+        return;
+    }
+    while(m->next_event==(int)GBN_EVENT_AUDIO &&
+          (int32_t)(m->now-m->events[GBN_EVENT_AUDIO].when)>=0)
+        gbn_audio_service_span(m,m->events[GBN_EVENT_AUDIO].when);
+}
+
 /* Called only after the shared instruction-boundary checks. Zero requests
  * the independent interpreter; successful blocks restore complete state.
  * Bit 31 requests one interpreter instruction after the completed prefix. */

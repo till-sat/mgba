@@ -81,6 +81,11 @@ enum GbnStatus gbn_service_events(struct Gbn* m) {
 	if (d->stopped) return GBN_UNSUPPORTED_DEVICE;
 	bool advanced = false;
 	for (;;) {
+        /* A halted CPU advances to its next real device boundary. PCM alone
+         * cannot wake it. DMA may also cross PCM-only clocks; sound writes
+         * synchronize before changing input. IRQ/DMA/timer ordering stays
+         * on the real queue, and reads materialize all elapsed PCM. */
+        gbn_audio_timeline_queue(m);
 		int id = m->next_event;
 		if (id < 0) return d->halted ? GBN_EVENT : GBN_STEP;
 		if ((int32_t) (m->now - m->events[id].when) < 0) {
@@ -105,7 +110,7 @@ enum GbnStatus gbn_service_events(struct Gbn* m) {
 			continue;
 		}
 		if (id == GBN_EVENT_AUDIO_FRAME) { gbn_audio_frame(m, when); continue; }
-		if (id == GBN_EVENT_AUDIO) { gbn_audio_service(m, when); continue; }
+		if (id == GBN_EVENT_AUDIO) { gbn_audio_service_span(m, when); continue; }
 		if (id == GBN_EVENT_DMA) {
 			uint32_t before = m->now;
 			enum GbnStatus status = gbn_dma_service(m);
@@ -305,6 +310,9 @@ enum GbnStatus gbn_device_write(struct Gbn* m, uint32_t address, unsigned width,
 		width = 2; address &= ~1u;
 	}
 	uint8_t* p = video_address(m->devices, address);
-	if (p) for (unsigned b = 0; b < width; ++b) p[b] = (uint8_t) (value >> (8 * b));
+	if (p) {
+        for (unsigned b = 0; b < width; ++b) p[b] = (uint8_t) (value >> (8 * b));
+        if (region == 7) gbn_ppu_invalidate_oam(m);
+    }
 	return GBN_STEP;
 }

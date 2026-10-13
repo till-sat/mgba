@@ -26,36 +26,50 @@
  * address while live; reinitialize it whenever its machine is reinitialized.
  * No mGBA state or callbacks are used. */
 struct GbnRv32Block {
-	uint32_t pc, generation, mask, target, timing;
+	/* Native edges and entry proofs share one aligned 16-byte hot prefix. */
+	uint32_t pc;
+	uint32_t* chain; /* Common-register entry; NULL when invalid or unsupported. */
+	uint32_t checked_epoch, context_tag; /* Native entry proofs; zero is invalid. */
+	uint32_t generation, mask, target, timing;
 	uint16_t instructions, words;
 	uint32_t pipe[2];
 	bool valid, branch, fallback, thumb, loop, arena_linked;
+    uint16_t proof_instructions; /* Lookahead proved independently of slow-body size. */
 	uint32_t* code;
-	uint32_t* chain; /* Common-register entry; NULL when invalid or unsupported. */
 	struct GbnRv32Block *arena_prev, *arena_next;
 };
+/* Interned full keys. Hash collisions evict entries without reusing tags. */
+struct GbnRv32Key {
+	uint32_t generation, mask, timing, tag;
+};
+#define GBN_RV32_KEYS 256u
 struct GbnRv32 {
 	struct Gbn* machine;
+	uint32_t next_epoch, next_context_tag;
+	struct GbnRv32Key keys[GBN_RV32_KEYS];
 	uint64_t native_instructions, fallback_instructions;
 	uint32_t compiled_blocks, cache_flushes, code_used; /* Segment flushes; arena cursor in words. */
 	uint32_t code_segment;
 	struct GbnRv32Block* segments[GBN_RV32_SEGMENTS];
-	struct GbnRv32Block blocks[GBN_RV32_SLOTS];
+	_Alignas(16) struct GbnRv32Block blocks[GBN_RV32_SLOTS];
 	struct GbnRv32Block* lookup[GBN_RV32_SLOTS];
 	uint8_t replacement[GBN_RV32_SETS];
 	_Alignas(16) uint8_t source[GBN_RV32_SLOTS][4 * GBN_RV32_INSNS];
 	_Alignas(16) uint32_t code[GBN_RV32_CODE_WORDS];
 	uint32_t scratch[GBN_RV32_WORDS];
 	uint64_t native_entries, loop_entries, loop_instructions;
+    uint64_t fused_mixer_instructions;
+    uint64_t fused_mixer_packets;
 	uint64_t fallback_kind[5]; /* BIOS, EWRAM, IWRAM, ROM ARM, ROM Thumb. */
 	uint64_t chained_blocks;
 	uint64_t merged_instructions; /* Exact fixed-point loops, never across an event. */
+	uint64_t fused_thumb_io_instructions;
 };
 
 bool gbn_rv32_available(void);
 void gbn_rv32_init(struct GbnRv32*, struct Gbn*);
 /* Same event, failure and instruction-cap contract as gbn_run_batch. Native
- * ROM and RAM blocks retain low registers, flags, time and prefetch state across RAM
+ * ROM and RAM blocks retain r0-r12, LR, flags, time and prefetch state across RAM
  * operations. Thumb supports common ALU/MUL, direct branches and single
  * memory operations, Thumb BL/BX and nonempty PUSH/POP in EWRAM/IWRAM. Guest SP low bits
  * survive word-aligned transfers; unaligned host RAM and mirrored-end spans
@@ -64,7 +78,10 @@ void gbn_rv32_init(struct GbnRv32*, struct Gbn*);
  * suffix targets chain through the existing keyed cache; misses return to C.
  * BL halves retain independent LR, event and cap boundaries. ARM supports conditional ALU, MUL/MLA, immediate
  * operand shifts, B/BL, and single transfers with pre-index writeback or
- * immediate post-indexing. Ordinary ROM reads and signed loads are direct.
+ * immediate post-indexing. Conditional ARM B/BL fallthroughs stay in the same
+ * block; taken edges preserve their exact prefix count, LR and refill timing.
+ * Guest SP remains in machine state; the native ABI preserves gp/tp and all
+ * callee-saved registers. Ordinary ROM reads and signed loads are direct.
  * Stored IO, DMA count/control and pure open-bus registers have direct reads.
  * Open bus preserves DMA latch selection, byte/sign lanes and live RAM fetches;
  * stale prefetched IWRAM tails fall back before guest effects. Aligned DMA
@@ -76,7 +93,12 @@ void gbn_rv32_init(struct GbnRv32*, struct Gbn*);
  * Read-only Thumb self-loops can merge complete fixed-point iterations after
  * comparing all modified registers, flags and prefetch state, while preserving
  * exact guest instruction/time counts and the next event/cap boundary.
- * RAM code bytes are validated at both C and chained entries. Writes overlapping the block and
+ * RAM code bytes are validated at every C entry. Chained entries reuse a
+ * proof only until a native write to the same RAM bank; raw host changes and
+ * DMA are therefore checked anew after every return to C. Unique interned
+ * context tags prove generation/mapping/timing without repeated full-key
+ * comparisons at every edge. Both proof counters handle wrap by retiring
+ * their old proofs. Writes overlapping the block and
  * its prefetched tail use the interpreter, preserving self modification.
  * Other instructions, BIOS and remaining IO use the independent interpreter. The
  * configurable set-associative cache has a fast lookup table (eight ways by

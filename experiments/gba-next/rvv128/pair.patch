@@ -1,0 +1,387 @@
+--- /dev/null
++++ b/am/test/gba-next-ppu-pair.c
+@@ -0,0 +1,141 @@
++/* SPDX-License-Identifier: MPL-2.0 */
++#include <gba-next/core.h>
++#include "ppu-internal.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++extern void gbn_test_ppu_pair(struct GbnDevices*,const struct IndexedBackground*,unsigned,
++    const struct Pixel*,unsigned,unsigned,uint16_t*);
++extern uint32_t gbn_ppu_pair_pixels,gbn_ppu_pair_rebuilds,gbn_ppu_pair_aliases;
++static struct GbnPpuCache cache;
++static struct GbnDevices dev;
++static _Alignas(4) uint8_t pal[1032],video[GBN_VRAM_SIZE],oam[GBN_OAM_SIZE];
++static _Alignas(4) uint8_t index_data[4][256];
++static uint16_t output[260];
++static struct Pixel obj[240];
++static struct IndexedBackground layers[4];
++static unsigned checks;
++#define CHECK(x) do {++checks;if(!(x)){printf("FAIL pair proof line %d; check %u\n",__LINE__,checks);exit(1);}}while(0)
++static unsigned load16(const uint8_t* p){return p[0]|(unsigned)p[1]<<8;}
++static void store16(uint8_t* p,unsigned x){p[0]=x;p[1]=x>>8;}
++static unsigned color(const uint8_t* p,unsigned a,unsigned b){return load16(p+2*((a&15)?a:(b&15)?b:0))&0x7fff;}
++static void init(unsigned alignment){
++    memset(&cache,0,sizeof(cache));memset(&dev,0,sizeof(dev));
++    dev.palette=pal+alignment;dev.vram=video;dev.oam=oam;dev.ppu.cache=&cache;
++    for(unsigned i=0;i<256;++i)store16(dev.palette+2*i,(i*3197u)^0xa65bu);
++    for(unsigned i=0;i<4;++i)layers[i]=(struct IndexedBackground){index_data[i],(uint8_t)(i*8+1),(uint8_t)i,(uint8_t)(1u<<i)};
++}
++static void exhaustive(void){
++    for(unsigned alignment=0;alignment<2;++alignment){
++        init(alignment);
++        for(unsigned a=0;a<256;++a){
++            memset(index_data[0],a,sizeof(index_data[0]));
++            for(unsigned batch=0;batch<2;++batch){
++                unsigned start=batch?16:0,end=batch?32:240;
++                for(unsigned x=0;x<256;++x)index_data[1][x]=(uint8_t)(batch?x+224:x);
++                for(unsigned x=0;x<260;++x)output[x]=0xbeef;
++                unsigned offset=a&1;
++                gbn_test_ppu_pair(&dev,layers,2,NULL,start,end,output+offset);
++                for(unsigned x=0;x<260;++x){
++                    unsigned expected=0xbeef;
++                    if(x>=offset+start && x<offset+end)expected=color(dev.palette,a,index_data[1][x-offset]);
++                    CHECK(output[x]==expected);
++                }
++            }
++        }
++    }
++}
++static void mutations_and_fallbacks(void){
++    init(0);
++    for(unsigned i=0;i<4;++i)for(unsigned x=0;x<256;++x)index_data[i][x]=(uint8_t)((x*17+i*39)^(x>>3));
++    for(unsigned trial=0;trial<520;++trial){
++        if(trial<512)dev.palette[trial]^=(uint8_t)(1u<<(trial&7));
++        else if(trial==512){memcpy(pal+513,dev.palette,512);dev.palette=pal+513;}
++        else if(trial==516){dev.ppu.cache=NULL;}
++        else if(trial==518){memset(&cache,0,sizeof(cache));dev.ppu.cache=&cache;}
++        unsigned start=trial&7,end=240-(trial&15);
++        gbn_test_ppu_pair(&dev,layers,2,NULL,start,end,output);
++        for(unsigned x=start;x<end;++x)CHECK(output[x]==color(dev.palette,index_data[0][x],index_data[1][x]));
++    }
++    for(unsigned count=0;count<=4;++count)for(unsigned with_obj=0;with_obj<2;++with_obj)
++        for(unsigned size=0;size<=240;++size){
++            for(unsigned x=0;x<240;++x)obj[x]=(struct Pixel){(uint16_t)(x*97&0x7fff),(uint8_t)(x%5*8),4,false};
++            unsigned start=(240-size)/2,end=start+size;
++            gbn_test_ppu_pair(&dev,layers,count,with_obj?obj:NULL,start,end,output);
++            for(unsigned x=start;x<end;++x){
++                unsigned selected=0,key=39;
++                for(unsigned i=0;i<count;++i)if(index_data[i][x]&15){selected=index_data[i][x];key=layers[i].key;break;}
++                unsigned want=with_obj && obj[x].key<key?obj[x].color:load16(dev.palette+2*selected)&0x7fff;
++                CHECK(output[x]==want);
++            }
++        }
++}
++static _Alignas(4) uint8_t alias_actual[2048],alias_expected[2048];
++static void aliases(void){
++    init(0);
++    for(unsigned kind=0;kind<4;++kind){
++        for(unsigned i=0;i<2048;++i)alias_actual[i]=(uint8_t)(i*23+(i>>4));
++        memcpy(alias_expected,alias_actual,sizeof(alias_actual));
++        unsigned a=0,b=256,palette=512,dest=kind==0?0:kind==1?258:kind==2?514:1024;
++        dev.palette=alias_actual+palette;layers[0].indices=alias_actual+a;layers[1].indices=alias_actual+b;
++        unsigned backdrop=load16(alias_expected+palette)&0x7fff;
++        for(unsigned x=3;x<237;++x){
++            unsigned aa=alias_expected[a+x],bb=alias_expected[b+x];
++            unsigned index=(aa&15)?aa:(bb&15)?bb:0;
++            unsigned want=index?load16(alias_expected+palette+2*index)&0x7fff:backdrop;
++            store16(alias_expected+dest+x*2,want);
++        }
++        gbn_test_ppu_pair(&dev,layers,2,NULL,3,237,(uint16_t*)(alias_actual+dest));
++        for(unsigned i=0;i<2048;++i)CHECK(alias_actual[i]==alias_expected[i]);
++    }
++    init(0);memset(index_data[0],1,256);memset(index_data[1],2,256);
++    gbn_test_ppu_pair(&dev,layers,2,NULL,0,240,output);
++    CHECK(cache.pair_valid);
++    gbn_test_ppu_pair(&dev,layers,2,NULL,0,240,cache.pair_colors);
++    CHECK(!cache.pair_valid);
++    gbn_test_ppu_pair(&dev,layers,2,NULL,0,240,output);
++    CHECK(cache.pair_valid);
++    for(unsigned x=0;x<240;++x)CHECK(output[x]==color(dev.palette,1,2));
++}
++#ifdef AM_RVV
++static void vector_kernel_checks(void) {
++    _Alignas(4) uint8_t a[512],b[512];
++    for(unsigned i=0;i<512;++i)a[i]=b[i]=(uint8_t)(i*197+(i>>2));
++    CHECK(gbn_ppu_palette_equal_vector(a,b));
++    for(unsigned i=0;i<512;++i)for(unsigned bit=0;bit<8;++bit){
++        b[i]^=(uint8_t)(1u<<bit);CHECK(!gbn_ppu_palette_equal_vector(a,b));
++        b[i]^=(uint8_t)(1u<<bit);CHECK(gbn_ppu_palette_equal_vector(a,b));
++    }
++    /* Exhaustive table address proof uses unique 16-bit values, unlike real
++     * palette rows, so truncation/reordering of any index bit is observable. */
++    for(unsigned i=0;i<65536;++i)cache.pair_colors[i]=(uint16_t)((i*40503u)^0x19af);
++    for(unsigned x=0;x<256;++x)index_data[1][x]=(uint8_t)x;
++    for(unsigned high=0;high<256;++high){
++        memset(index_data[0],high,256);
++        gbn_ppu_pair_vector(index_data[0],index_data[1],cache.pair_colors,output,256);
++        for(unsigned x=0;x<256;++x)CHECK(output[x]==cache.pair_colors[high*256+x]);
++    }
++    for(unsigned n=0;n<=240;++n)for(unsigned align=0;align<4;++align){
++        for(unsigned x=0;x<260;++x)output[x]=0xbeef;
++        for(unsigned x=0;x<256;++x){index_data[0][x]=(uint8_t)(x*13);index_data[1][x]=(uint8_t)(x*107);}
++        unsigned off=align&1;
++        gbn_ppu_pair_vector(index_data[0]+align,index_data[1]+align,cache.pair_colors,output+off,n);
++        for(unsigned x=0;x<260;++x){
++            unsigned want=0xbeef;
++            if(x>=off && x<off+n)want=cache.pair_colors[(unsigned)index_data[0][x-off+align]*256+index_data[1][x-off+align]];
++            CHECK(output[x]==want);
++        }
++    }
++}
++#endif
++int main(void){
++#ifdef AM_RVV
++    vector_kernel_checks();
++#endif
++
++    exhaustive();mutations_and_fallbacks();aliases();
++    CHECK(gbn_ppu_pair_pixels>=131072);CHECK(gbn_ppu_pair_rebuilds>=512);CHECK(gbn_ppu_pair_aliases>=4);
++    printf("PASS fused palette pair: %u checks; pixels=%u rebuilds=%u alias_fallbacks=%u\n",checks,
++        gbn_ppu_pair_pixels,gbn_ppu_pair_rebuilds,gbn_ppu_pair_aliases);
++    return 0;
++}
+--- a/include/gba-next/core.h
++++ b/include/gba-next/core.h
+@@ -133,6 +133,10 @@
+     uint8_t object_ids[GBN_SCREEN_HEIGHT][128], object_counts[GBN_SCREEN_HEIGHT];
+     uint32_t object_bounds[GBN_SCREEN_HEIGHT];
+     bool object_valid, tracked_oam;
++    /* Exact palette snapshot and fused two-background RGB lookup. */
++    bool pair_valid;
++    _Alignas(4) uint8_t pair_palette[512];
++    _Alignas(4) uint16_t pair_colors[256 * 256];
+ };
+ struct GbnPpu {
+ 	uint16_t* pixels; /* GBA BGR555: red occupies bits 0..4. Caller-owned. */
+--- a/src/gba-next/ppu-internal.h
++++ b/src/gba-next/ppu-internal.h
+@@ -21,4 +21,8 @@
+ void gbn_ppu_indexed_vector(const struct IndexedBackground* layers, unsigned count,
+     const struct Pixel* objects, unsigned start, unsigned end,
+     const uint8_t* palette, uint16_t* output);
++/* Dense palette proof and two-plane RGB lookup; callers prove 4-byte input
++ * alignment for the proof and distinct source/output spans for composition. */
++bool gbn_ppu_palette_equal_vector(const uint8_t*, const uint8_t*);
++void gbn_ppu_pair_vector(const uint8_t*, const uint8_t*, const uint16_t*, uint16_t*, unsigned);
+ #endif
+--- /dev/null
++++ b/src/gba-next/ppu-pair-lookup.h
+@@ -0,0 +1,89 @@
++/* SPDX-License-Identifier: MPL-2.0 */
++/* Fuse opaque selection and palette conversion. The inputs are the two
++ * already priority-sorted index planes, including their transparent bank
++ * entries. This cache depends only on all 512 live background palette bytes;
++ * no VRAM write tracking or frame reuse is involved. */
++#ifdef GBN_PPU_PAIR_TEST
++uint32_t gbn_ppu_pair_pixels, gbn_ppu_pair_rebuilds, gbn_ppu_pair_aliases;
++#endif
++static __attribute__((noinline)) const uint16_t* ppu_pair_table(struct GbnPpuCache* c,
++        const uint8_t* palette) {
++    bool equal=false;
++    if (c->pair_valid) {
++#if defined(AM_RVV)
++        if (!((uintptr_t)palette&3)) equal=gbn_ppu_palette_equal_vector(c->pair_palette,palette);
++        else
++#endif
++        equal=!memcmp(c->pair_palette,palette,512);
++    }
++    if (!equal) {
++        uint16_t bottom[256];
++        uint16_t backdrop=half(palette,0)&0x7fff;
++        for (unsigned b=0;b<256;++b) bottom[b]=(b&15)?half(palette,b*2)&0x7fff:backdrop;
++        for (unsigned a=0;a<256;++a) {
++            uint16_t* row=c->pair_colors+a*256;
++            if (a&15) {
++                uint16_t color=half(palette,a*2)&0x7fff;
++                for (unsigned b=0;b<256;++b) row[b]=color;
++            } else memcpy(row,bottom,sizeof(bottom));
++        }
++        memcpy(c->pair_palette,palette,512);
++        c->pair_valid=true;
++#ifdef GBN_PPU_PAIR_TEST
++        ++gbn_ppu_pair_rebuilds;
++#endif
++    }
++    return c->pair_colors;
++}
++
++static __attribute__((noinline)) void indexed_pair_span(const struct GbnDevices* d,
++        const struct IndexedBackground* layers,unsigned count,const struct Pixel* objects,
++        unsigned start,unsigned end,uint16_t backdrop,uint16_t* output,const uint16_t** pair) {
++#if !defined(AM_RVV) || !(GBN_PPU_RVV & 4)
++    struct GbnPpuCache* c=d->ppu.cache;
++    if (count==2 && !objects && end-start>=16 && c) {
++        const uint8_t* a=layers[0].indices;
++        const uint8_t* b=layers[1].indices;
++        /* Preserve pixel-by-pixel behavior for all legal source/output aliases.
++         * Check the whole output row, since a preceding span may write palette.
++         * Table construction must not modify any live renderer input either. */
++        if (ppu_pair_overlap(output,480,d->palette,512) ||
++            ppu_pair_overlap(output,480,c,sizeof(*c)) ||
++            ppu_pair_overlap(output,480,a,240) || ppu_pair_overlap(output,480,b,240) ||
++            ppu_pair_overlap(c,sizeof(*c),d->palette,GBN_PALETTE_SIZE) ||
++            ppu_pair_overlap(c,sizeof(*c),d->vram,GBN_VRAM_SIZE) ||
++            ppu_pair_overlap(c,sizeof(*c),d->oam,GBN_OAM_SIZE) ||
++            ppu_pair_overlap(c,sizeof(*c),d,sizeof(*d)) ||
++            ppu_pair_overlap(c->pair_colors,sizeof(c->pair_colors),a,240) ||
++            ppu_pair_overlap(c->pair_colors,sizeof(c->pair_colors),b,240)) {
++#ifdef GBN_PPU_PAIR_TEST
++            ++gbn_ppu_pair_aliases;
++#endif
++        } else {
++            const uint16_t* table=*pair;
++            if (!table) *pair=table=ppu_pair_table(c,d->palette);
++#if defined(AM_RVV)
++            gbn_ppu_pair_vector(a+start,b+start,table,output+start,end-start);
++#else
++            for (unsigned x=start;x<end;++x) output[x]=table[(unsigned)a[x]*256+b[x]];
++#endif
++#ifdef GBN_PPU_PAIR_TEST
++            gbn_ppu_pair_pixels+=end-start;
++#endif
++            return;
++        }
++    }
++#else
++    (void) pair;
++#endif
++    indexed_span(layers,count,objects,start,end,d->palette,backdrop,output);
++}
++#ifdef GBN_PPU_PAIR_TEST
++void gbn_test_ppu_pair(struct GbnDevices* d,const struct IndexedBackground* layers,
++        unsigned count,const struct Pixel* objects,unsigned start,unsigned end,uint16_t* output) {
++    const uint16_t* pair=NULL;
++    indexed_pair_span(d,layers,count,objects,start,end,half(d->palette,0)&0x7fff,output,&pair);
++    if(d->ppu.cache && ppu_pair_overlap(output,480,d->ppu.cache,sizeof(*d->ppu.cache)))
++        d->ppu.cache->pair_valid=false;
++}
++#endif
+--- a/src/gba-next/ppu-rvv.c
++++ b/src/gba-next/ppu-rvv.c
+@@ -1,6 +1,6 @@
+ /* SPDX-License-Identifier: MPL-2.0 */
+ #include "ppu-internal.h"
+-#if defined(__riscv_vector) && GBN_PPU_RVV
++#if defined(__riscv_vector)
+ #include <riscv_vector.h>
+ #endif
+ 
+@@ -109,3 +109,39 @@
+     else indexed_vector_body(layers, count, NULL, start, end, palette, output);
+ }
+ #endif
++
++#if defined(__riscv_vector)
++/* e32,m8 compares 32 aligned words per iteration at VLEN=128. Use returned
++ * VL so every byte is checked, including on a different legal vector length. */
++bool gbn_ppu_palette_equal_vector(const uint8_t* a, const uint8_t* b) {
++    for (unsigned i=0; i<128;) {
++        size_t vl=__riscv_vsetvl_e32m8(128-i);
++        vuint32m8_t av=__riscv_vle32_v_u32m8((const uint32_t*)(a+4*i),vl);
++        vuint32m8_t bv=__riscv_vle32_v_u32m8((const uint32_t*)(b+4*i),vl);
++        vbool4_t different=__riscv_vmsne_vv_u32m8_b4(av,bv,vl);
++        if (__riscv_vfirst_m_b4(different,vl)>=0) return false;
++        i+=(unsigned)vl;
++    }
++    return true;
++}
++
++/* Two byte planes become 32-bit table offsets. The 128 KiB table requires
++ * 17 offset bits; a 16-bit gather would wrap the upper half. */
++void gbn_ppu_pair_vector(const uint8_t* a, const uint8_t* b,
++        const uint16_t* table, uint16_t* output, unsigned count) {
++    for (unsigned i=0; i<count;) {
++        size_t vl=__riscv_vsetvl_e16m4(count-i);
++        vuint8m2_t av=__riscv_vle8_v_u8m2(a+i,vl);
++        vuint8m2_t bv=__riscv_vle8_v_u8m2(b+i,vl);
++        vuint16m4_t high=__riscv_vzext_vf2_u16m4(av,vl);
++        vuint16m4_t low=__riscv_vzext_vf2_u16m4(bv,vl);
++        high=__riscv_vsll_vx_u16m4(high,8,vl);
++        high=__riscv_vor_vv_u16m4(high,low,vl);
++        vuint32m8_t offsets=__riscv_vzext_vf2_u32m8(high,vl);
++        offsets=__riscv_vsll_vx_u32m8(offsets,1,vl);
++        vuint16m4_t colors=__riscv_vluxei32_v_u16m4(table,offsets,vl);
++        __riscv_vse16_v_u16m4(output+i,colors,vl);
++        i+=(unsigned)vl;
++    }
++}
++#endif
+--- a/src/gba-next/ppu.c
++++ b/src/gba-next/ppu.c
+@@ -2,6 +2,11 @@
+ #include "internal.h"
+ #include <string.h>
+ #include "ppu-internal.h"
++static bool ppu_pair_overlap(const void* av, size_t an, const void* bv, size_t bn) {
++    uintptr_t a=(uintptr_t)av,b=(uintptr_t)bv;
++    return a<=b ? b-a<an : a-b<bn;
++}
++
+ 
+ /* Decode backgrounds a scanline at a time. Transparent texels keep a separate
+  * bit so opaque RGB555 black remains visible. Only the closest two visible
+@@ -879,6 +884,8 @@
+     switch (count) { INDEX_CASE(0); INDEX_CASE(1); INDEX_CASE(2); INDEX_CASE(3); INDEX_CASE(4); }
+ #undef INDEX_CASE
+ }
++#include "ppu-pair-lookup.h"
++
+ static inline bool indexed_supported(const struct GbnDevices* d, unsigned mode) {
+     if (mode) return false;
+     unsigned control = d->io[0x50 / 2], alpha = d->io[0x52 / 2];
+@@ -920,16 +927,17 @@
+ static inline __attribute__((always_inline)) void indexed_range(
+         const struct GbnDevices* d,const struct IndexedBackground* layers,unsigned count,
+         const struct Pixel* obj,bool have_objects,unsigned object_bounds,
+-        unsigned start,unsigned end,unsigned mask,uint16_t backdrop,uint16_t* output) {
++        unsigned start,unsigned end,unsigned mask,uint16_t backdrop,uint16_t* output,
++        const uint16_t** pair) {
+     struct IndexedBackground visible[4];unsigned active=0;
+     for(unsigned i=0;i<count;++i)if(mask&layers[i].mask)visible[active++]=layers[i];
+     unsigned first=object_bounds&65535,last=object_bounds>>16;
+     if(have_objects && (mask&16) && first<end && last>start) {
+         unsigned a=first>start?first:start,b=last<end?last:end;
+-        if(start<a)indexed_span(visible,active,NULL,start,a,d->palette,backdrop,output);
+-        indexed_span(visible,active,obj,a,b,d->palette,backdrop,output);
+-        if(b<end)indexed_span(visible,active,NULL,b,end,d->palette,backdrop,output);
+-    }else indexed_span(visible,active,NULL,start,end,d->palette,backdrop,output);
++        if(start<a)indexed_pair_span(d,visible,active,NULL,start,a,backdrop,output,pair);
++        indexed_pair_span(d,visible,active,obj,a,b,backdrop,output,pair);
++        if(b<end)indexed_pair_span(d,visible,active,NULL,b,end,backdrop,output,pair);
++    }else indexed_pair_span(d,visible,active,NULL,start,end,backdrop,output,pair);
+ }
+ static __attribute__((noinline)) void indexed_line(struct GbnDevices* d, unsigned y, uint16_t* output) {
+     _Alignas(4) uint8_t storage[4][GBN_SCREEN_WIDTH + 8];
+@@ -962,11 +970,12 @@
+         }
+     }
+     uint16_t backdrop=half(d->palette,0)&0x7fff;
++    const uint16_t* pair = NULL;
+     if(!(d->io[0]&0x8000) || !have_objects) {
+         unsigned edges[6],count_edges=rectangle_edges(d,y,edges);
+         for(unsigned i=0;i+1<count_edges;++i)if(edges[i]<edges[i+1])
+             indexed_range(d,layers,count,obj,have_objects,object_bounds,
+-                edges[i],edges[i+1],rectangle_mask(d,edges[i],y),backdrop,output);
++                edges[i],edges[i+1],rectangle_mask(d,edges[i],y),backdrop,output,&pair);
+         return;
+     }
+     uint8_t masks[GBN_SCREEN_WIDTH];
+@@ -975,7 +984,7 @@
+         unsigned mask=masks[start],end=start+1;
+         if(uniform)end=240;
+         else while(end<240 && masks[end]==mask)++end;
+-        indexed_range(d,layers,count,obj,have_objects,object_bounds,start,end,mask,backdrop,output);
++        indexed_range(d,layers,count,obj,have_objects,object_bounds,start,end,mask,backdrop,output,&pair);
+         start=end;
+     }
+ }
+@@ -1079,6 +1088,7 @@
+ 			row[x] = (row[x] & ~0x3e0u) | (row[x + 1] & 0x3e0);
+ 			row[x + 1] = (row[x + 1] & ~0x3e0u) | green;
+ 		}
++		if (p->cache && ppu_pair_overlap(row, 480, p->cache, sizeof(*p->cache))) p->cache->pair_valid = false;
+ 		++p->lines; p->seen[y / 32] |= 1u << (y & 31);
+ 		if (y == 159 && p->seen[0] == UINT32_MAX && p->seen[1] == UINT32_MAX && p->seen[2] == UINT32_MAX && p->seen[3] == UINT32_MAX && p->seen[4] == UINT32_MAX) ++p->frames;
+ 	}

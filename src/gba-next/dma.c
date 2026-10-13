@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: MPL-2.0 */
 #include "internal.h"
 #include <stddef.h>
+#if GBN_DMA_STATS
+uint64_t gbn_dma_first_span_hits;
+#endif
 
 static uint32_t dma_raw_read(const uint8_t* data, unsigned width) {
 	uint32_t value = data[0];
@@ -184,16 +187,35 @@ static unsigned span_limit(const struct Gbn* m, uint32_t address, unsigned width
 	return a < b ? a : b;
 }
 
-/* The first beat still uses the general path (including late-start timing and
- * save-device notification). Continue a lone DMA only through raw aligned
+static enum GbnStatus dma_finish(struct Gbn* m,unsigned channel) {
+    struct GbnDevices* d=m->devices;
+    struct GbnDma* c=&d->dma[channel];
+		uint32_t when = c->when;
+		bool repeat = (c->control & 0x200) && (c->control & 0x3000);
+		if (channel == 3 && (c->control & 0x3000) == 0x3000 && d->io[3] == 161) repeat = false;
+		c->finishing = false;
+		c->fifo = false;
+		if (repeat) reload_count(d, channel);
+		else {
+			c->control &= ~0x8000u;
+			d->io[(0xba + channel * 12) / 2] &= ~0x8000u;
+		}
+		if ((c->control & 0x60) == 0x60) c->next_dest = c->dest;
+		if (c->control & 0x4000) gbn_irq_at(m, (uint16_t) (0x100u << channel), when);
+		select_dma(m);
+		return GBN_STEP;
+}
+
+/* Fuse a lone DMA, including its exact late first beat, through raw aligned
  * memory, strictly before any other event. Every bus beat still reads then
  * writes in order, including overlapping/fixed/decrementing transfers. */
 static __attribute__((noinline)) bool dma_span(struct Gbn* m, unsigned channel) {
 #if defined(__GNUC__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 	struct GbnDevices* d = m->devices;
 	struct GbnDma* c = &d->dma[channel];
-	if (!d->dma_blocked || c->finishing || c->remaining < 2 ||
-	    c->remaining == (c->fifo ? 4 : c->count) || (c->control & 0x800)) return false;
+    if (c->finishing || !c->remaining || (c->control & 0x800)) return false;
+    bool first = c->remaining == (c->fifo ? 4 : c->count);
+    if (!first && !d->dma_blocked) return false;
 	for (unsigned i = 0; i < 4; ++i) if (i != channel &&
 	    (d->dma[i].control & 0x8000) && (d->dma[i].remaining || d->dma[i].finishing)) return false;
 	unsigned width = c->fifo || (c->control & 0x400) ? 4 : 2;
@@ -210,16 +232,23 @@ static __attribute__((noinline)) bool dma_span(struct Gbn* m, unsigned channel) 
 	if (beats > limit) beats = limit;
 	limit = span_limit(m, dest, width, ds);
 	if (beats > limit) beats = limit;
-	unsigned elapsed = 2 + wait_cycles(m, source, width, true) + wait_cycles(m, dest, width, true);
-	unsigned other = m->event_head;
+    unsigned elapsed = 2 + wait_cycles(m, source, width, true) + wait_cycles(m, dest, width, true);
+    unsigned first_elapsed = first ? 2 + wait_cycles(m, source, width, false)
+        + wait_cycles(m, dest, width, false) : elapsed;
+    uint32_t when = first ? m->now : c->when;
+    unsigned other = m->event_head;
 	if (other == GBN_EVENT_DMA) other = m->event_next[other];
 	if (other < GBN_EVENT_COUNT) {
-		int32_t distance = (int32_t) (m->events[other].when - c->when);
-		if (distance <= 0) return false;
-		limit = ((uint32_t) distance - 1) / elapsed + 1;
+        int32_t distance = (int32_t) (m->events[other].when - when);
+        if (distance <= 0 || (uint32_t) distance <= first_elapsed) return false;
+        limit = ((uint32_t) distance - 1 - first_elapsed) / elapsed + 2;
 		if (beats > limit) beats = limit;
 	}
-	if (beats < 2) return false;
+    if(beats<2) {
+        /* A lone last beat is useful only when its release is also unobserved. */
+        if(beats!=1 || c->remaining!=1 || (other<GBN_EVENT_COUNT &&
+            (int32_t)(when+first_elapsed+2-m->events[other].when)>=0))return false;
+    }
 	uint32_t value = 0;
 	if (width == 4) {
 		for (unsigned i = 0; i < beats; ++i) {
@@ -234,20 +263,37 @@ static __attribute__((noinline)) bool dma_span(struct Gbn* m, unsigned channel) 
 		}
 		value = (uint32_t) half * 0x10001u;
 	}
-	uint32_t last = c->when + (beats - 1) * elapsed;
-	if ((int32_t) (last - m->now) > 0) m->now = last;
-	c->next_source += beats * (uint32_t) ss; c->next_dest += beats * (uint32_t) ds;
-	c->when += beats * elapsed; c->remaining -= beats;
+    if ((dest >> 24) == 7) gbn_ppu_invalidate_oam(m);
+
+    /* First beats begin at the observed CPU boundary, not the original
+     * requested timestamp, and retain nonsequential source/destination waits.
+     * Raw RAM/video destinations cannot notify the EEPROM DMA detector. */
+    uint32_t last = beats>1 ? when + first_elapsed + (beats - 2) * elapsed : when;
+    if ((int32_t) (last - m->now) > 0) m->now = last;
+    c->next_source += beats * (uint32_t) ss; c->next_dest += beats * (uint32_t) ds;
+    c->when = when + first_elapsed + (beats - 1) * elapsed; c->remaining -= beats;
+    d->dma_blocked = true;
 	c->latch = value; d->dma_bus = value; d->dma_bus_valid = true;
-	d->dma_pc = m->cpu.pc + (m->cpu.cpsr & 0x20 ? 2 : 4);
-	if (!c->remaining && (c->control & 0x8000)) {
+    d->dma_pc = m->cpu.pc + (m->cpu.cpsr & 0x20 ? 2 : 4);
+#if GBN_DMA_STATS
+    if(first)++gbn_dma_first_span_hits;
+#endif
+    if (!c->remaining && (c->control & 0x8000)) {
 		c->finishing = true;
 		/* Raw destinations are RAM/video; the bus release adds two cycles. */
 		c->when += 2;
 	}
 	gbn_cancel(m, GBN_EVENT_DMA);
-	gbn_schedule_at(m, GBN_EVENT_DMA, c->when, 0x40);
-	return true;
+    gbn_schedule_at(m, GBN_EVENT_DMA, c->when, 0x40);
+    /* The DMA event remains active while completing its normal finalizer,
+     * including IRQ scheduling and historical queue ties. Only advance to
+     * release when no other channel/event can observe that boundary first. */
+    if(c->finishing && (other>=GBN_EVENT_COUNT ||
+        (int32_t)(c->when-m->events[other].when)<0)) {
+        if((int32_t)(c->when-m->now)>0)m->now=c->when;
+        (void)dma_finish(m,channel);
+    }
+    return true;
 #else
 	(void) m; (void) channel;
 	return false;
@@ -259,26 +305,11 @@ enum GbnStatus gbn_dma_service(struct Gbn* m) {
 	if (!d || d->active_dma < 0) return GBN_INVALID_ARGUMENT;
 	unsigned channel = (unsigned) d->active_dma;
 	struct GbnDma* c = &d->dma[channel];
-	/* Keep finishing and IO transfers out of span setup. A CPU-started first
-	 * beat also bypasses it while DMA has not yet blocked the bus. */
-	if (d->dma_blocked && c->remaining > 1 && (c->next_dest >> 24) != 4 &&
-	    dma_span(m, channel)) return GBN_STEP;
-	if (c->finishing) {
-		uint32_t when = c->when;
-		bool repeat = (c->control & 0x200) && (c->control & 0x3000);
-		if (channel == 3 && (c->control & 0x3000) == 0x3000 && d->io[3] == 161) repeat = false;
-		c->finishing = false;
-		c->fifo = false;
-		if (repeat) reload_count(d, channel);
-		else {
-			c->control &= ~0x8000u;
-			d->io[(0xba + channel * 12) / 2] &= ~0x8000u;
-		}
-		if ((c->control & 0x60) == 0x60) c->next_dest = c->dest;
-		if (c->control & 0x4000) gbn_irq_at(m, (uint16_t) (0x100u << channel), when);
-		select_dma(m);
-		return GBN_STEP;
-	}
+	/* Keep IO transfers and empty/releasing channels out of raw span setup.
+	 * The span proves which first, sequential and release boundaries fit. */
+    if (c->remaining && (c->next_dest >> 24) != 4 &&
+        dma_span(m, channel)) return GBN_STEP;
+	if (c->finishing) return dma_finish(m,channel);
 	if (c->control & 0x800) return GBN_UNSUPPORTED_DEVICE; /* External cartridge DRQ. */
 	unsigned width = c->fifo || (c->control & 0x400) ? 4 : 2;
 	uint32_t source = c->next_source, dest = c->next_dest;
@@ -312,6 +343,7 @@ enum GbnStatus gbn_dma_service(struct Gbn* m) {
 	if (dest_pointer) {
 		uint32_t stored = width == 2 ? value >> ((dest & 2) * 8) : value;
 		for (unsigned i = 0; i < width; ++i) dest_pointer[i] = (uint8_t) (stored >> (8 * i));
+        if ((dest >> 24) == 7) gbn_ppu_invalidate_oam(m);
 		ignored = 0;
 		status = GBN_STEP;
 	} else {

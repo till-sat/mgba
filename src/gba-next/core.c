@@ -273,6 +273,9 @@ bool gbn_schedule(struct Gbn* m, unsigned id, uint32_t delay, uint8_t priority) 
 bool gbn_schedule_at(struct Gbn* m, unsigned id, uint32_t when, uint8_t priority) {
 	int32_t distance = (int32_t) (when - m->now);
 	if (id >= GBN_EVENT_COUNT || distance > (int32_t) GBN_MAX_DELAY || distance < -(int32_t) GBN_MAX_DELAY) return false;
+    if (!gbn_audio_regular_event(id, priority) ||
+            (id == GBN_EVENT_AUDIO && m->devices && m->devices->audio.pcm_detached))
+        gbn_audio_set_timeline(m, false);
 	int old = m->next_event;
 	bool was_next = old == (int) id;
 	bool linked = m->events[id].active;
@@ -300,6 +303,8 @@ select_cached:
 
 void gbn_cancel(struct Gbn* m, unsigned id) {
 	if (id >= GBN_EVENT_COUNT) return;
+    if (id == GBN_EVENT_AUDIO && m->devices && m->devices->audio.pcm_detached)
+        gbn_audio_set_timeline(m, false);
 	bool was_next = m->next_event == (int) id;
 	if (m->events[id].active) event_remove(m, id);
 	m->events[id].active = false;
@@ -1056,7 +1061,8 @@ static enum GbnStatus step_instruction(struct Gbn* m) {
 
 static enum GbnStatus step_boundary(struct Gbn* m) {
 	if (m->devices && (m->devices->dma_blocked || m->devices->halted || m->devices->stopped)) return GBN_EVENT;
-	if (event_due(m)) return GBN_EVENT;
+	int next=gbn_cpu_event(m);
+	if (next>=0 && (int32_t)(m->now-m->events[next].when)>=0) return GBN_EVENT;
 	if (bank(m->cpu.cpsr) < 0) return GBN_UNSUPPORTED_MODE;
 	return GBN_STEP;
 }

@@ -52,6 +52,7 @@ struct Input { uint32_t frame; uint16_t keys; };
 
 static struct Gbn machine;
 static struct GbnDevices devices;
+static struct GbnPpuCache ppu_cache;
 static struct GbnSave save;
 static uint8_t ewram[GBN_EWRAM_SIZE], iwram[GBN_IWRAM_SIZE];
 static uint8_t palette[GBN_PALETTE_SIZE], vram[GBN_VRAM_SIZE], oam[GBN_OAM_SIZE];
@@ -122,6 +123,7 @@ int main(void) {
 	gbn_init(&machine, ewram, iwram);
 	if (!gbn_attach_rom(&machine, _rom_start, rom_size) ||
 		!gbn_attach_devices(&machine, &devices, palette, vram, oam) ||
+		!gbn_attach_ppu_cache_tracked(&machine, &ppu_cache) ||
 		!gbn_attach_pixels(&machine, pixels, GBN_SCREEN_WIDTH)) return 1;
 	gbn_use_builtin_bios(&machine);
 	enum GbnSaveType save_type = gbn_detect_save(_rom_start, rom_size);
@@ -136,6 +138,8 @@ int main(void) {
 	if (gbn_enter_arm(&machine, 0x08000000) != GBN_STEP) return 1;
 	gbn_video_start(&machine, true);
 	gbn_audio_start(&machine);
+	gbn_audio_set_batched(&machine, true);
+    gbn_audio_set_timeline(&machine, true);
 #if GBN_RV32
 	if (!gbn_rv32_available()) return 1;
 	gbn_rv32_init(&backend, &machine);
@@ -169,13 +173,22 @@ int main(void) {
 	uint64_t cpu_retired = 0, event_retired = 0, validation_retired = 0, stamp;
 #endif
 	enum GbnStatus status = GBN_STEP;
+#if GBN_RV32 && GBN_RV32_STATS
+	uint64_t first_grouped_io = 0;
+#endif
 	for (;;) {
 		if (!measuring && completed == GBN_BENCH_WARMUP) {
 			first_instruction = instructions; first_cycle = cycles;
+#if GBN_RV32 && GBN_RV32_STATS
+			first_grouped_io = backend.fused_thumb_io_instructions;
+#endif
 #if GBN_BENCH_VALIDATE
 			first_samples = audio_samples;
 #endif
 			measuring = true;
+#ifdef AM_SPIKE
+			puts("GBN wall: begin");
+#endif
 			start_us = am_uptime_us();
 #ifdef GBN_PROFILE
 			am_profile_start();
@@ -197,6 +210,12 @@ int main(void) {
 		if (measuring) event_retired += am_counter_retired() - stamp;
 		stamp = am_counter_retired();
 #endif
+		/* Materialize pending PCM only at the picture boundary. The retained
+         * 32768-cycle PSG frame bounds any hidden span to at most 512 samples;
+         * FIFO changes also materialize before changing the output. Ordinary
+         * frontend reads keep consuming already materialized samples. */
+        if (devices.ppu.frames != completed || status != GBN_STEP)
+            gbn_audio_timeline_materialize(&machine);
 		drain_audio();
 #if GBN_HOST_STATS
 		if (measuring) validation_retired += am_counter_retired() - stamp;
@@ -222,6 +241,9 @@ int main(void) {
 				host_retired = am_counter_retired() - start_retired; host_cycles = am_counter_cycles() - start_cycles;
 #endif
 				elapsed_us = am_uptime_us() - start_us;
+#ifdef AM_SPIKE
+				puts("GBN wall: end");
+#endif
 				break;
 			}
 			if (!measuring && completed % 100 == 0) printf("GBN warmup: %" PRIu32 "/%u\n", completed, (unsigned) GBN_BENCH_WARMUP);
@@ -234,9 +256,9 @@ int main(void) {
 		stamp = am_counter_retired();
 #endif
 #if GBN_RV32
-		status = gbn_rv32_run_batch(&backend, 256, &batch);
+		status = gbn_rv32_run_batch(&backend, 4096, &batch);
 #else
-		status = gbn_run_batch(&machine, 256, &batch);
+		status = gbn_run_batch(&machine, 4096, &batch);
 #endif
 #if GBN_HOST_STATS
 		if (measuring) cpu_retired += am_counter_retired() - stamp;
@@ -259,6 +281,10 @@ int main(void) {
 	printf("GBN RV32 cache: segment_flushes=%" PRIu32 "; code_bytes=%" PRIu32 "\n", backend.cache_flushes, backend.code_used * 4);
 	printf("GBN RV32 chains: blocks=%" PRIu64 "\n", backend.chained_blocks);
 	printf("GBN RV32 fixed loops: merged_instructions=%" PRIu64 "\n", backend.merged_instructions);
+	printf("GBN RV32 grouped IO: total_instructions=%" PRIu64 "; measured_instructions=%" PRIu64 "\n",
+		backend.fused_thumb_io_instructions, backend.fused_thumb_io_instructions - first_grouped_io);
+	printf("GBN RV32 mixer: fused_instructions=%" PRIu64 "; fused_packets=%" PRIu64 "\n",
+		backend.fused_mixer_instructions, backend.fused_mixer_packets);
 	printf("GBN RV32 fallback: bios=%" PRIu64 "; ewram=%" PRIu64 "; iwram=%" PRIu64 "; rom_arm=%" PRIu64 "; rom_thumb=%" PRIu64 "\n",
 		backend.fallback_kind[0], backend.fallback_kind[1], backend.fallback_kind[2], backend.fallback_kind[3], backend.fallback_kind[4]);
 #endif

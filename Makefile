@@ -303,6 +303,15 @@ else ifneq ($(filter $(PLATFORM),spike spike_zve32x),)
 .PHONY: run-gba-next-bench
 run-gba-next-bench: $(GBN_BENCH_TARGET) $(SPIKE_PLUGIN)
 	$(SPIKE_COMMAND) --device=am_protosoc,0 "$<"
+GBN_WALL_CPU ?= 1
+.PHONY: measure-gba-next-spike
+measure-gba-next-spike: $(GBN_BENCH_TARGET) $(SPIKE_PLUGIN)
+	@test "$(GBN_VALIDATE):$(PROFILE):$(GBN_RV32_STATS)" = "0:0:0" || \
+		{ echo 'Use GBN_VALIDATE=0 PROFILE=0 GBN_RV32_STATS=0 for wall FPS.' >&2; exit 1; }
+	$(PYTHON) -u am/tools/gba_next_spike_wall.py --cpu "$(GBN_WALL_CPU)" \
+		--log "$(BUILD_DIR)/gba-next-spike-wall.log" \
+		--output "$(BUILD_DIR)/gba-next-spike-wall.json" \
+		-- $(SPIKE_COMMAND) --device=am_protosoc,0 "$<"
 else ifeq ($(PLATFORM),fpga)
 $(BUILD_DIR)/gba-next-bench.bin: $(GBN_BENCH_TARGET)
 	$(OBJCOPY) -O binary "$<" "$@"
@@ -473,6 +482,17 @@ $(BUILD_DIR)/gba-next-test: am/test/gba-next.c $(GBN_LIBRARY) $(CORE_LIBRARY) Ma
 
 .PHONY: test-gba-next
 test-gba-next: $(BUILD_DIR)/gba-next-test
+	"$(abspath $<)"
+
+# Compare eager/independent device clocks with the opt-in PCM timeline.
+$(BUILD_DIR)/gba-next-audio-timeline-test: am/test/gba-next-audio-timeline.c $(GBN_LIBRARY) Makefile $(BUILD_DIR)/.build-config
+	$(CC) $(GBN_CPPFLAGS) -Isrc/gba-next $(CPPFLAGS) $(PROJECT_CFLAGS) $(CFLAGS) $(LTO) \
+		-MMD -MP -MF "$@.d" -MT "$@" $< $(GBN_LIBRARY) $(LDFLAGS) $(LDLIBS) -o "$@"
+
+-include $(BUILD_DIR)/gba-next-audio-timeline-test.d
+
+.PHONY: test-gba-next-audio-timeline
+test-gba-next-audio-timeline: $(BUILD_DIR)/gba-next-audio-timeline-test
 	"$(abspath $<)"
 
 $(BUILD_DIR)/gba-next-ppu-test: am/test/gba-next-ppu.c $(GBN_LIBRARY) $(CORE_LIBRARY) Makefile $(BUILD_DIR)/.build-config

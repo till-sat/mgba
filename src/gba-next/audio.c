@@ -36,17 +36,18 @@ static void wave_rotate(struct Gbn* m, uint32_t steps) {
 	memcpy(wave, next, length / 2);
 }
 
-static void advance_channel(struct Gbn* m, unsigned id, uint32_t when) {
+static void advance_channel(struct Gbn* m, unsigned id, uint32_t when, bool powered) {
 	struct GbnPsgChannel* c = &m->devices->audio.psg[id];
 	int32_t elapsed = (int32_t) (when - c->updated);
 	if (elapsed < 0) return; /* Wave trigger has a 24-cycle startup delay. */
-	if (!master(m) || !c->enabled) { c->updated = when; return; }
+	if (!powered || !c->enabled) { c->updated = when; return; }
 	uint32_t total = c->remainder + (uint32_t) elapsed;
 	unsigned cycles = period(c, id);
-	uint32_t steps = total / cycles;
-	c->remainder = total % cycles;
 	c->updated = when;
-	if (!steps) return;
+    if (total < cycles) { c->remainder = total; return; }
+    uint32_t steps;
+    if (total - cycles < cycles) { steps = 1; c->remainder = total - cycles; }
+    else { steps = total / cycles; c->remainder = total % cycles; }
 	if (id < 2) c->phase = (uint8_t) ((c->phase + steps) & 7);
 	else if (id == 2) wave_rotate(m, steps);
 	else {
@@ -60,7 +61,18 @@ static void advance_channel(struct Gbn* m, unsigned id, uint32_t when) {
 }
 
 static void advance_all(struct Gbn* m, uint32_t when) {
-	for (unsigned id = 0; id < 4; ++id) advance_channel(m, id, when);
+    struct GbnAudio* a=&m->devices->audio;
+    if(a->psg_pending) {
+        uint32_t last=a->samples[(a->read+a->size-1)&(GBN_AUDIO_CAPACITY-1)].when;
+        a->psg_pending=false;
+        /* Preserve eager behavior even for an explicit out-of-order call. */
+        if((int32_t)(last-when)>0) advance_all(m,last);
+    }
+    bool powered = master(m);
+    advance_channel(m, 0, when, powered);
+    advance_channel(m, 1, when, powered);
+    advance_channel(m, 2, when, powered);
+    advance_channel(m, 3, when, powered);
 }
 
 static uint16_t mask(unsigned offset) {
@@ -216,9 +228,18 @@ static void write_byte(struct Gbn* m, unsigned offset, uint8_t value) {
 }
 
 void gbn_audio_write(struct Gbn* m, unsigned offset, unsigned width, uint32_t value) {
-	advance_all(m, m->now);
-	struct GbnAudio* a = &m->devices->audio;
-	if (offset >= 0xa0) {
+    if ((m->cpu_access || (m->devices->dma_access && m->devices->audio.pcm_detached))
+            && m->devices->audio.batched) gbn_audio_catchup(m);
+    struct GbnAudio* a = &m->devices->audio;
+    if (offset >= 0xa0) {
+        /* FIFO data does not alter PSG. Defer advancement to its next
+         * observation only while both periodic observers remain in the future.
+         * Overdue/cancelled clocks retain the original ordering exactly. */
+        if (!a->running || (!m->events[GBN_EVENT_AUDIO].active && !a->pcm_detached)
+                || !m->events[GBN_EVENT_AUDIO_FRAME].active
+                || (int32_t) (m->now - m->events[GBN_EVENT_AUDIO].when) >= 0
+                || (int32_t) (m->now - m->events[GBN_EVENT_AUDIO_FRAME].when) >= 0)
+            advance_all(m, m->now);
 		struct GbnFifo* f = &a->fifo[(offset - 0xa0) / 4];
 		for (unsigned i = 0; i < width; ++i) if (f->size < 32) {
 			f->data[(f->read + f->size) & 31] = (uint8_t) (value >> (8 * i));
@@ -226,17 +247,24 @@ void gbn_audio_write(struct Gbn* m, unsigned offset, unsigned width, uint32_t va
 		}
 		return;
 	}
+    advance_all(m, m->now);
 	if (offset >= 0x90) {
 		unsigned bank = master(m) ? !(m->devices->io[0x70 / 2] & 0x40) : 1;
 		for (unsigned i = 0; i < width; ++i) a->wave[bank * 16 + offset - 0x90 + i] = (uint8_t) (value >> (8 * i));
 		return;
 	}
 	unsigned old_interval = interval(m);
+    bool detached = a->pcm_detached;
 	for (unsigned i = 0; i < width; ++i) write_byte(m, offset + i, (uint8_t) (value >> (8 * i)));
 	if (a->running && old_interval != interval(m)) {
 		unsigned cycles = interval(m);
-		gbn_schedule_at(m, GBN_EVENT_AUDIO, (m->now & ~(cycles - 1u)) + cycles, 0x18);
+		if (detached) {
+            m->events[GBN_EVENT_AUDIO].when = (m->now & ~(cycles - 1u)) + cycles;
+            a->pcm_tie = false;
+        } else gbn_schedule_at(m, GBN_EVENT_AUDIO, (m->now & ~(cycles - 1u)) + cycles, 0x18);
 	}
+    if (a->pcm_detached && (m->devices->io[0x80 / 2] & 0xff00))
+        gbn_audio_timeline_restore(m);
 }
 
 void gbn_audio_start(struct Gbn* m) {
@@ -252,6 +280,7 @@ unsigned gbn_audio_rate(const struct Gbn* m) { return m->devices ? 16777216u / i
 
 unsigned gbn_audio_read(struct Gbn* m, struct GbnStereo* output, unsigned capacity) {
 	if (!m->devices || !output) return 0;
+    gbn_audio_timeline_materialize(m);
 	struct GbnAudio* a = &m->devices->audio;
 	unsigned count = a->size < capacity ? a->size : capacity;
 	for (unsigned i = 0; i < count; ++i) output[i] = a->samples[(a->read + i) & (GBN_AUDIO_CAPACITY - 1)];
@@ -261,6 +290,7 @@ unsigned gbn_audio_read(struct Gbn* m, struct GbnStereo* output, unsigned capaci
 }
 
 void gbn_audio_frame(struct Gbn* m, uint32_t when) {
+    gbn_audio_timeline_drain(m, when, false);
 	struct GbnAudio* a = &m->devices->audio;
 	advance_all(m, when);
 	if (master(m)) {
@@ -314,10 +344,17 @@ static int16_t pcm(int sample, unsigned bias) {
 void gbn_audio_service(struct Gbn* m, uint32_t when) {
 	struct GbnAudio* a = &m->devices->audio;
 	const uint16_t* io = m->devices->io;
-	advance_all(m, when);
+    bool defer=a->batched && a->running && !(io[0x80/2]&0xff00) &&
+        m->events[GBN_EVENT_AUDIO_FRAME].active &&
+        (int32_t)(m->events[GBN_EVENT_AUDIO_FRAME].when-when)>0;
+    if(!defer) advance_all(m,when);
+
 	int left = 0, right = 0;
 	if (master(m)) {
 		unsigned routing = io[0x80 / 2] >> 8;
+        /* Unrouted PSG contributes exactly zero. Oscillators and the frame
+         * sequencer still advance; FIFO PCM production is unchanged. */
+        if (routing) {
 		for (unsigned i = 0; i < 4; ++i) {
 			int sample = channel_sample(&a->psg[i], i);
 			if (routing & (1u << i)) right += sample;
@@ -326,6 +363,7 @@ void gbn_audio_service(struct Gbn* m, uint32_t when) {
 		unsigned shift = 4 - (io[0x82 / 2] & 3);
 		left = left * 8 * (1 + (io[0x80 / 2] >> 4 & 7)) >> shift;
 		right = right * 8 * (1 + (io[0x80 / 2] & 7)) >> shift;
+        }
 		for (unsigned i = 0; i < 2; ++i) {
 			int sample = a->fifo[i].sample * (io[0x82 / 2] & (4u << i) ? 4 : 2);
 			if (io[0x82 / 2] & (0x100u << (4 * i))) right += sample;
@@ -338,11 +376,67 @@ void gbn_audio_service(struct Gbn* m, uint32_t when) {
 	a->samples[slot].right = pcm(right, io[0x88 / 2] & 0x3ff);
 	a->samples[slot].when = when;
 	++a->produced;
+    if(defer) a->psg_pending=true;
 	gbn_schedule_at(m, GBN_EVENT_AUDIO, when + interval(m), 0x18);
+}
+
+
+#include "pcm-span-impl.h"
+#include "timeline-impl.h"
+
+void gbn_audio_sync(struct Gbn* m) {
+    gbn_audio_timeline_materialize(m);
+    if(!m || !m->devices || !m->devices->audio.psg_pending)return;
+    struct GbnAudio* a=&m->devices->audio;
+    advance_all(m,a->samples[(a->read+a->size-1)&(GBN_AUDIO_CAPACITY-1)].when);
+}
+
+void gbn_audio_set_batched(struct Gbn* m, bool enabled) {
+    if (!m || !m->devices) return;
+    if (!enabled && m->devices->audio.pcm_detached) gbn_audio_timeline_restore(m);
+    if (!enabled && m->devices->audio.batched) gbn_audio_catchup(m);
+    if(!enabled) gbn_audio_sync(m);
+    m->devices->audio.batched=enabled;
+}
+
+void gbn_audio_service_span(struct Gbn* m, uint32_t when) {
+    struct GbnAudio* a=&m->devices->audio;
+    const uint16_t* io=m->devices->io;
+    if(!a->batched || m->events[GBN_EVENT_AUDIO].priority!=0x18 ||
+            (master(m) && (io[0x80/2]&0xff00))) {
+        gbn_audio_service(m,when);return;
+    }
+    unsigned cycles=interval(m);
+    uint32_t last=m->now;
+    unsigned next=m->event_head;
+    if(next==GBN_EVENT_AUDIO) next=m->event_next[next];
+    if(next<GBN_EVENT_COUNT) {
+        const struct GbnEvent* other=&m->events[next];
+        bool audio_first=0x18<other->priority ||
+            (0x18==other->priority && GBN_EVENT_AUDIO<next);
+        uint32_t limit=other->when-(audio_first?0:1);
+        if((int32_t)(limit-last)<0) last=limit;
+    }
+    /* The selected audio event may own a historical tie, so always execute
+     * that one sample even if the canonical order would prefer its peer. */
+    unsigned count=(int32_t)(last-when)>0?1+(last-when)/cycles:1;
+    gbn_audio_service(m,when);
+    if(count==1)return;
+    struct GbnStereo value=a->samples[(a->read+a->size-1)&(GBN_AUDIO_CAPACITY-1)];
+    for(unsigned i=1;i<count;++i) {
+        if(a->size==GBN_AUDIO_CAPACITY) {
+            a->read=(a->read+1)&(GBN_AUDIO_CAPACITY-1);--a->size;++a->dropped;
+        }
+        unsigned slot=(a->read+a->size++)&(GBN_AUDIO_CAPACITY-1);
+        value.when=when+i*cycles;a->samples[slot]=value;++a->produced;
+    }
+    if(!a->psg_pending) advance_all(m,value.when);
+    gbn_schedule_at(m,GBN_EVENT_AUDIO,value.when+cycles,0x18);
 }
 
 void gbn_audio_timer(struct Gbn* m, unsigned timer, uint32_t when) {
 	if (timer > 1 || !master(m)) return;
+    gbn_audio_timeline_drain(m, when, true);
 	uint16_t control = m->devices->io[0x82 / 2];
 	for (unsigned i = 0; i < 2; ++i) {
 		if (!(control & (0x300u << (4 * i))) || ((control >> (10 + 4 * i)) & 1) != timer) continue;

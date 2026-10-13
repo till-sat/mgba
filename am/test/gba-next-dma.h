@@ -141,3 +141,43 @@ static void check_dma_spans(void) {
     }
     printf("PASS DMA span reference: %u cases, %u complete-state checkpoints; overlap, mirrors, video holes, ROM windows, fixed/decrement, host alignment, late start, clock wrap, priority ties and preemption\n",span_cases,span_checks);
 }
+
+static void check_dma_first_spans(void) {
+#if GBN_DMA_STATS
+    extern uint64_t gbn_dma_first_span_hits;
+    uint64_t before=gbn_dma_first_span_hits;
+#endif
+    unsigned initial=span_cases,initial_checks=span_checks;
+    const unsigned sources[]={2,3,8},dests[]={2,6};
+    for(unsigned src=0;src<3;++src)for(unsigned dst=0;dst<2;++dst)
+    for(unsigned w=0;w<2;++w)for(unsigned count=1;count<=8;++count)
+    for(unsigned cut=0;cut<5;++cut)for(unsigned late=0;late<3;++late)
+    for(unsigned wrap=0;wrap<2;++wrap) {
+        unsigned trial=span_cases++,width=w?4:2;
+        span_fixture_init(&span_a,trial,0);span_fixture_init(&span_b,trial,0);
+        span_a.m.now=span_b.m.now=wrap?0xfffffff0u:0;
+        span_configure(&span_a.m,3,(sources[src]<<24)|0x180,(dests[dst]<<24)|0x180,count,0xc000|(w<<10));
+        span_configure(&span_b.m,3,(sources[src]<<24)|0x180,(dests[dst]<<24)|0x180,count,0xc000|(w<<10));
+        unsigned delay=3+cut*7,priority=cut&1?0x40:0;
+        CHECK(gbn_schedule(&span_a.m,0,delay,priority));CHECK(gbn_schedule(&span_b.m,0,delay,priority));
+        span_a.m.now+=3+late*13;span_b.m.now+=3+late*13;
+        for(;;) {
+            enum GbnStatus a=gbn_service_events(&span_a.m),b=span_reference_events(&span_b.m);
+            CHECK(a==b);span_compare();
+            if(a!=GBN_STEP && a!=GBN_EVENT)break;
+            if(!span_a.m.events[GBN_EVENT_DMA].active)break;
+            CHECK(a==GBN_EVENT && span_a.m.next_event==0);
+            CHECK(gbn_take_event(&span_a.m,NULL)==0 && gbn_take_event(&span_b.m,NULL)==0);
+        }
+        CHECK(!memcmp(span_a.ew,span_b.ew,sizeof(span_a.ew)));
+        CHECK(!memcmp(span_a.iw,span_b.iw,sizeof(span_a.iw)));
+        CHECK(!memcmp(span_a.pal,span_b.pal,sizeof(span_a.pal)));
+        CHECK(!memcmp(span_a.vr,span_b.vr,sizeof(span_a.vr)));
+        CHECK(!memcmp(span_a.oa,span_b.oa,sizeof(span_a.oa)));
+    }
+#if GBN_DMA_STATS
+    CHECK(gbn_dma_first_span_hits-before>100);
+    printf("First DMA native fast-path hits: %llu\n",(unsigned long long)(gbn_dma_first_span_hits-before));
+#endif
+    printf("PASS DMA first-span reference: %u short-transfer cases, %u full-state checkpoints; raw ROM/two RAM sources, RAM/video destinations, first nonseq/seq costs, external cuts/ties, late starts and clock wrap\n",span_cases-initial,span_checks-initial_checks);
+}

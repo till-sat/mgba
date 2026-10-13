@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MPL-2.0 */
 /* Included by the RV32 differential test; actual emitted machine code. */
-_Alignas(4) static uint8_t open_bus_large_rom[0x1000000+32];
+#include "mixer-packet-rom-fixture.h"
 static uint32_t open_bus_arm(unsigned kind, unsigned rd, unsigned rn) {
     uint32_t code = 0xe1900000 | rn << 16 | rd << 12;
     if (kind == 3 || kind == 5 || kind == 7)
@@ -111,4 +111,158 @@ static void open_bus_stale_prefetch(void) {
     CHECK(gbn_enter_thumb(&machine,0x03000002)==GBN_STEP);
     compare_device_write(1,0x750002);
     puts("PASS native open-bus stale IWRAM prefetch: 3 comparisons; warm omitted tail, external write, old pipeline and refreshed entry");
+}
+
+static void immediate_io_reads(void) {
+    static const unsigned codes[]={0x6808,0x8808,0x7808};
+    static const unsigned regions[]={2,3,8};
+    unsigned before=comparisons;
+    setup();CHECK(gbn_attach_devices(&machine,&devices,palette,vram,oam));
+    for(unsigned i=0;i<sizeof(devices.io)/sizeof(*devices.io);++i)
+        devices.io[i]=(uint16_t)random_word();
+    /* Exercise the no-address-branch literal case on an open-bus DMA
+     * register; the helper must restore LHS before choosing the bus value. */
+    put16(0,0x4907);put16(2,0x6808);put32(32,0x040000d4);
+    CHECK(gbn_attach_rom(&machine,rom,sizeof(rom)));
+    machine.cpu.r[1]=0x02000000;machine.cpu.r[0]=random_word();
+    devices.dma_bus_valid=true;devices.dma_access=true;devices.dma_bus=random_word();
+    devices.dma_pc=0x08000006;machine.now=0xfffffff0;
+    CHECK(gbn_enter_thumb(&machine,0x08000000)==GBN_STEP);
+    compare_device_write(8,0x75f000);
+    /* Classify on cold entry, then reuse exactly that block with changed
+     * IO values, DMA selection, odd addresses and a different memory region.
+     * Sweep the interpreter's entire IO map rather than duplicate its table. */
+    for(unsigned bank=0;bank<3;++bank)for(unsigned kind=0;kind<3;++kind)
+    for(unsigned offset=0;offset<0x240;++offset) {
+        put16(0,codes[kind]);put16(2,0xbe00);put16(4,0x80ff);
+        memcpy(ewram,rom,16);memcpy(iwram,rom,16);
+        CHECK(gbn_attach_rom(&machine,rom,sizeof(rom)));
+        gbn_set_waitcnt(&machine,(uint16_t)(offset&1?0x4010:0));
+        for(unsigned trial=0;trial<6;++trial) {
+            machine.cpu.r[0]=random_word();machine.cpu.r[1]=0x04000000+offset;
+            if(trial==3)machine.cpu.r[1]^=1;
+            if(trial==4)machine.cpu.r[1]=0x02000100;
+            machine.cpu.cpsr=(random_word()&~63u)|63;machine.now=0xfffffff0;
+            devices.dma_access=trial==2;devices.dma_bus_valid=trial!=0;
+            devices.dma_bus=random_word();devices.dma_pc=(regions[bank]<<24)+(trial==1?2:6);
+            if(offset<sizeof(devices.io))devices.io[offset/2]=(uint16_t)random_word();
+            CHECK(gbn_enter_thumb(&machine,regions[bank]<<24)==GBN_STEP);
+            uint64_t native=backend.native_instructions;
+            compare_device_write(1,0x76000000|bank<<20|kind<<18|offset<<3|trial);
+            if(offset==0xd4 && (trial<3 || trial==5) && backend.native_instructions!=native+1) {
+                printf("IO native miss: bank=%u kind=%u trial=%u pc=%08x now=%u next=%d\n",
+                       regions[bank],kind,trial,machine.cpu.pc,machine.now,machine.next_event);
+                CHECK(backend.native_instructions==native+1);
+            }
+        }
+    }
+    printf("PASS immediate IO loads: %u comparisons; complete IO map, widths, live values, warm address changes, DMA latch/access/PC, RAM/ROM code and clock wrap\n",comparisons-before);
+}
+
+static void immediate_dma_writes(void) {
+    static const unsigned regions[]={2,3,8};
+    unsigned before=comparisons;
+    setup();CHECK(gbn_attach_devices(&machine,&devices,palette,vram,oam));
+    for(unsigned bank=0;bank<3;++bank)for(unsigned channel=0;channel<4;++channel)
+    for(unsigned dest=0;dest<2;++dest)for(unsigned literal=0;literal<2;++literal) {
+        /* Literal entry deliberately starts with a different base. The
+         * source/destination readback must retain its own visible bus PC. */
+        put16(0,literal?0x4907:0x6008);put16(2,literal?0x6008:0x680a);
+        put16(4,literal?0x680a:0xbe00);put16(6,0xbe00);
+        uint32_t address=0x040000b0+12*channel+4*dest;put32(32,address);
+        memcpy(ewram,rom,40);memcpy(iwram,rom,40);
+        CHECK(gbn_attach_rom(&machine,rom,sizeof(rom)));
+        for(unsigned trial=0;trial<4;++trial)for(unsigned cap=1;cap<4;++cap)
+        for(unsigned distance=0;distance<16;++distance) {
+            CHECK(gbn_attach_devices(&machine,&devices,palette,vram,oam));
+            memset(machine.events,0,sizeof(machine.events));machine.next_event=-1;
+            machine.cpu.r[0]=random_word();machine.cpu.r[1]=literal?0x02001000:address;
+            if(!literal && trial==3)machine.cpu.r[1]=0x040000b0+12*((channel+1)%4)+4*dest;
+            machine.cpu.cpsr=(random_word()&~63u)|63;machine.now=0xfffffff0;
+            gbn_set_waitcnt(&machine,(uint16_t)(trial&1?0x4010:0));
+            devices.dma_bus_valid=trial!=0;devices.dma_access=trial==2;
+            devices.dma_bus=random_word();devices.dma_pc=(regions[bank]<<24)+(literal?6:4);
+            devices.dma[channel].source=random_word();devices.dma[channel].dest=random_word();
+            devices.dma[channel].next_source=random_word();devices.dma[channel].next_dest=random_word();
+            devices.dma[channel].remaining=17;devices.dma[channel].control=0x8200;
+            CHECK(gbn_enter_thumb(&machine,regions[bank]<<24)==GBN_STEP);
+            CHECK(gbn_schedule(&machine,0,distance,1));
+            compare_device_write(cap,0x77000000|bank<<20|channel<<16|dest<<15|literal<<14|trial<<10|cap<<6|distance);
+        }
+    }
+    printf("PASS immediate DMA programming: %u comparisons; all address masks/channels, literal and entry bases, live readback, warm base changes and every event/cap cut\n",comparisons-before);
+}
+
+static void consecutive_io_prefetch(void) {
+    static const uint16_t waits[]={0,0x4000,0x4010,0x401c};
+    static const unsigned deadlines[]={0,1,2,3,4,5,8,13,21,64};
+    unsigned before=comparisons;
+    setup();CHECK(gbn_attach_devices(&machine,&devices,palette,vram,oam));
+    for(unsigned gap=0;gap<3;++gap) {
+        /* Mix programming, open-bus reads and stored/zero count reads.
+         * RAM and ROM loads between IO operations must break the proof. */
+        put16(0,0x6008);put16(2,0x680a);
+        put16(4,gap==1?0x6818:gap==2?0x4806:0x6048);
+        put16(6,0x684a);put16(8,0x688a);put16(10,0x680a);put16(12,0xbe00);
+        put32(32,0x02000100);
+        CHECK(gbn_attach_rom(&machine,rom,sizeof(rom)));
+        for(unsigned config=0;config<4;++config)for(unsigned queue=0;queue<20;++queue)
+        for(unsigned cap=0;cap<=6;++cap)for(unsigned event=0;event<10;++event) {
+            CHECK(gbn_attach_devices(&machine,&devices,palette,vram,oam));
+            memset(machine.events,0,sizeof(machine.events));machine.next_event=-1;
+            machine.cpu.r[0]=random_word();machine.cpu.r[1]=0x040000d4;
+            machine.cpu.r[2]=random_word();machine.cpu.r[3]=0x02000100;
+            machine.cpu.cpsr=(random_word()&~63u)|63;machine.now=0xfffffff0;
+            gbn_set_waitcnt(&machine,waits[config]);
+            devices.dma_access=queue&1;devices.dma_bus_valid=queue&2;
+            devices.dma_bus=random_word();devices.dma_pc=0x08000004+2*(queue%6);
+            CHECK(gbn_enter_thumb(&machine,0x08000000)==GBN_STEP);
+            machine.prefetched_pc=queue==18?0:queue==19?UINT32_MAX:0x08000003+queue;
+            CHECK(gbn_schedule(&machine,0,deadlines[event],1));
+            compare_device_write(cap,0x78000000|gap<<20|config<<16|queue<<10|cap<<5|event);
+        }
+    }
+    CHECK(backend.fused_thumb_io_instructions > 0);
+    printf("PASS consecutive IO prefetch: %u comparisons; queue alignment/range, RAM/ROM interruptions, waits, caps/events, DMA readback and clock wrap\n",comparisons-before);
+    printf("Grouped Thumb IO instructions: %llu\n", backend.fused_thumb_io_instructions);
+}
+
+static void grouped_io_boundaries(void) {
+    static const unsigned lengths[]={3,4,7,8,9};
+    static const unsigned caps[]={1,2,3,4,6,7,8,9,10,32};
+    static const unsigned times[]={0,1,2,3,4,5,6,7,8,13,14,15,16,17,24,64};
+    static const uint16_t ops[]={0x6008,0x680a,0x604a,0x6848,0x688a};
+    unsigned before=comparisons;
+    setup();CHECK(gbn_attach_devices(&machine,&devices,palette,vram,oam));
+    for(unsigned l=0;l<5;++l)for(unsigned channel=0;channel<4;++channel)
+    for(unsigned literal=0;literal<2;++literal) {
+        unsigned n=lengths[l];uint32_t base=0x040000b0+channel*12;
+        if(literal)put16(0,0x490f);
+        for(unsigned i=0;i<n;++i)put16(2*(i+literal),ops[i%5]);
+        put16(2*(n+literal),0xbe00);put32(64,base);
+        CHECK(gbn_attach_rom(&machine,rom,sizeof(rom)));
+        for(unsigned config=0;config<2;++config)for(unsigned trial=0;trial<4;++trial)
+        for(unsigned c=0;c<10;++c)for(unsigned t=0;t<16;++t) {
+            CHECK(gbn_attach_devices(&machine,&devices,palette,vram,oam));
+            memset(machine.events,0,sizeof(machine.events));machine.next_event=-1;
+            machine.cpu.r[0]=random_word();machine.cpu.r[2]=random_word();
+            machine.cpu.r[1]=trial==1?0x040000b0+12*((channel+1)%4):base+(trial==2);
+            machine.cpu.cpsr=(random_word()&~63u)|63;machine.now=trial&1?0xfffffff0:0;
+            gbn_set_waitcnt(&machine,config?0x4010:0x4000);
+            devices.dma_access=trial==3;devices.dma_bus_valid=trial!=0;
+            devices.dma_bus=random_word();devices.dma_pc=0x08000000+2*(literal+t%(n+1));
+            devices.dma[channel].source=random_word();devices.dma[channel].dest=random_word();
+            devices.dma[channel].next_source=random_word();devices.dma[channel].next_dest=random_word();
+            devices.dma[channel].remaining=17;devices.dma[channel].control=0x8200;
+            devices.io[(base-0x04000000+10)/2]=0x8200;
+            CHECK(gbn_enter_thumb(&machine,0x08000000)==GBN_STEP);
+            machine.prefetched_pc=0x08000004+2*literal+7*(trial%3);
+            CHECK(gbn_schedule(&machine,0,times[t],1));
+            uint64_t grouped=backend.fused_thumb_io_instructions;
+            compare_device_write(caps[c],0x79000000|l<<20|channel<<18|literal<<17|config<<16|trial<<12|c<<6|t);
+            if(trial==0 && !literal && caps[c]>=n && times[t]==64)
+                CHECK(backend.fused_thumb_io_instructions>=grouped+(n==9?8:n));
+        }
+    }
+    printf("PASS grouped IO boundaries: %u comparisons;3..9 operations,all DMA channels,read-to-store dependencies,literal/warm base changes,misalignment,queue endpoints,cap/event cuts and wrap\n",comparisons-before);
 }

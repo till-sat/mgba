@@ -1,0 +1,106 @@
+{
+  "purpose": "Preserve optional VLEN=128 RVV experiments at user request; hardware performance not measured to completion. No change to active scalar PPU.",
+  "variants": {
+    "pair": {
+      "source_evidence": "build/gba-next/ppu-pair-vector-20261012",
+      "patch_sha256": "d0fa5a4b4d9b30fcfe564dac21b23f78964005b50972989b21c73f7c7c37147f",
+      "applies_to_current_worktree": true,
+      "files": [
+        {
+          "path": "am/test/gba-next-ppu-pair.c",
+          "base_sha256": null,
+          "candidate_sha256": "0d9206feac951b560c67ffc3e72e08dfd86371b79e124fe086fc3333ebd1c8e2"
+        },
+        {
+          "path": "include/gba-next/core.h",
+          "base_sha256": "66774bfd4e1fe4083e0dffae52d9e8cd2ad0b9fb6732121b66228ab47c5af48f",
+          "candidate_sha256": "542ecdb9567e22706ea1f81959304dca67f9f49a1e82f0086c2565e86e179ffd"
+        },
+        {
+          "path": "src/gba-next/ppu-internal.h",
+          "base_sha256": "6daf870efd3535335673aefb08294550005846e2ee8e00de59ba0a33e5420935",
+          "candidate_sha256": "5dc6ffcd12de02c03d520bf61a3a3962d883fb2bcbe65fda76be0569852bda1f"
+        },
+        {
+          "path": "src/gba-next/ppu-pair-lookup.h",
+          "base_sha256": null,
+          "candidate_sha256": "4caf0e3fa04ade3a2430ebb82276f0f6b42f1ad117e3180699a78e46d325b7e1"
+        },
+        {
+          "path": "src/gba-next/ppu-rvv.c",
+          "base_sha256": "565de1700b5a00e1d1e408b91f1a4e1d1fa2d8cde2ad5fa5fb7814ef4766ba58",
+          "candidate_sha256": "ef7474fad6b563b973070bcfba40bcf2642f77d02d7b1591dfd92a23e28b54ff"
+        },
+        {
+          "path": "src/gba-next/ppu.c",
+          "base_sha256": "b13b1509fea9cab8b1dea8fd80e6a3b1b97bd8e8ec7df377c5caa3526cfb1fcc",
+          "candidate_sha256": "ac2a0d9b6aca3fd5996222cca778d0c8abe864c68662519a64ef1912a5d3717d"
+        }
+      ]
+    },
+    "packed": {
+      "source_evidence": "build/gba-next/ppu-packed-pair-20261012",
+      "patch_sha256": "79d3082d0634d1bcca0c04188e1e4925cae5bcbca7af8278860fb011a95d06da",
+      "applies_to_current_worktree": true,
+      "files": [
+        {
+          "path": "am/test/gba-next-ppu-pair.c",
+          "base_sha256": null,
+          "candidate_sha256": "dc48805d8c468dd5f97b3cc0e48a5b84c6eab27da3a4953a30d67a63df654d7e"
+        },
+        {
+          "path": "src/gba-next/ppu-internal.h",
+          "base_sha256": "6daf870efd3535335673aefb08294550005846e2ee8e00de59ba0a33e5420935",
+          "candidate_sha256": "e4bd360aa3f08299dd6e4c4f51b514997847bf86667666d8271dfb1452ec6432"
+        },
+        {
+          "path": "src/gba-next/ppu-packed-pair.h",
+          "base_sha256": null,
+          "candidate_sha256": "141a31c5cf80787e45302b2cfee290d3a2013d780fb4af4b701fc8dc84d34708"
+        },
+        {
+          "path": "src/gba-next/ppu-rvv.c",
+          "base_sha256": "565de1700b5a00e1d1e408b91f1a4e1d1fa2d8cde2ad5fa5fb7814ef4766ba58",
+          "candidate_sha256": "52f4e0733da9bb280b61b4c50d3321469f2e190e71c0435fb5c43b8d9fc8aefe"
+        },
+        {
+          "path": "src/gba-next/ppu.c",
+          "base_sha256": "b13b1509fea9cab8b1dea8fd80e6a3b1b97bd8e8ec7df377c5caa3526cfb1fcc",
+          "candidate_sha256": "22b2d7a25ffa3a4c8664d3093eb57eb4d077d6e13fd37d90dd4eebea526572bb"
+        }
+      ]
+    },
+    "packed-swar": {
+      "source_evidence": "build/gba-next/ppu-packed-swar-20261012",
+      "patch_sha256": "8140976bf46e1c9e81df0f37559f9b8249dd033e9f1f551b17af8d1e67cb0814",
+      "applies_to_current_worktree": true,
+      "files": [
+        {
+          "path": "am/test/gba-next-ppu-pair.c",
+          "base_sha256": null,
+          "candidate_sha256": "dc48805d8c468dd5f97b3cc0e48a5b84c6eab27da3a4953a30d67a63df654d7e"
+        },
+        {
+          "path": "src/gba-next/ppu-internal.h",
+          "base_sha256": "6daf870efd3535335673aefb08294550005846e2ee8e00de59ba0a33e5420935",
+          "candidate_sha256": "e4bd360aa3f08299dd6e4c4f51b514997847bf86667666d8271dfb1452ec6432"
+        },
+        {
+          "path": "src/gba-next/ppu-packed-pair.h",
+          "base_sha256": null,
+          "candidate_sha256": "141a31c5cf80787e45302b2cfee290d3a2013d780fb4af4b701fc8dc84d34708"
+        },
+        {
+          "path": "src/gba-next/ppu-rvv.c",
+          "base_sha256": "565de1700b5a00e1d1e408b91f1a4e1d1fa2d8cde2ad5fa5fb7814ef4766ba58",
+          "candidate_sha256": "c72510b258ecf86ba6c3251f92c2b3033f8316cc537c5adb392e5d740d19138c"
+        },
+        {
+          "path": "src/gba-next/ppu.c",
+          "base_sha256": "b13b1509fea9cab8b1dea8fd80e6a3b1b97bd8e8ec7df377c5caa3526cfb1fcc",
+          "candidate_sha256": "22b2d7a25ffa3a4c8664d3093eb57eb4d077d6e13fd37d90dd4eebea526572bb"
+        }
+      ]
+    }
+  }
+}

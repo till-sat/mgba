@@ -6,7 +6,11 @@
 #ifndef GBN_PPU_RVV
 #define GBN_PPU_RVV 0
 #endif
-struct Pixel { uint16_t color; uint8_t key, layer; bool alpha; };
+/* One aligned word keeps the color, priority and effect metadata together. */
+struct Pixel { uint16_t color; uint8_t key; uint8_t layer : 7; bool alpha : 1; }
+    __attribute__((aligned(4)));
+_Static_assert(sizeof(struct Pixel) == 4, "Pixel must occupy one word");
+_Static_assert(_Alignof(struct Pixel) == 4, "Pixel arrays must support word stores");
 #define TRANSPARENT 0x8000u
 struct Background { const uint16_t* colors; uint8_t key, layer, mask; };
 struct IndexedBackground { const uint8_t* indices; uint8_t key, layer, mask; };
