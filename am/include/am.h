@@ -10,6 +10,15 @@
 extern "C" {
 #endif
 
+/* proto-soc's wide on-chip SRAM (0x0e000000, 256 KiB, cached like SDRAM but
+ * refilled much faster): AM_WSRAM places zero-initialized data there on
+ * platforms built with AM_HAS_WSRAM (fpga, sim); elsewhere it is .bss. */
+#ifdef AM_HAS_WSRAM
+#define AM_WSRAM __attribute__((section(".wsram"), aligned(64)))
+#else
+#define AM_WSRAM
+#endif
+
 /* Logical buttons, independent of keyboard codes, GPIO pins, and emulator keys. */
 enum am_button {
 	AM_BUTTON_UP     = 1u << 0,

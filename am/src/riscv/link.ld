@@ -1,7 +1,11 @@
 /* SPDX-License-Identifier: MPL-2.0 */
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
-MEMORY { ram (rwx) : ORIGIN = 0xa0000000, LENGTH = 64M }
+MEMORY {
+    ram (rwx) : ORIGIN = 0xa0000000, LENGTH = 64M
+    /* proto-soc's wide SRAM, in the D-cache's window (am.h AM_WSRAM) */
+    wsram (rw) : ORIGIN = 0x0e000000, LENGTH = 256K
+}
 PHDRS {
     text PT_LOAD FLAGS(5);
     rodata PT_LOAD FLAGS(4);
@@ -37,4 +41,12 @@ SECTIONS {
         _trap_stack_top = .;
     } > ram :data
     ASSERT(_heap_start + 8M <= _heap_end, "Image leaves less than 8 MiB for the heap")
+    /* Not loaded and in no program header (the binary image stays in SDRAM);
+     * start.S zeroes it like .bss. Empty unless a platform defines AM_HAS_WSRAM. */
+    .wsram (NOLOAD) : ALIGN(64) {
+        _wsram_start = .;
+        *(.wsram .wsram.*)
+        . = ALIGN(16);
+        _wsram_end = .;
+    } > wsram :NONE
 }

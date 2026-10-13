@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MPL-2.0
 # Load a headless benchmark into volatile SDRAM through Boot ROM recovery.
 PLATFORM_MAKEFILE := am/platform/fpga.mk
-AM_RUNNER_FLAGS := -DAM_FPGA
+AM_RUNNER_FLAGS := -DAM_FPGA -DAM_HAS_WSRAM
 HEADLESS ?= 1
 AUDIO ?= 0
 BENCHMARK ?= 1

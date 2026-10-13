@@ -12,9 +12,9 @@ PLATFORM_MAKEFILE := am/platform/sim.mk
 # timed image, identical to PLATFORM=fpga.
 SIM_MEDIA ?= 0
 ifeq ($(SIM_MEDIA),1)
-AM_RUNNER_FLAGS := -DAM_SIM_MEDIA
+AM_RUNNER_FLAGS := -DAM_SIM_MEDIA -DAM_HAS_WSRAM
 else
-AM_RUNNER_FLAGS := -DAM_FPGA
+AM_RUNNER_FLAGS := -DAM_FPGA -DAM_HAS_WSRAM
 endif
 # The core checkout whose sim/soc builds refsim-soc (its SoC model is
 # sim/src/protosoc.c of the same tree). Required, no default.

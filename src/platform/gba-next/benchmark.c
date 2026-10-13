@@ -57,10 +57,15 @@ static struct Gbn machine;
 static struct GbnDevices devices;
 static struct GbnPpuCache ppu_cache;
 static struct GbnSave save;
-static uint8_t ewram[GBN_EWRAM_SIZE], iwram[GBN_IWRAM_SIZE];
-static uint8_t palette[GBN_PALETTE_SIZE], vram[GBN_VRAM_SIZE], oam[GBN_OAM_SIZE];
+#if GBN_WSRAM
+#define GBN_FAST_RAM AM_WSRAM
+#else
+#define GBN_FAST_RAM
+#endif
+static uint8_t ewram[GBN_EWRAM_SIZE], iwram[GBN_IWRAM_SIZE] GBN_FAST_RAM;
+static uint8_t palette[GBN_PALETTE_SIZE] GBN_FAST_RAM, vram[GBN_VRAM_SIZE] GBN_FAST_RAM, oam[GBN_OAM_SIZE] GBN_FAST_RAM;
 static uint8_t save_data[GBN_SAVE_MAX_SIZE];
-static uint16_t pixels[GBN_SCREEN_WIDTH * GBN_SCREEN_HEIGHT];
+static uint16_t pixels[GBN_SCREEN_WIDTH * GBN_SCREEN_HEIGHT] GBN_FAST_RAM;
 #if GBN_BENCH_VALIDATE
 static uint32_t crc_table[256];
 static uint32_t video_crc = UINT32_MAX, audio_crc = UINT32_MAX;

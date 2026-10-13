@@ -22,7 +22,13 @@ _start:
     sw zero, 0(t0)
     addi t0, t0, 4
     j 1b
-2:  call am_platform_boot
+2:  la t0, _wsram_start
+    la t1, _wsram_end
+4:  bgeu t0, t1, 5f
+    sw zero, 0(t0)
+    addi t0, t0, 4
+    j 4b
+5:  call am_platform_boot
     call main
     call exit
 3:  j 3b
