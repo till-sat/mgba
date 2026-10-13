@@ -54,7 +54,9 @@ static bool hblank_observed(const struct GbnDevices* d) {
  * for the next transition, as on hardware). */
 void gbn_hblank_observe(struct Gbn* m) {
 	struct GbnDevices* d = m->devices;
-	if (!d || !d->hblank_merged || !hblank_observed(d) || (int32_t) (m->now - (d->line_when + 1008)) >= 0) return;
+	if (!d) return;
+	d->hblank_seen = hblank_observed(d);
+	if (!d->hblank_merged || !d->hblank_seen || (int32_t) (m->now - (d->line_when + 1008)) >= 0) return;
 	d->hblank_merged = false;
 	gbn_schedule_at(m, GBN_EVENT_VIDEO, d->line_when + 1008, 8);
 }
@@ -227,7 +229,7 @@ enum GbnStatus gbn_service_events(struct Gbn* m) {
 			} else if (d->io[VCOUNT] == 227) d->io[DISPSTAT] &= ~1u;
 #if GBN_RV32_FAST & 65536
 			d->line_when = when;
-			if (!hblank_observed(d)) {
+			if (!d->hblank_seen) {
 				d->hblank_merged = true;
 				gbn_schedule_at(m, GBN_EVENT_VIDEO, when + 1232, 8);
 				continue;

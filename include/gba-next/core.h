@@ -176,6 +176,7 @@ struct GbnDevices {
 	/* The current line's HBlank start had no event (nothing observes it);
 	 * line_when is the line's start, its HBlank begins 1008 cycles later. */
 	bool hblank_merged;
+	bool hblank_seen; /* hblank_observed(), refreshed by DISPSTAT/IE/DMA control writes */
 	uint32_t line_when;
 #endif
 #endif
