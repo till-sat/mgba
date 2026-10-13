@@ -38,6 +38,28 @@ void gbn_irq_at(struct Gbn* m, uint16_t mask, uint32_t when) {
 	gbn_update_irq(m, when);
 }
 
+#if GBN_RV32_FAST & 65536
+/* HBlank start needs its own event only for an enabled HBlank interrupt
+ * (it can also end a halt) or an HBlank/video-capture DMA. */
+static bool hblank_observed(const struct GbnDevices* d) {
+	if ((d->io[DISPSTAT] & 0x10) && (d->io[IE] & 2)) return true;
+	for (unsigned i = 0; i < 4; ++i) {
+		unsigned timing = d->dma[i].control >> 12 & 3;
+		if ((d->dma[i].control & 0x8000) && (timing == 2 || (i == 3 && timing == 3))) return true;
+	}
+	return false;
+}
+/* A write may have made the current line's HBlank observable: give it back
+ * its event unless the HBlank has already begun (a new request then waits
+ * for the next transition, as on hardware). */
+void gbn_hblank_observe(struct Gbn* m) {
+	struct GbnDevices* d = m->devices;
+	if (!d || !d->hblank_merged || !hblank_observed(d) || (int32_t) (m->now - (d->line_when + 1008)) >= 0) return;
+	d->hblank_merged = false;
+	gbn_schedule_at(m, GBN_EVENT_VIDEO, d->line_when + 1008, 8);
+}
+#endif
+
 void gbn_request_irq(struct Gbn* m, uint16_t mask) {
 	if (m->devices) gbn_irq_at(m, mask, m->now);
 }
@@ -152,6 +174,9 @@ enum GbnStatus gbn_service_events(struct Gbn* m) {
 #if GBN_RV32_FAST & 2048
 			/* Lines that had no HBlank this frame (video started mid-frame)
 			 * are not drawn, as before. */
+#if GBN_RV32_FAST & 65536
+			if (d->ppu_due == d->io[VCOUNT] + 1) {} else /* marked by a write in its HBlank */
+#endif
 			if (d->ppu_due != d->io[VCOUNT]) {
 				enum GbnStatus status = gbn_ppu_catchup(m);
 				if (status != GBN_STEP) return status;
@@ -165,7 +190,13 @@ enum GbnStatus gbn_service_events(struct Gbn* m) {
 		}
 		gbn_cancel(m, GBN_EVENT_VIDEO);
 		if (!d->video_running) continue;
-		if (!(d->io[DISPSTAT] & 2)) {
+		bool merged = false;
+#if GBN_RV32_FAST & 65536
+		merged = d->hblank_merged;
+		d->hblank_merged = false;
+		if (merged && (d->io[DISPSTAT] & 0x10)) gbn_irq_at(m, 2, when); /* masked in IE */
+#endif
+		if (!(d->io[DISPSTAT] & 2) && !merged) {
 			d->io[DISPSTAT] |= 2;
 			/* The reference LCD interrupt path becomes visible to the IRQ
 			 * controller six cycles after the HBlank status transition. */
@@ -194,6 +225,14 @@ enum GbnStatus gbn_service_events(struct Gbn* m) {
 				gbn_dma_trigger(m, 1, when);
 				if (d->io[DISPSTAT] & 8) gbn_irq_at(m, 1, when);
 			} else if (d->io[VCOUNT] == 227) d->io[DISPSTAT] &= ~1u;
+#if GBN_RV32_FAST & 65536
+			d->line_when = when;
+			if (!hblank_observed(d)) {
+				d->hblank_merged = true;
+				gbn_schedule_at(m, GBN_EVENT_VIDEO, when + 1232, 8);
+				continue;
+			}
+#endif
 			gbn_schedule_at(m, GBN_EVENT_VIDEO, when + 1008, 8);
 		}
 	}
@@ -221,6 +260,10 @@ static uint16_t io_read(const struct Gbn* m, uint32_t offset) {
 	if ((offset >= 0x10 && offset < 0x48) || offset == 0x4c || offset == 0x4e || (offset >= 0x54 && offset < 0x60)) {
 		return (uint16_t) gbn_open_bus(m);
 	}
+#if GBN_RV32_FAST & 65536
+	if (offset == 4 && m->devices->hblank_merged && (int32_t) (m->now - (m->devices->line_when + 1008)) >= 0)
+		return m->devices->io[DISPSTAT] | 2;
+#endif
 	return offset == 0x204 ? m->waitcnt : m->devices->io[offset / 2];
 }
 
@@ -260,6 +303,9 @@ static void io_write(struct Gbn* m, uint32_t offset, uint16_t value, uint16_t ma
 	case 4:
 		io[DISPSTAT] = (old & 7) | (value & 0xff38);
 		vcount_match(m, m->now);
+#if GBN_RV32_FAST & 65536
+		gbn_hblank_observe(m);
+#endif
 		return;
 	case 6: case 0x130: return; /* Read-only. */
 	case 8: case 10: value &= 0xdfff; break;
@@ -277,6 +323,9 @@ static void io_write(struct Gbn* m, uint32_t offset, uint16_t value, uint16_t ma
 	io[offset / 2] = value;
 	if ((offset >= 0x28 && offset < 0x30) || (offset >= 0x38 && offset < 0x40)) gbn_ppu_reference(m, offset);
 	if (offset == 0x200 || offset == 0x208) gbn_update_irq(m, m->now);
+#if GBN_RV32_FAST & 65536
+	if (offset == 0x200) gbn_hblank_observe(m);
+#endif
 	if (offset == 0x132) check_keys(m);
 }
 

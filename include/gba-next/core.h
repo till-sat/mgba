@@ -172,6 +172,12 @@ struct GbnDevices {
 	struct GbnPpu ppu;
 #if GBN_RV32_FAST & 2048
 	uint8_t ppu_due, ppu_drawn; /* catch-up rendering: lines whose HBlank passed, lines drawn */
+#if GBN_RV32_FAST & 65536
+	/* The current line's HBlank start had no event (nothing observes it);
+	 * line_when is the line's start, its HBlank begins 1008 cycles later. */
+	bool hblank_merged;
+	uint32_t line_when;
+#endif
 #endif
 };
 

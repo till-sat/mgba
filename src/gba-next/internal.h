@@ -102,10 +102,21 @@ static inline void gbn_vram_written(struct GbnDevices* d, uint32_t lo, uint32_t 
 #if GBN_RV32_FAST & 2048
 /* Draw the lines whose HBlank has passed (devices.c). */
 enum GbnStatus gbn_ppu_catchup(struct Gbn*);
+#if GBN_RV32_FAST & 65536
+void gbn_hblank_observe(struct Gbn*); /* after DISPSTAT, IE or DMA control writes */
+#endif
 /* Before a write at address (width bytes, any region) that may change a line
  * not yet drawn: video memory, display registers, or DMA into them. */
 static inline void gbn_ppu_before_write(struct Gbn* m, uint32_t address) {
 	unsigned region = address >> 24;
+#if GBN_RV32_FAST & 65536
+	/* A merged line becomes due at its HBlank start, without an event. */
+	struct GbnDevices* d = m->devices;
+	if (d && d->hblank_merged && d->io[3] < 160 && d->ppu_due == d->io[3] &&
+	    (int32_t) (m->now - (d->line_when + 1008)) >= 0 &&
+	    ((region >= 5 && region <= 7) || (region == 4 && (address & 0xffffff) < 0x60)))
+		d->ppu_due = (uint8_t) (d->io[3] + 1); /* io[3] = VCOUNT */
+#endif
 	if (m->devices && m->devices->ppu_drawn < m->devices->ppu_due &&
 	    ((region >= 5 && region <= 7) || (region == 4 && (address & 0xffffff) < 0x60)))
 		(void) gbn_ppu_catchup(m);

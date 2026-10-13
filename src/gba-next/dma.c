@@ -98,6 +98,9 @@ void gbn_dma_write(struct Gbn* m, unsigned offset, uint16_t value) {
 	bool was_enabled = (c->control & 0x8000) != 0;
 	c->control = value & (channel == 3 ? 0xffe0 : 0xf7e0);
 	d->io[offset / 2] = c->control;
+#if GBN_RV32_FAST & 65536
+	gbn_hblank_observe(m);
+#endif
 	if (!(c->control & 0x8000)) {
 		c->remaining = 0; c->finishing = false; c->fifo = false;
 		select_dma(m);
