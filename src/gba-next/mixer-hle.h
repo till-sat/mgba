@@ -19,7 +19,12 @@ static bool mixer_head_at(const struct Gbn* m, uint32_t pc) {
 	uint32_t offset = pc & (GBN_IWRAM_SIZE - 1);
 	if (offset > GBN_IWRAM_SIZE - MIXER_HEAD_BYTES) return false;
 	const uint8_t* code = m->iwram + offset;
-	return !memcmp(code, mixer_head_ops, 8) && !memcmp(code + 8, mixer_packet_ops, sizeof(mixer_packet_ops));
+	if (memcmp(code, mixer_head_ops, 8)) return false;
+#if defined(AM_RVV) && (GBN_PPU_RVV & 8)
+	return gbn_rvv_equal(code + 8, (const uint8_t*) mixer_packet_ops, sizeof(mixer_packet_ops));
+#else
+	return !memcmp(code + 8, mixer_packet_ops, sizeof(mixer_packet_ops));
+#endif
 }
 
 /* Bytewise add without carries between lanes (the guest's top-byte adds). */
@@ -74,7 +79,45 @@ static __attribute__((noinline)) uint32_t mixer_hle(struct Gbn* m) {
 		word_r = sh ? r[6] << sh | r[6] >> (32 - sh) : r[6];
 		word_l = sh ? r[7] << sh | r[7] >> (32 - sh) : r[7];
 	}
+	/* r0/r1 are the sample bytes around r3 - 1 (loop invariant, also kept
+	 * below); then every sample of a word follows from its position alone. */
+	bool positional = q >= 1 && (int8_t) rom[q - 1] == s && (int8_t) rom[q] == s + d;
 	while ((int32_t) (now - deadline) < 0) {
+		if (at_head && positional) {
+			/* Whole word with independent samples (no position chain). */
+			uint32_t x1 = lr + step, x2 = x1 + step, x3 = x2 + step, x4 = x3 + step;
+			uint32_t i1 = x1 >> 23, i2 = x2 >> 23, i3 = x3 >> 23, i4 = x4 >> 23;
+			if (rem <= (int32_t) i4 || q + i4 >= limit) goto single;
+			const int8_t* b = (const int8_t*) rom + q - 1;
+			int32_t v0 = b[0] + ((int32_t) lr * (b[1] - b[0]) >> 23);
+			int32_t v1 = b[i1] + ((int32_t) (x1 & 0x7fffff) * (b[i1 + 1] - b[i1]) >> 23);
+			int32_t v2 = b[i2] + ((int32_t) (x2 & 0x7fffff) * (b[i2 + 1] - b[i2]) >> 23);
+			int32_t v3 = b[i3] + ((int32_t) (x3 & 0x7fffff) * (b[i3 + 1] - b[i3]) >> 23);
+			uint32_t n0 = i1, n1 = i2 - i1, n2 = i3 - i2, n3 = i4 - i3;
+			uint32_t moved = (n0 != 0) + (n1 != 0) + (n2 != 0) + (n3 != 0);
+			uint32_t extra = (n0 > 1) + (n1 > 1) + (n2 > 1) + (n3 > 1);
+			bool more = (int32_t) (r8 - 4) > 0;
+			uint32_t cost = 90 + (more ? 2 : 0) + 6 * moved + load_cost * (moved + extra);
+			uint32_t last = 20 + 4 + (more ? 2 : 0) + (n3 ? 6 + load_cost * (n3 > 1 ? 2 : 1) : 0);
+			/* Each sample starts before the event, as in the single steps. */
+			if ((int32_t) (now + cost - last - deadline) >= 0) goto single;
+			uint32_t add_r4 = (uint32_t) (uint8_t) (vr * v0 >> 8) | (uint32_t) (uint8_t) (vr * v1 >> 8) << 8
+				| (uint32_t) (uint8_t) (vr * v2 >> 8) << 16 | (uint32_t) (uint8_t) (vr * v3 >> 8) << 24;
+			uint32_t add_l4 = (uint32_t) (uint8_t) (vl * v0 >> 8) | (uint32_t) (uint8_t) (vl * v1 >> 8) << 8
+				| (uint32_t) (uint8_t) (vl * v2 >> 8) << 16 | (uint32_t) (uint8_t) (vl * v3 >> 8) << 24;
+			uint32_t o = base & (GBN_IWRAM_SIZE - 1);
+			uint32_t* wr = (uint32_t*) __builtin_assume_aligned(iwram + o, 4);
+			uint32_t* wl = (uint32_t*) __builtin_assume_aligned(iwram + ((o + 0x630) & (GBN_IWRAM_SIZE - 1)), 4);
+			word_r = mixer_bytes(*wr, add_r4); word_l = mixer_bytes(*wl, add_l4);
+			*wl = word_l; *wr = word_r;
+			s = b[i4]; d = b[i4 + 1] - b[i4]; q += i4; rem -= (int32_t) i4; lr = x4 & 0x7fffff;
+			last_n = n3; last_v = (uint32_t) v3;
+			base += 4; old8 = r8; r8 -= 4;
+			now += cost; retired += 58 + 8 * moved;
+			if (!more) { ended = true; break; }
+			continue;
+		}
+	single:;
 		uint32_t cost = 20, count = 13, f = lr + step, n = f >> 23;
 		/* SUBS r2 / BLE leaves for the end of the wave; stop before it. */
 		if (n && (rem <= (int32_t) n || q + n >= limit)) break;
@@ -135,8 +178,10 @@ static __attribute__((noinline)) uint32_t mixer_hle(struct Gbn* m) {
 	m->cpu.cpsr = flags;
 	m->prefetched_pc = 0;
 	m->now = now;
-	m->cpu.pipe[0] = fetch(m, m->cpu.pc, 4);
-	m->cpu.pipe[1] = fetch(m, m->cpu.pc + 4, 4);
+	/* The pipeline of a loop boundary is the proven loop code itself. */
+	if (m->cpu.pc == head) { m->cpu.pipe[0] = mixer_head_ops[0]; m->cpu.pipe[1] = mixer_head_ops[1]; }
+	else if (m->cpu.pc == head + 8) { m->cpu.pipe[0] = mixer_packet_ops[0]; m->cpu.pipe[1] = mixer_packet_ops[1]; }
+	else { m->cpu.pipe[0] = fetch(m, m->cpu.pc, 4); m->cpu.pipe[1] = fetch(m, m->cpu.pc + 4, 4); }
 	return retired;
 }
 #undef MIXER_HEAD_BYTES
