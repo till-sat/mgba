@@ -782,8 +782,11 @@ static inline __attribute__((always_inline)) bool cached_indexed_body(
     uint32_t frame = d->frames, map_offset = (uint32_t) (map - d->vram), next_offset = (uint32_t) (next_map - d->vram);
     if ((stamp->state & 1) && stamp->character == character && stamp->map == map_offset
             && (first == 31 || stamp->next == next_offset) && (uint16_t) (frame - stamp->frame) <= 3) {
-        uint32_t dirty = 0;
-        for (uint16_t f = stamp->frame; f != (uint16_t) (frame + 1); ++f) dirty |= cache->dirty[f & 3];
+        unsigned age = (uint16_t) (frame - stamp->frame);
+        uint32_t dirty = cache->dirty[frame & 3];
+        if (age > 0) dirty |= cache->dirty[(frame - 1) & 3];
+        if (age > 1) dirty |= cache->dirty[(frame - 2) & 3];
+        if (age > 2) dirty |= cache->dirty[(frame - 3) & 3];
         if (!(dirty & stamp->pages)) {
             stamp->frame = (uint16_t) frame;
             *output = row->indices + phase;
@@ -859,12 +862,16 @@ static inline __attribute__((always_inline)) bool cached_indexed_body(
         }
     }
 #if GBN_RV32_FAST & 32768
+    if (rebuilt) {
+        uint32_t tiles = 0;
+        for (unsigned i = 0; i < row->samples; ++i) tiles |= 1u << (row->address[i] >> 9);
+        stamp->tiles = tiles;
+    }
     if (!cache->tracked_oam) stamp->state = 0;
     else if (rebuilt || !(stamp->state & 1) || stamp->map != map_offset || stamp->next != next_offset) {
         uint32_t pages = 1u << (map_offset >> 11) | 1u << ((map_offset + first * 2 - 1) >> 11);
         if (first < 31) pages |= 1u << (next_offset >> 11) | 1u << ((next_offset + (31 - first) * 2 - 1) >> 11);
-        for (unsigned i = 0; i < row->samples; ++i) pages |= 1u << (row->address[i] >> 9);
-        stamp->pages = pages;
+        stamp->pages = pages | stamp->tiles;
         stamp->map = (uint16_t) map_offset; stamp->next = (uint16_t) next_offset;
         stamp->character = (uint16_t) character;
         stamp->state = (uint8_t) (1 | row->opaque30 << 1 | row->opaque31 << 2);

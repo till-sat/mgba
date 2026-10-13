@@ -139,7 +139,7 @@ struct GbnPpuCache {
      * from and the frame it was last proven in. */
     uint32_t dirty[4]; /* text BG data: pages 0..31 */
     struct GbnRowStamp {
-        uint32_t pages;
+        uint32_t pages, tiles; /* tiles: the row's own tile pages, set when it is decoded */
         uint16_t frame, map, next, character;
         uint8_t state; /* 1 valid, 2 opaque30, 4 opaque31 */
     } stamps[4][256];
