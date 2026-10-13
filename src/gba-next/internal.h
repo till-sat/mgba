@@ -89,6 +89,16 @@ void gbn_save_dma(struct Gbn*, uint32_t dest, unsigned width, uint32_t count);
 unsigned gbn_save_wait(const struct Gbn*, uint32_t address);
 void gbn_ppu_reference(struct Gbn*, unsigned offset);
 enum GbnStatus gbn_ppu_line(struct Gbn*, unsigned y);
+#if GBN_RV32_FAST & 32768
+/* VRAM backing bytes [lo, hi) were written: mark their pages in this frame. */
+static inline void gbn_vram_written(struct GbnDevices* d, uint32_t lo, uint32_t hi) {
+	struct GbnPpuCache* c = d->ppu.cache;
+	if (!c || hi <= lo) return;
+	if (lo >= 0x10000) return;
+	if (hi > 0x10000) hi = 0x10000;
+	for (uint32_t p = lo >> 11; p <= (hi - 1) >> 11; ++p) c->dirty[d->frames & 3] |= 1u << p;
+}
+#endif
 #if GBN_RV32_FAST & 2048
 /* Draw the lines whose HBlank has passed (devices.c). */
 enum GbnStatus gbn_ppu_catchup(struct Gbn*);

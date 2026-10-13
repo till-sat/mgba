@@ -102,6 +102,40 @@ static inline __attribute__((always_inline)) void indexed_vector_body(
     }
 }
 
+bool gbn_rvv_equal(const uint8_t* a, const uint8_t* b, unsigned n) {
+    for (unsigned i = 0; i < n;) {
+        size_t vl = __riscv_vsetvl_e8m8(n - i);
+        vbool1_t differ = __riscv_vmsne_vv_u8m8_b1(__riscv_vle8_v_u8m8(a + i, vl),
+            __riscv_vle8_v_u8m8(b + i, vl), vl);
+        if (__riscv_vcpop_m_b1(differ, vl)) return false;
+        i += (unsigned) vl;
+    }
+    return true;
+}
+
+bool gbn_ppu_row_matches_vector(const uint8_t* vram, const uint8_t* map, unsigned first,
+    const uint8_t* next_map, const uint16_t* row_map, const uint16_t* address,
+    const uint32_t* words, unsigned samples) {
+    /* Map entries are halfword aligned in VRAM; compare them as bytes. */
+    size_t vl = __riscv_vsetvl_e8m4(first * 2);
+    vbool2_t differ = __riscv_vmsne_vv_u8m4_b2(__riscv_vle8_v_u8m4(map, vl),
+        __riscv_vle8_v_u8m4((const uint8_t*) row_map, vl), vl);
+    if (__riscv_vcpop_m_b2(differ, vl)) return false;
+    if (first < 31) {
+        vl = __riscv_vsetvl_e8m4((31 - first) * 2);
+        differ = __riscv_vmsne_vv_u8m4_b2(__riscv_vle8_v_u8m4(next_map, vl),
+            __riscv_vle8_v_u8m4((const uint8_t*) (row_map + first), vl), vl);
+        if (__riscv_vcpop_m_b2(differ, vl)) return false;
+    }
+    if (!samples) return true;
+    vl = __riscv_vsetvl_e32m8(samples);
+    vuint32m8_t offsets = __riscv_vsll_vx_u32m8(__riscv_vzext_vf2_u32m8(
+        __riscv_vle16_v_u16m4(address, vl), vl), 2, vl);
+    vuint32m8_t current = __riscv_vluxei32_v_u32m8((const uint32_t*) vram, offsets, vl);
+    vbool4_t changed = __riscv_vmsne_vv_u32m8_b4(current, __riscv_vle32_v_u32m8(words, vl), vl);
+    return !__riscv_vcpop_m_b4(changed, vl);
+}
+
 void gbn_ppu_indexed_vector(const struct IndexedBackground* layers, unsigned count,
     const struct Pixel* objects, unsigned start, unsigned end,
     const uint8_t* palette, uint16_t* output) {

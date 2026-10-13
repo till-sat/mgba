@@ -188,6 +188,9 @@ enum GbnStatus gbn_service_events(struct Gbn* m) {
 			if (d->io[VCOUNT] == 160) {
 				d->io[DISPSTAT] |= 1;
 				++d->frames;
+#if GBN_RV32_FAST & 32768
+				if (d->ppu.cache) d->ppu.cache->dirty[d->frames & 3] = 0;
+#endif
 				gbn_dma_trigger(m, 1, when);
 				if (d->io[DISPSTAT] & 8) gbn_irq_at(m, 1, when);
 			} else if (d->io[VCOUNT] == 227) d->io[DISPSTAT] &= ~1u;
@@ -353,6 +356,11 @@ enum GbnStatus gbn_device_write(struct Gbn* m, uint32_t address, unsigned width,
 	}
 	uint8_t* p = video_address(m->devices, address);
 	if (p) {
+#if GBN_RV32_FAST & 32768
+        bool changed = false;
+        for (unsigned b = 0; b < width; ++b) changed |= p[b] != (uint8_t) (value >> (8 * b));
+        if (region == 6 && changed) gbn_vram_written(m->devices, (uint32_t) (p - m->devices->vram), (uint32_t) (p - m->devices->vram) + width);
+#endif
         for (unsigned b = 0; b < width; ++b) p[b] = (uint8_t) (value >> (8 * b));
         if (region == 7) gbn_ppu_invalidate_oam(m);
     }

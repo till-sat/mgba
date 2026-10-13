@@ -192,8 +192,9 @@ static unsigned span_limit(const struct Gbn* m, uint32_t address, unsigned width
 	}
 	/* Memory-region changes also end runs in small mirrored RAM windows. */
 	uint32_t region_offset = address & 0xffffff;
-	unsigned a = step > 0 ? (size - offset) / width : offset / width + 1;
-	unsigned b = step > 0 ? (0x1000000u - region_offset) / width : region_offset / width + 1;
+	unsigned shift = width == 4 ? 2 : 1; /* beats are halfwords or words */
+	unsigned a = step > 0 ? (size - offset) >> shift : (offset >> shift) + 1;
+	unsigned b = step > 0 ? (0x1000000u - region_offset) >> shift : (region_offset >> shift) + 1;
 	return a < b ? a : b;
 }
 
@@ -304,6 +305,30 @@ static __attribute__((noinline)) bool dma_span(struct Gbn* m, unsigned channel) 
             (int32_t)(when+first_elapsed+2-m->events[other].when)>=0))return false;
     }
 	uint32_t value = 0;
+#if GBN_RV32_FAST & 32768
+	/* VRAM pages count as written only when their bytes change. */
+	uint32_t changed = 0;
+	if ((dest >> 24) == 6 && d->ppu.cache) {
+		if (width == 4) {
+			for (unsigned i = 0; i < beats; ++i) {
+				uint32_t old;
+				__builtin_memcpy(&value, __builtin_assume_aligned(src + (ptrdiff_t) i * ss, 4), 4);
+				__builtin_memcpy(&old, __builtin_assume_aligned(dst + (ptrdiff_t) i * ds, 4), 4);
+				changed |= old ^ value;
+				__builtin_memcpy(__builtin_assume_aligned(dst + (ptrdiff_t) i * ds, 4), &value, 4);
+			}
+		} else {
+			uint16_t half = 0, old;
+			for (unsigned i = 0; i < beats; ++i) {
+				__builtin_memcpy(&half, __builtin_assume_aligned(src + (ptrdiff_t) i * ss, 2), 2);
+				__builtin_memcpy(&old, __builtin_assume_aligned(dst + (ptrdiff_t) i * ds, 2), 2);
+				changed |= (uint32_t) (old ^ half);
+				__builtin_memcpy(__builtin_assume_aligned(dst + (ptrdiff_t) i * ds, 2), &half, 2);
+			}
+			value = (uint32_t) half * 0x10001u;
+		}
+	} else
+#endif
 	if (width == 4) {
 		for (unsigned i = 0; i < beats; ++i) {
 			__builtin_memcpy(&value, __builtin_assume_aligned(src + (ptrdiff_t) i * ss, 4), 4);
@@ -318,6 +343,12 @@ static __attribute__((noinline)) bool dma_span(struct Gbn* m, unsigned channel) 
 		value = (uint32_t) half * 0x10001u;
 	}
     if ((dest >> 24) == 7) gbn_ppu_invalidate_oam(m);
+#if GBN_RV32_FAST & 32768
+    if ((dest >> 24) == 6 && changed) {
+        uint32_t a = (uint32_t) (dst - d->vram), b = a + (uint32_t) ((int) (beats - 1) * ds);
+        gbn_vram_written(d, a < b ? a : b, (a < b ? b : a) + width);
+    }
+#endif
 
     /* First beats begin at the observed CPU boundary, not the original
      * requested timestamp, and retain nonsequential source/destination waits.
@@ -399,6 +430,11 @@ enum GbnStatus gbn_dma_service(struct Gbn* m) {
 #endif
 	if (dest_pointer) {
 		uint32_t stored = width == 2 ? value >> ((dest & 2) * 8) : value;
+#if GBN_RV32_FAST & 32768
+		bool changed = false;
+		for (unsigned i = 0; i < width; ++i) changed |= dest_pointer[i] != (uint8_t) (stored >> (8 * i));
+		if ((dest >> 24) == 6 && changed) gbn_vram_written(d, (uint32_t) (dest_pointer - d->vram), (uint32_t) (dest_pointer - d->vram) + width);
+#endif
 		for (unsigned i = 0; i < width; ++i) dest_pointer[i] = (uint8_t) (stored >> (8 * i));
         if ((dest >> 24) == 7) gbn_ppu_invalidate_oam(m);
 		ignored = 0;

@@ -774,7 +774,31 @@ static inline __attribute__((always_inline)) bool cached_indexed_body(
     unsigned next_x = (sx + first * 8) & xmask;
     const uint8_t* next_map = d->vram
         + ((map_row + (next_x >> 8) * 0x800 + (next_x & 248) / 4) & 0xffff);
-    bool hit = row->valid && row->character == character
+#if GBN_RV32_FAST & 32768
+    /* Tracked writes: a row built from the same map entries is still exact
+     * when none of its pages was written since the frame it was proven in. */
+    struct GbnPpuCache* cache = d->ppu.cache;
+    struct GbnRowStamp* stamp = &cache->stamps[id][sy & 255];
+    uint32_t frame = d->frames, map_offset = (uint32_t) (map - d->vram), next_offset = (uint32_t) (next_map - d->vram);
+    if ((stamp->state & 1) && stamp->character == character && stamp->map == map_offset
+            && (first == 31 || stamp->next == next_offset) && (uint16_t) (frame - stamp->frame) <= 3) {
+        uint32_t dirty = 0;
+        for (uint16_t f = stamp->frame; f != (uint16_t) (frame + 1); ++f) dirty |= cache->dirty[f & 3];
+        if (!(dirty & stamp->pages)) {
+            stamp->frame = (uint16_t) frame;
+            *output = row->indices + phase;
+            return (stamp->state & (phase ? 4 : 2)) != 0;
+        }
+    }
+#endif
+    bool hit;
+#if defined(AM_RVV) && (GBN_PPU_RVV & 8)
+    if (aligned) hit = row->valid && row->character == character
+        && gbn_ppu_row_matches_vector(d->vram, map, first, next_map, row->map, row->address, row->words, row->samples);
+    else
+#endif
+    {
+    hit = row->valid && row->character == character
         && !memcmp(map, row->map, first * 2)
         && (first == 31 || !memcmp(next_map, row->map + first, (31 - first) * 2));
     if (hit) for (unsigned i = 0; i < row->samples; ++i) {
@@ -789,6 +813,10 @@ static inline __attribute__((always_inline)) bool cached_indexed_body(
             | (uint32_t) text_half(d->vram, address + 2, false) << 16;
         if (packed != row->words[i]) { hit = false; break; }
     }
+    }
+#if GBN_RV32_FAST & 32768
+    bool rebuilt = !hit;
+#endif
     if (!hit) {
         memcpy(row->map, map, first * 2);
         if (first < 31) memcpy(row->map + first, next_map, (31 - first) * 2);
@@ -819,6 +847,19 @@ static inline __attribute__((always_inline)) bool cached_indexed_body(
         row->valid = true;
 
     }
+#if GBN_RV32_FAST & 32768
+    if (!cache->tracked_oam) stamp->state = 0;
+    else if (rebuilt || !(stamp->state & 1) || stamp->map != map_offset || stamp->next != next_offset) {
+        uint32_t pages = 1u << (map_offset >> 11) | 1u << ((map_offset + first * 2 - 1) >> 11);
+        if (first < 31) pages |= 1u << (next_offset >> 11) | 1u << ((next_offset + (31 - first) * 2 - 1) >> 11);
+        for (unsigned i = 0; i < row->samples; ++i) pages |= 1u << (row->address[i] >> 9);
+        stamp->pages = pages;
+        stamp->map = (uint16_t) map_offset; stamp->next = (uint16_t) next_offset;
+        stamp->character = (uint16_t) character;
+        stamp->state = (uint8_t) (1 | row->opaque30 << 1 | row->opaque31 << 2);
+    }
+    stamp->frame = (uint16_t) frame;
+#endif
     *output = row->indices + phase;
     return phase ? row->opaque31 : row->opaque30;
 }

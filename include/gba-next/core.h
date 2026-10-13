@@ -133,6 +133,17 @@ struct GbnPpuCache {
     uint8_t object_ids[GBN_SCREEN_HEIGHT][128], object_counts[GBN_SCREEN_HEIGHT];
     uint32_t object_bounds[GBN_SCREEN_HEIGHT];
     bool object_valid, tracked_oam;
+#if GBN_RV32_FAST & 32768
+    /* Tracked writes only: the VRAM 2 KiB pages written in each of the last
+     * four frames, and per text row the pages and map entries it was built
+     * from and the frame it was last proven in. */
+    uint32_t dirty[4]; /* text BG data: pages 0..31 */
+    struct GbnRowStamp {
+        uint32_t pages;
+        uint16_t frame, map, next, character;
+        uint8_t state; /* 1 valid, 2 opaque30, 4 opaque31 */
+    } stamps[4][256];
+#endif
 };
 struct GbnPpu {
 	uint16_t* pixels; /* GBA BGR555: red occupies bits 0..4. Caller-owned. */

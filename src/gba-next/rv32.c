@@ -7,6 +7,7 @@
 #define GBN_RV32_FAST 0
 #endif
 #include "internal.h"
+#include "ppu-internal.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -2877,8 +2878,13 @@ static inline __attribute__((always_inline)) unsigned execute_mode(struct GbnRv3
 	/* Validate the bytes of a RAM block at every entry. CPU stores, DMA and
 	 * external loaders therefore need no new write barrier. A stale pipeline
 	 * is checked separately below and remains in the interpreter until consumed. */
+#if defined(AM_RVV) && (GBN_PPU_RVV & 8)
+	if (hit && !rom && !gbn_rvv_equal(backend->source[slot], source + (m->cpu.pc & m->code_mask),
+	    (b->proof_instructions > b->instructions ? b->proof_instructions : b->instructions ? b->instructions : 1) * width)) hit = false;
+#else
 	if (hit && !rom && memcmp(backend->source[slot], source + (m->cpu.pc & m->code_mask),
 	    (b->proof_instructions > b->instructions ? b->proof_instructions : b->instructions ? b->instructions : 1) * width)) hit = false;
+#endif
 	if (hit && !b->instructions) return 0;
 	uint32_t deadline = m->now + GBN_MAX_DELAY;
 	int next=gbn_cpu_event(m);

@@ -21,4 +21,11 @@ void gbn_ppu_compose_vector(const struct Background* layers, unsigned count,
 void gbn_ppu_indexed_vector(const struct IndexedBackground* layers, unsigned count,
     const struct Pixel* objects, unsigned start, unsigned end,
     const uint8_t* palette, uint16_t* output);
+/* n bytes at a and b are equal (cache validation of translated RAM code). */
+bool gbn_rvv_equal(const uint8_t* a, const uint8_t* b, unsigned n);
+/* A cached text row still matches VRAM: its first `first` map entries at map,
+ * the rest at next_map, and its sampled tile words (word indices in address). */
+bool gbn_ppu_row_matches_vector(const uint8_t* vram, const uint8_t* map, unsigned first,
+    const uint8_t* next_map, const uint16_t* row_map, const uint16_t* address,
+    const uint32_t* words, unsigned samples);
 #endif
