@@ -65,7 +65,8 @@ endif
 # mirror of SIM_CORE there, in its tool image (am/tools/run_sim.py).
 SIM_HOST ?=
 SIM_REMOTE_ROOT ?= proto-core/quad-issue-rvv-wide-peak
-SIM_CPU ?= 300
+# The host CPU of a remote run; empty picks one per run (am/tools/run_sim.py).
+SIM_CPU ?=
 # Extra refsim-soc options, e.g. SIM_ARGS="--ic-kb 128".
 SIM_ARGS ?=
 # 1: a per-function profile of the window (am/tools/sim_profile.py).
@@ -73,7 +74,7 @@ SIM_PROFILE ?= 0
 # A capture.bin of another GBN_CAPTURE=1 run to compare pictures and sound with.
 SIM_REFERENCE ?=
 SIM_TOOL = $(PYTHON) -u am/tools/run_sim.py --refsim "$(REFSIM)" \
-	$(if $(SIM_HOST),--host "$(SIM_HOST)" --remote-root "$(SIM_REMOTE_ROOT)" --cpu $(SIM_CPU)) \
+	$(if $(SIM_HOST),--host "$(SIM_HOST)" --remote-root "$(SIM_REMOTE_ROOT)" $(if $(SIM_CPU),--cpu $(SIM_CPU))) \
 	$(if $(filter 1,$(SIM_PROFILE)),--profile) $(if $(SIM_REFERENCE),--reference "$(abspath $(SIM_REFERENCE))")
 SIM_TAIL = $(if $(strip $(SIM_ARGS)),-- $(SIM_ARGS))
 

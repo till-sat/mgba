@@ -14,11 +14,11 @@ model dumps the capture; am/tools/gba_next_capture.py decodes it into DIR/
 capture (and compares it with --reference). DIR receives stats.json, pcs.tsv,
 console.log and the summary. With --host the ELF is copied to
 REMOTE_ROOT/build/sim-runs/NAME on that host and run there by the mirror's
-build/chiprun.sh (its tool image, CPU --cpu); the outputs are copied back.
+build/chiprun.sh (its tool image, pinned to CPU --cpu); the outputs are copied back.
 Exit status 1 if the model fails, the window does not close, or the program
 exits non-zero.
 """
-import argparse, json, re, shlex, subprocess, sys, time
+import argparse, json, os, re, shlex, subprocess, sys, time
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent
@@ -41,7 +41,7 @@ def main():
     ap.add_argument('--host')
     ap.add_argument('--remote-root', default='proto-core/quad-issue-rvv-wide-peak')
     ap.add_argument('--remote-home', default='/home/tillsat', help='the home directory inside the tool image')
-    ap.add_argument('--cpu', default='300')
+    ap.add_argument('--cpu', help='the host CPU to pin the run to (default: one of 256..383 by process id, so that parallel runs do not share a core)')
     ap.add_argument('--warmup', type=int)
     ap.add_argument('--begin')
     ap.add_argument('--end', default='GBN result:')
@@ -76,13 +76,16 @@ def main():
     for f in fetch:
         (out / f).unlink(missing_ok=True)
     if a.host:
-        name = f"{out.name}-{time.strftime('%Y%m%d-%H%M%S')}"
+        # Runs started in the same second must not share a directory, and
+        # parallel runs must not share a core (the cpuset is one CPU).
+        cpu = a.cpu or str(256 + os.getpid() % 128)
+        name = f"{out.name}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
         rel = f"{a.remote_root}/build/sim-runs/{name}"
         subprocess.run(['ssh', '-o', 'BatchMode=yes', a.host, f'mkdir -p {shlex.quote(rel)}'], check=True)
         subprocess.run(['scp', '-q', str(elf), f'{a.host}:{rel}/app.elf'], check=True)
         refsim = f"{a.remote_home}/{a.remote_root}/sim/soc/refsim-soc"
         inner = f"cd build/sim-runs/{name} && " + ' '.join(shlex.quote(x) for x in [refsim, 'app.elf'] + opts)
-        remote = (f"cd {shlex.quote(a.remote_root)} && MEM=4g build/chiprun.sh sim-{name} {shlex.quote(a.cpu)} "
+        remote = (f"cd {shlex.quote(a.remote_root)} && MEM=4g build/chiprun.sh sim-{name} {shlex.quote(cpu)} "
                   + shlex.quote(inner))
         status = subprocess.run(['ssh', '-o', 'BatchMode=yes', a.host, remote]).returncode
         for f in fetch:
