@@ -40,8 +40,8 @@ else
 ROM_PATH := $(ROM_DIR)/$(ROM_INPUT).gba
 endif
 
-ifeq ($(filter $(PLATFORM),native spike spike_zve32x verilator fpga ysyxsoc),)
-$(error Unsupported PLATFORM '$(PLATFORM)'; choose native, spike, spike_zve32x, verilator, fpga or ysyxsoc)
+ifeq ($(filter $(PLATFORM),native spike spike_zve32x verilator fpga ysyxsoc sim),)
+$(error Unsupported PLATFORM '$(PLATFORM)'; choose native, spike, spike_zve32x, verilator, fpga, ysyxsoc or sim)
 endif
 
 BUILD_DIR := build
@@ -255,16 +255,28 @@ GBN_VALIDATE ?= 1
 ifeq ($(filter $(GBN_VALIDATE),0 1),)
 $(error GBN_VALIDATE must be 0 or 1)
 endif
+# 1: record pictures, sound and per-frame CRCs in gbn_capture for comparing
+# builds (PLATFORM=sim dumps and decodes it). Needs GBN_VALIDATE=1.
+GBN_CAPTURE ?= 0
+ifeq ($(filter $(GBN_CAPTURE),0 1),)
+$(error GBN_CAPTURE must be 0 or 1)
+endif
+ifeq ($(GBN_CAPTURE):$(GBN_VALIDATE),1:0)
+$(error GBN_CAPTURE=1 needs GBN_VALIDATE=1)
+endif
 GBN_BENCH_TARGET = $(BUILD_DIR)/gba-next-bench$(if $(filter native,$(PLATFORM)),,.elf)
 GBN_BENCH_OBJECT = $(BUILD_DIR)/src/platform/gba-next/benchmark.o
 GBN_ROM_OBJECT = $(BUILD_DIR)/gba-next-rom.o
 GBN_BENCH_FLAGS = -DGBN_BENCH_FRAMES=$(GBN_FRAMES) -DGBN_BENCH_WARMUP=$(GBN_WARMUP) -DGBN_BENCH_VALIDATE=$(GBN_VALIDATE)
-ifneq ($(filter $(PLATFORM),spike spike_zve32x fpga verilator),)
+ifeq ($(GBN_CAPTURE),1)
+GBN_BENCH_FLAGS += -DGBN_BENCH_CAPTURE=1
+endif
+ifneq ($(filter $(PLATFORM),spike spike_zve32x fpga verilator sim),)
 GBN_BENCH_FLAGS += -DGBN_COUNTERS
 endif
 
 $(BUILD_DIR)/.gba-next-bench-config: FORCE | $(BUILD_DIR)
-	@printf '%s\n' '$(GBN_FRAMES)' '$(GBN_WARMUP)' '$(abspath $(GBN_INPUT))' '$(GBN_VALIDATE)' > "$@.tmp"
+	@printf '%s\n' '$(GBN_FRAMES)' '$(GBN_WARMUP)' '$(abspath $(GBN_INPUT))' '$(GBN_VALIDATE)' '$(GBN_CAPTURE)' > "$@.tmp"
 	@cmp -s "$@.tmp" "$@" || cp "$@.tmp" "$@"
 	@rm -f "$@.tmp"
 
@@ -320,6 +332,12 @@ run-gba-next-bench: $(BUILD_DIR)/gba-next-bench.bin $(LOADER).bin
 	$(PYTHON) -u am/tools/run_fpga.py --protosoc "$(PROTOSOC)" --port "$(PORT)" \
 		--loader "$(LOADER).bin" --app "$<" --baud $(BAUD) \
 		--watch $(WATCH) --log "$(BUILD_DIR)/gba-next-fpga.log"
+else ifeq ($(PLATFORM),sim)
+# refsim-soc --chip: the window runs from the warmup line (or the start) to the
+# result line; a GBN_CAPTURE=1 build is run to the end and its capture decoded.
+.PHONY: run-gba-next-bench
+run-gba-next-bench: $(GBN_BENCH_TARGET) sim-model
+	$(SIM_TOOL) --elf "$<" --out "$(BUILD_DIR)/sim-gba-next-bench" --warmup $(GBN_WARMUP) $(SIM_TAIL)
 endif
 
 -include $(GBN_BENCH_OBJECT:.o=.d)
@@ -354,6 +372,11 @@ else ifneq ($(filter $(PLATFORM),spike spike_zve32x),)
 .PHONY: run-gba-next
 run-gba-next run-gba-next-player: $(GBN_PLAYER_TARGET) $(SPIKE_PLUGIN)
 	$(SPIKE_COMMAND) --device=am_protosoc,0 --device="am_media,GBA next (Spike)" "$<"
+else ifeq ($(PLATFORM):$(SIM_MEDIA),sim:1)
+# The chip model in fast-forward (its window never opens), until the program exits.
+.PHONY: run-gba-next
+run-gba-next run-gba-next-player: $(GBN_PLAYER_TARGET) sim-model-media
+	"$(REFSIM_MEDIA)" "$<" --chip --begin "(no statistics window)" --stop "AM exit:"
 endif
 -include $(GBN_PLAYER_OBJECT:.o=.d)
 

@@ -42,6 +42,9 @@ static bool resolve_native(uintptr_t pc, struct am_profile_location* location, v
 _Static_assert(GBN_BENCH_FRAMES > 0, "Benchmark requires a positive frame count");
 _Static_assert(GBN_BENCH_WARMUP >= 0, "Warmup must be nonnegative");
 _Static_assert(GBN_BENCH_VALIDATE == 0 || GBN_BENCH_VALIDATE == 1, "Validation must be 0 or 1");
+#if defined(GBN_BENCH_CAPTURE) && GBN_BENCH_CAPTURE && !GBN_BENCH_VALIDATE
+#error "GBN_BENCH_CAPTURE needs GBN_BENCH_VALIDATE=1 (it reads the validated PCM)"
+#endif
 _Static_assert((uint64_t) GBN_BENCH_WARMUP + GBN_BENCH_FRAMES <= UINT32_MAX, "Frame count overflow");
 extern const uint8_t _rom_start[], _rom_end[];
 #ifdef AM_ROM_OMIT_FF_TAIL
@@ -73,6 +76,29 @@ static uint32_t crc_bytes(const uint8_t* data, uint32_t size) {
 	return crc ^ UINT32_MAX;
 }
 
+#if GBN_BENCH_CAPTURE
+/* Picture/sound capture for comparing builds (PLATFORM=sim dumps
+ * gbn_capture after the run; am/tools/gba_next_capture.py decodes it):
+ * per-frame video/audio CRCs and sample counts, every CAPTURE_EVERY-th
+ * frame in full, and raw PCM of frames [CAPTURE_PCM_FIRST,
+ * CAPTURE_PCM_FIRST + CAPTURE_PCM_FRAMES). Sized to leave the heap its
+ * 8 MiB beside the 16 MiB ROM in 64 MiB of SDRAM. */
+#define CAPTURE_FRAMES 4800
+#define CAPTURE_EVERY 40
+#define CAPTURE_SHOTS (CAPTURE_FRAMES / CAPTURE_EVERY)
+#define CAPTURE_PCM_FIRST 300
+#define CAPTURE_PCM_FRAMES 600
+#define CAPTURE_PCM (CAPTURE_PCM_FRAMES * 1200)
+struct GbnCapture {
+	uint32_t magic, frames, shots, pcm, rate, every, pcm_first, pcm_frames;
+	uint32_t frame_crc[CAPTURE_FRAMES], audio_crc[CAPTURE_FRAMES], audio_count[CAPTURE_FRAMES];
+	int16_t pcm_data[CAPTURE_PCM][2];
+	uint16_t shot[CAPTURE_SHOTS][GBN_SCREEN_WIDTH * GBN_SCREEN_HEIGHT];
+};
+__attribute__((used)) struct GbnCapture gbn_capture;
+static uint32_t capture_audio = UINT32_MAX, capture_samples;
+#endif
+
 static uint32_t crc_pixels(uint32_t crc) {
 	for (unsigned i = 0; i < GBN_SCREEN_WIDTH * GBN_SCREEN_HEIGHT; ++i) {
 		crc = crc_byte(crc, (uint8_t) pixels[i]);
@@ -91,6 +117,20 @@ static void drain_audio(void) {
 	while ((count = gbn_audio_read(&machine, samples, 256)) != 0) for (unsigned i = 0; i < count; ++i) {
 		++audio_samples;
 		if (samples[i].left || samples[i].right) ++audio_nonzero;
+#if GBN_BENCH_CAPTURE
+		{
+			uint16_t l = (uint16_t) samples[i].left, r = (uint16_t) samples[i].right;
+			capture_audio = crc_byte(capture_audio, (uint8_t) l); capture_audio = crc_byte(capture_audio, (uint8_t) (l >> 8));
+			capture_audio = crc_byte(capture_audio, (uint8_t) r); capture_audio = crc_byte(capture_audio, (uint8_t) (r >> 8));
+			++capture_samples;
+			uint32_t f = devices.ppu.frames;
+			if (f >= CAPTURE_PCM_FIRST && f < CAPTURE_PCM_FIRST + CAPTURE_PCM_FRAMES && gbn_capture.pcm < CAPTURE_PCM) {
+				gbn_capture.pcm_data[gbn_capture.pcm][0] = samples[i].left;
+				gbn_capture.pcm_data[gbn_capture.pcm][1] = samples[i].right;
+				++gbn_capture.pcm;
+			}
+		}
+#endif
 		uint16_t left = (uint16_t) samples[i].left, right = (uint16_t) samples[i].right;
 		audio_crc = crc_byte(audio_crc, (uint8_t) left);
 		audio_crc = crc_byte(audio_crc, (uint8_t) (left >> 8));
@@ -229,6 +269,19 @@ int main(void) {
 #endif
 #if GBN_BENCH_VALIDATE
 			video_crc = crc_pixels(video_crc);
+#endif
+#if GBN_BENCH_CAPTURE
+			if (completed && completed <= CAPTURE_FRAMES) {
+				uint32_t f = completed - 1;
+				gbn_capture.frame_crc[f] = crc_bytes((const uint8_t*) pixels, sizeof(pixels));
+				gbn_capture.audio_crc[f] = capture_audio ^ UINT32_MAX; gbn_capture.audio_count[f] = capture_samples;
+				capture_audio = UINT32_MAX; capture_samples = 0;
+				if (completed % CAPTURE_EVERY == 0 && gbn_capture.shots < CAPTURE_SHOTS)
+					memcpy(gbn_capture.shot[gbn_capture.shots++], pixels, sizeof(pixels));
+				gbn_capture.frames = completed;
+			}
+			gbn_capture.magic = 0x43415054u; gbn_capture.rate = gbn_audio_rate(&machine);
+			gbn_capture.every = CAPTURE_EVERY; gbn_capture.pcm_first = CAPTURE_PCM_FIRST; gbn_capture.pcm_frames = CAPTURE_PCM_FRAMES;
 #endif
 #if GBN_HOST_STATS
 			if (measuring) validation_retired += am_counter_retired() - stamp;

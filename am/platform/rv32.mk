@@ -59,14 +59,14 @@ $(error PERF_COUNTERS=1 requires PLATFORM=fpga BENCHMARK=1 PROFILE=0 and the dia
 endif
 PROJECT_CPPFLAGS += -DAM_PERF_COUNTERS
 endif
-ifneq ($(filter $(PLATFORM),fpga spike spike_zve32x verilator),)
+ifneq ($(filter $(PLATFORM),fpga spike spike_zve32x verilator sim),)
 PROJECT_CPPFLAGS += -DAM_BENCH_COUNTERS
 ifeq ($(PROFILE),1)
 PROJECT_CPPFLAGS += -DAM_PROFILE_SAMPLING
 AM_SOURCES += am/src/protosoc/profile.c
 endif
 else ifeq ($(PROFILE),1)
-$(error PROFILE=1 requires a proto-soc platform: fpga, spike, spike_zve32x or verilator)
+$(error PROFILE=1 requires a proto-soc platform: fpga, spike, spike_zve32x, verilator or sim)
 endif
 ifneq ($(findstring -DAM_SIM_MEDIA,$(AM_RUNNER_FLAGS)),)
 AM_SOURCES += am/src/riscv/sim-media.c

@@ -81,13 +81,38 @@ make PLATFORM=ysyxsoc \
 
 `YSYX_NPC` and `YSYX_SOC` are required and have no defaults.
 
+### Proto-soc chip model (refsim)
+
+```sh
+make PLATFORM=sim \
+  SIM_CORE=/path/to/proto-core/quad-issue-rvv \
+  run
+```
+
+`SIM_CORE` is required and has no default: the core checkout whose
+`sim/soc` builds `refsim-soc`, the model of the proto-soc chip (100 MHz,
+32-bit SDRAM, the chip's caches). Like `PLATFORM=spike run`, `run` opens a
+window: the independent core's player (Dragon Ball, the RV32 translator, the
+RVV PPU kernels) with picture, sound and keys, built in `build/sim-media` and
+run by `refsim-soc-media` in fast-forward (instruction by instruction, no
+cycle timing; a few frames per second). The cycle-exact measurement is a
+separate target:
+
+```sh
+make PLATFORM=sim SIM_CORE=/path/to/proto-core/quad-issue-rvv run-gba-next-bench
+```
+
+It builds the benchmark as for the board (the `PLATFORM=fpga` image, byte for
+byte, with its recorded input), runs the warmup functionally and the measured
+frames cycle by cycle, and prints the window's cycles, IPC and FPS.
+
 ## Variables by platform
 
 ### Common
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `PLATFORM` | Build target: `native`, `spike` or `ysyxsoc` | `native` |
+| `PLATFORM` | Build target: `native`, `spike`, `ysyxsoc` or `sim` | `native` |
 | `ROM` | ROM name under `roms/` (embedded for bare-metal targets); `.gba` is added when omitted | Native / Spike: `dragonball`; ysyxsoc: `cinema/gba/obj/2d-wrap/test.gba` |
 | `BUILD_DIR` | Build output directory | `build` or a platform-specific directory |
 | `RV32_RUNNER` | Experimental ARM/Thumb-to-RV32 block translator on RV32 targets | `0` |
@@ -136,6 +161,24 @@ disable only audio.
 | `GPIO` | Fixed input mask for Spike | `0` |
 
 Spike saves last for the current run only.
+
+### Sim (proto-soc chip model)
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `SIM_CORE` | Core checkout that builds `sim/soc/refsim-soc` (and `refsim-soc-media` for `run`) | required |
+| `GBN_PLAYER_FRAMES` | `run`: stop after this many frames; `0` runs until the window is closed | `0` |
+| `GBN_WARMUP`, `GBN_FRAMES` | `run-gba-next-bench`: warmup frames run functionally, then the frames timed cycle by cycle; the window opens at the warmup line when `GBN_WARMUP` is a multiple of 100, else at the start | `100`, `30`; the standard measurement is `4500`, `120` |
+| `GBN_CAPTURE` | `1`: run to the end and write pictures (`shot-*.png`), sound (`audio.wav`) and per-frame CRCs instead of timing | `0` |
+| `SIM_REFERENCE` | `capture.bin` of another `GBN_CAPTURE=1` run: report the first differing frame and differing pixels | empty |
+| `SIM_PROFILE` | `1`: per-function profile of the window | `0` |
+| `SIM_ARGS` | Extra `refsim-soc` options, such as `--ic-kb 128` | empty |
+| `SIM_HOST` | Run on that host (copies the ELF, runs its mirror of `SIM_CORE` in the tool image, copies the results back) | empty: here |
+
+`run-gba-next-bench` results go to `build/sim/sim-gba-next-bench/`
+(`summary.txt`, `stats.json`, `pcs.tsv`, `console.log`, `capture/`).
+`run-mgba` times the mGBA player benchmark instead; the model then executes
+its interpreter cycle by cycle, which is slow.
 
 ### Own core + ysyxSoC
 
