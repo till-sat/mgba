@@ -209,14 +209,24 @@ GBN_RV32_CODE_MIB ?= 16
 # prologue/epilogue, 8 dead C/V elimination, 16 direct block links, 128
 # compact exit edges, 256 ROM chained entries right before the body, 512
 # rarely taken load/store paths after the epilogue, 1024 Thumb fetch time
-# added once per block exit. Devices (also without the translator): 32 DMA
-# transfers and sound FIFO bursts at once, 64 timer overflows only the sound
-# FIFOs see without events, 2048 lines drawn in batches before a write that
-# could change them and at VBlank (catch-up rendering), 4096 PCM at most
-# 32768 Hz and unrouted PSG oscillators not advanced. 8191 enables all.
-# Pictures and sound stay correct but no longer match the exact core frame for
-# frame; 0 is the exact translator, which test-gba-next-rv32 compares cycle by
-# cycle.
+# added once per block exit, 16384 only the Thumb flags read later, 131072
+# Thumb shifts by register lowered when C is dead, 262144 DMAs started by ROM
+# code run without leaving native code, 4194304 loads, stores, PUSH/POP and
+# indirect branch checks through shared leaves addressed by tp, 8388608
+# Thumb ALU results written straight to guest registers, immediates folded
+# and branch conditions tested in the block tail, 16777216 no flags live
+# across BX/POP {PC}/MOV PC (AAPCS). Devices (also without the translator):
+# 32 DMA transfers and sound FIFO bursts at once, 64 timer overflows only the
+# sound FIFOs see without events, 2048 lines drawn in batches before a write
+# that could change them and at VBlank (catch-up rendering), 4096 PCM at most
+# 32768 Hz and unrouted PSG oscillators not advanced, 8192 and 524288 the
+# mixer's resampling and fixed-frequency loops run in C, 32768 BG rows reused
+# while their VRAM pages are unchanged, 65536 HBlank starts nobody observes
+# merged into the line end, 1048576 plain immediate DMAs in one step,
+# 2097152 sound timer overflows without the general sample path. 33554431
+# enables all. Pictures and sound stay correct but no longer match the exact
+# core frame for frame; 0 is the exact translator, which test-gba-next-rv32
+# compares cycle by cycle.
 GBN_RV32_FAST ?= 0
 # 1: the frontends put the GBA's IWRAM, VRAM, palette, OAM and picture in
 # the wide SRAM where the platform has one (am.h AM_WSRAM).

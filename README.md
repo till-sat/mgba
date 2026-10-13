@@ -118,7 +118,7 @@ frames cycle by cycle, and prints the window's cycles, IPC and FPS.
 | `BUILD_DIR` | Build output directory | `build` or a platform-specific directory |
 | `RV32_RUNNER` | Experimental ARM/Thumb-to-RV32 block translator on RV32 targets | `0` |
 | `GBN_WSRAM` | `1`: put the GBA's IWRAM, VRAM, palette, OAM and picture in proto-soc's wide SRAM (`fpga` and `sim`; other platforms ignore it) | `1` |
-| `GBN_RV32_FAST` | With `GBN_RV32=1`: relaxed-timing translation (bits in the Makefile); `0` is the exact translator, whose frames match the interpreter's (`test-gba-next-rv32` needs it); `31` enables all of it | `0` |
+| `GBN_RV32_FAST` | With `GBN_RV32=1`: relaxed-timing translation (bits in the Makefile); `0` is the exact translator, whose frames match the interpreter's (`test-gba-next-rv32` needs it); `33554431` enables all of it | `0` |
 
 The experimental translator, its validation commands and instruction-count results are described in [doc/rv32-runner.md](doc/rv32-runner.md).
 
