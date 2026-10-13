@@ -209,12 +209,13 @@ GBN_RV32_CODE_MIB ?= 16
 # prologue/epilogue, 8 dead C/V elimination, 16 direct block links, 128
 # compact exit edges, 256 ROM chained entries right before the body, 512
 # rarely taken load/store paths after the epilogue, 1024 Thumb fetch time
-# added once per block exit. Devices
-# (also without the translator): 32 DMA transfers and sound FIFO bursts at
-# once, 64 timer overflows only the sound FIFOs see without events. 2047
-# enables all. Pictures and sound stay correct but no longer match the exact
-# core frame for frame; 0 is the exact translator, which test-gba-next-rv32
-# compares cycle by cycle.
+# added once per block exit. Devices (also without the translator): 32 DMA
+# transfers and sound FIFO bursts at once, 64 timer overflows only the sound
+# FIFOs see without events, 2048 lines drawn in batches before a write that
+# could change them and at VBlank (catch-up rendering). 4095 enables all.
+# Pictures and sound stay correct but no longer match the exact core frame for
+# frame; 0 is the exact translator, which test-gba-next-rv32 compares cycle by
+# cycle.
 GBN_RV32_FAST ?= 0
 # 1: the frontends put the GBA's IWRAM, VRAM, palette, OAM and picture in
 # the wide SRAM where the platform has one (am.h AM_WSRAM).

@@ -271,6 +271,9 @@ static __attribute__((noinline)) bool dma_span(struct Gbn* m, unsigned channel) 
 	const uint8_t* src = dma_read_pointer(m, source, width);
 	uint8_t* dst = dma_write_pointer(m, dest, width);
 	if (!src || !dst || (((uintptr_t) src | (uintptr_t) dst) & (width - 1))) return false;
+#if GBN_RV32_FAST & 2048
+	gbn_ppu_before_write(m, dest);
+#endif
 	unsigned sm = source >= 0x08000000 && source < 0x0e000000 ? 0 : c->control >> 7 & 3;
 	unsigned dm = c->fifo ? 2 : c->control >> 5 & 3;
 	int ss = sm == 2 ? 0 : sm == 1 ? -(int) width : (int) width;
@@ -391,6 +394,9 @@ enum GbnStatus gbn_dma_service(struct Gbn* m) {
 	uint32_t ignored;
 	uint8_t* dest_pointer = dma_write_pointer(m, dest, width);
 	enum GbnStatus status;
+#if GBN_RV32_FAST & 2048
+	if (dest_pointer) gbn_ppu_before_write(m, dest);
+#endif
 	if (dest_pointer) {
 		uint32_t stored = width == 2 ? value >> ((dest & 2) * 8) : value;
 		for (unsigned i = 0; i < width; ++i) dest_pointer[i] = (uint8_t) (stored >> (8 * i));

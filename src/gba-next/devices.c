@@ -75,6 +75,21 @@ void gbn_video_start(struct Gbn* m, bool skip_bios) {
 	gbn_schedule(m, GBN_EVENT_VIDEO, skip_bios ? 120 : 1008, 8);
 }
 
+#if GBN_RV32_FAST & 2048
+/* Fast mode: lines are drawn in batches. HBlank only marks its line due; the
+ * due lines are drawn before any write that could change them (video memory,
+ * display registers, DMA into them; gbn_ppu_before_write) and at VBlank, so
+ * every line still shows the state of its own HBlank. */
+enum GbnStatus gbn_ppu_catchup(struct Gbn* m) {
+	struct GbnDevices* d = m->devices;
+	while (d->ppu_drawn < d->ppu_due) {
+		enum GbnStatus status = gbn_ppu_line(m, d->ppu_drawn++);
+		if (status != GBN_STEP) { d->ppu_drawn = d->ppu_due; return status; }
+	}
+	return GBN_STEP;
+}
+#endif
+
 enum GbnStatus gbn_service_events(struct Gbn* m) {
 	if (!m->devices) return GBN_INVALID_ARGUMENT;
 	struct GbnDevices* d = m->devices;
@@ -134,8 +149,19 @@ enum GbnStatus gbn_service_events(struct Gbn* m) {
 			continue;
 		}
 		if (d->video_running && !(d->io[DISPSTAT] & 2) && d->io[VCOUNT] < 160) {
+#if GBN_RV32_FAST & 2048
+			/* Lines that had no HBlank this frame (video started mid-frame)
+			 * are not drawn, as before. */
+			if (d->ppu_due != d->io[VCOUNT]) {
+				enum GbnStatus status = gbn_ppu_catchup(m);
+				if (status != GBN_STEP) return status;
+				d->ppu_drawn = (uint8_t) d->io[VCOUNT];
+			}
+			d->ppu_due = (uint8_t) (d->io[VCOUNT] + 1);
+#else
 			enum GbnStatus status = gbn_ppu_line(m, d->io[VCOUNT]);
 			if (status != GBN_STEP) return status;
+#endif
 		}
 		gbn_cancel(m, GBN_EVENT_VIDEO);
 		if (!d->video_running) continue;
@@ -151,6 +177,13 @@ enum GbnStatus gbn_service_events(struct Gbn* m) {
 			d->io[DISPSTAT] &= ~2u;
 			if (++d->io[VCOUNT] == 228) d->io[VCOUNT] = 0;
 			if (!d->io[VCOUNT]) check_keys(m);
+#if GBN_RV32_FAST & 2048
+			if (!d->io[VCOUNT]) d->ppu_due = d->ppu_drawn = 0;
+			if (d->io[VCOUNT] == 160) {
+				enum GbnStatus status = gbn_ppu_catchup(m);
+				if (status != GBN_STEP) return status;
+			}
+#endif
 			vcount_match(m, when);
 			if (d->io[VCOUNT] == 160) {
 				d->io[DISPSTAT] |= 1;
@@ -291,6 +324,9 @@ bool gbn_device_writable(const struct Gbn* m, uint32_t address, unsigned width) 
 
 enum GbnStatus gbn_device_write(struct Gbn* m, uint32_t address, unsigned width, uint32_t value, uint32_t* cycles) {
 	if (!gbn_device_writable(m, address, width)) return GBN_UNSUPPORTED_ADDRESS;
+#if GBN_RV32_FAST & 2048
+	gbn_ppu_before_write(m, address);
+#endif
 	unsigned region = address >> 24;
 	*cycles = width == 4 && (region == 5 || region == 6) ? 2 : 1;
 	if (region == 4) {

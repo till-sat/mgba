@@ -89,4 +89,16 @@ void gbn_save_dma(struct Gbn*, uint32_t dest, unsigned width, uint32_t count);
 unsigned gbn_save_wait(const struct Gbn*, uint32_t address);
 void gbn_ppu_reference(struct Gbn*, unsigned offset);
 enum GbnStatus gbn_ppu_line(struct Gbn*, unsigned y);
+#if GBN_RV32_FAST & 2048
+/* Draw the lines whose HBlank has passed (devices.c). */
+enum GbnStatus gbn_ppu_catchup(struct Gbn*);
+/* Before a write at address (width bytes, any region) that may change a line
+ * not yet drawn: video memory, display registers, or DMA into them. */
+static inline void gbn_ppu_before_write(struct Gbn* m, uint32_t address) {
+	unsigned region = address >> 24;
+	if (m->devices && m->devices->ppu_drawn < m->devices->ppu_due &&
+	    ((region >= 5 && region <= 7) || (region == 4 && (address & 0xffffff) < 0x60)))
+		(void) gbn_ppu_catchup(m);
+}
+#endif
 #endif

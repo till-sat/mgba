@@ -159,6 +159,9 @@ struct GbnDevices {
 	struct GbnAudio audio;
 	struct GbnSio sio;
 	struct GbnPpu ppu;
+#if GBN_RV32_FAST & 2048
+	uint8_t ppu_due, ppu_drawn; /* catch-up rendering: lines whose HBlank passed, lines drawn */
+#endif
 };
 
 struct Gbn {
