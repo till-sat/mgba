@@ -20,9 +20,27 @@ uint16_t gbn_timer_read(const struct Gbn* m, unsigned id, uint32_t when) {
 	return (uint16_t) value;
 }
 
+#if GBN_RV32_FAST & 64
+/* Only the sound FIFOs observe these overflows (reads compute the value). */
+static bool batched(const struct GbnDevices* d, unsigned id) {
+	const struct GbnTimer* t = &d->timers[id];
+	return (t->control & 0xc0) == 0x80 && !cascade(t, id) &&
+		(id == 3 || (d->timers[id + 1].control & 0x84) != 0x84);
+}
+/* The earliest pending batched overflow of the machine last caught up, so
+ * that the frequent calls with nothing due return at once. Every timer
+ * change goes through schedule_timer, which forgets it. */
+static const struct Gbn* due_machine;
+static uint32_t due_when;
+#endif
+
 static void schedule_timer(struct Gbn* m, unsigned id) {
 	struct GbnTimer* t = &m->devices->timers[id];
 	gbn_cancel(m, GBN_EVENT_TIMER0 + id);
+#if GBN_RV32_FAST & 64
+	due_machine = 0;
+	if (batched(m->devices, id)) return;
+#endif
 	if ((t->control & 0x80) && !cascade(t, id)) {
 		gbn_schedule_at(m, GBN_EVENT_TIMER0 + id, t->epoch + ((0x10000u - t->value) << shift(t->control)), (uint8_t) (0x20 + id));
 	}
@@ -30,6 +48,9 @@ static void schedule_timer(struct Gbn* m, unsigned id) {
 
 void gbn_timer_write(struct Gbn* m, unsigned id, bool control, uint16_t value, uint16_t mask) {
 	struct GbnTimer* t = &m->devices->timers[id];
+#if GBN_RV32_FAST & 64
+	gbn_timer_catchup_now(m);
+#endif
 	if (!control) { t->reload = (t->reload & ~mask) | (value & mask); return; }
 	uint16_t old = t->control;
 	t->value = gbn_timer_read(m, id, m->now);
@@ -38,6 +59,10 @@ void gbn_timer_write(struct Gbn* m, unsigned id, bool control, uint16_t value, u
 	t->epoch = m->now & ~((1u << shift(t->control)) - 1);
 	m->devices->io[(0x102 + 4 * id) / 2] = t->control;
 	schedule_timer(m, id);
+#if GBN_RV32_FAST & 64
+	/* A new cascade below changes whether the previous timer is batched. */
+	if (id) schedule_timer(m, id - 1);
+#endif
 }
 
 void gbn_timer_service(struct Gbn* m, unsigned id, uint32_t when) {
@@ -52,3 +77,31 @@ void gbn_timer_service(struct Gbn* m, unsigned id, uint32_t when) {
 		if ((next->control & 0x84) == 0x84 && ++next->value == 0) gbn_timer_service(m, id + 1, when);
 	}
 }
+
+#if GBN_RV32_FAST & 64
+void gbn_timer_catchup(struct Gbn* m, uint32_t until) {
+	struct GbnDevices* d = m->devices;
+	if (!d || (due_machine == m && (int32_t) (due_when - until) > 0)) return;
+	uint32_t next[4];
+	unsigned live = 0;
+	for (unsigned id = 0; id < 4; ++id) if (batched(d, id)) {
+		const struct GbnTimer* t = &d->timers[id];
+		next[id] = t->epoch + ((0x10000u - t->value) << shift(t->control));
+		live |= 1u << id;
+	}
+	for (;;) {
+		int best = -1;
+		uint32_t when = until + GBN_MAX_DELAY;
+		for (unsigned id = 0; id < 4; ++id)
+			if ((live >> id & 1) && (best < 0 || (int32_t) (next[id] - when) < 0)) { best = (int) id; when = next[id]; }
+		if (best < 0 || (int32_t) (when - until) > 0) { due_machine = m; due_when = when; return; }
+		/* gbn_timer_service without its event, IRQ and cascade: batched
+		 * timers have none of them. */
+		struct GbnTimer* t = &d->timers[best];
+		t->value = t->reload;
+		t->epoch = when;
+		gbn_audio_timer(m, (unsigned) best, when);
+		next[best] = when + ((0x10000u - t->reload) << shift(t->control));
+	}
+}
+#endif

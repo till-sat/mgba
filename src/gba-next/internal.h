@@ -2,6 +2,11 @@
 #ifndef GBA_NEXT_INTERNAL_H
 #define GBA_NEXT_INTERNAL_H
 #include <gba-next/core.h>
+/* Relaxed timing (Makefile GBN_RV32_FAST); bits 32 and 64 also apply to the
+ * interpreter. */
+#ifndef GBN_RV32_FAST
+#define GBN_RV32_FAST 0
+#endif
 struct GbnRv32;
 /* PCM has no guest-visible side effects. A CPU-only interval may cross its
  * clock, provided sound writes first catch up and the event service retains
@@ -56,6 +61,18 @@ void gbn_dma_fifo(struct Gbn*, unsigned fifo, uint32_t when);
 uint16_t gbn_timer_read(const struct Gbn*, unsigned timer, uint32_t when);
 void gbn_timer_write(struct Gbn*, unsigned timer, bool control, uint16_t value, uint16_t mask);
 void gbn_timer_service(struct Gbn*, unsigned timer, uint32_t when);
+#if GBN_RV32_FAST & 64
+/* Relaxed timing: a timer that raises no IRQ and drives no cascade overflows
+ * without events; its overflows up to until run here, in time order. */
+void gbn_timer_catchup(struct Gbn*, uint32_t until);
+/* Bounded by the next event, which must see the overflows before it. */
+static inline void gbn_timer_catchup_now(struct Gbn* m) {
+	int next = m->next_event;
+	uint32_t until = m->now;
+	if (next >= 0 && (int32_t) (until - m->events[next].when) > 0) until = m->events[next].when;
+	gbn_timer_catchup(m, until);
+}
+#endif
 bool gbn_audio_register(unsigned offset);
 uint16_t gbn_audio_reg_read(const struct Gbn*, unsigned offset);
 void gbn_audio_write(struct Gbn*, unsigned offset, unsigned width, uint32_t value);

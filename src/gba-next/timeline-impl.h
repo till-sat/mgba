@@ -66,6 +66,9 @@ void gbn_audio_timeline_drain(struct Gbn* m, uint32_t when, bool inclusive) {
 }
 
 void gbn_audio_timeline_materialize(struct Gbn* m) {
+#if GBN_RV32_FAST & 64
+    if (m && m->devices) gbn_timer_catchup_now(m);
+#endif
     if (!m || !m->devices || !m->devices->audio.pcm_detached) return;
     uint32_t through = m->now;
     unsigned next = m->event_head;

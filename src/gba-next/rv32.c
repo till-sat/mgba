@@ -1692,6 +1692,10 @@ static void indirect_tail(struct Emit* e, struct GbnRv32* backend) {
     e->returns[e->return_count++] = e->count; word(e, 0);
 }
 
+#if (GBN_RV32_FAST & 128) && !GBN_RV32_STATS
+static void far_jump(struct Emit*, uint32_t target, unsigned through, unsigned link);
+static uint32_t exit_stub(struct GbnRv32*, bool ram, bool miss);
+#endif
 static void tail(struct Emit* e, struct GbnRv32* backend, uint32_t pc, bool fallback) {
 	struct GbnRv32Block* b = e->block;
     /* The entry proof covers the entire contiguous source span. Native
@@ -1739,10 +1743,22 @@ static void tail(struct Emit* e, struct GbnRv32* backend, uint32_t pc, bool fall
 #if GBN_RV32_FAST & 16
 			{
 				/* Always two words: a direct link to the target replaces them. */
+#if (GBN_RV32_FAST & 128) && !GBN_RV32_STATS
+				if (e->link_count < GBN_RV32_INSNS + 2) { e->link_at[e->link_count] = e->count; e->link_pc[e->link_count++] = pc; }
+				(void) slot;
+				bool ram = backend->machine->code_region < 8;
+				far_jump(e, exit_stub(backend, ram, false), TEMP, TEMP);
+				for (unsigned i = 0; i < n; ++i)
+					b->code[misses[i]] |= beq(0, 0, 4 * (e->count - misses[i])) & 0xfe000f80u;
+				far_jump(e, exit_stub(backend, ram, true), TEMP, TEMP);
+				word(e, pc);
+				return;
+#else
 				uint32_t a = (uint32_t) (uintptr_t) &backend->lookup[slot], hi = (a + 0x800) >> 12;
 				if (e->link_count < GBN_RV32_INSNS + 2) { e->link_at[e->link_count] = e->count; e->link_pc[e->link_count++] = pc; }
 				word(e, hi << 12 | LHS << 7 | 0x37);
 				word(e, (a - (hi << 12)) << 20 | LHS << 15 | LHS << 7 | 0x13);
+#endif
 			}
 #else
 			constant(e, LHS, (uint32_t) (uintptr_t) &backend->lookup[slot]);
@@ -1836,6 +1852,59 @@ static void far_jump(struct Emit* e, uint32_t target, unsigned through, unsigned
 	uint32_t hi = (target + 0x800) >> 12;
 	word(e, hi << 12 | through << 7 | 0x37);
 	word(e, (target - (hi << 12)) << 20 | through << 15 | link << 7 | 0x67);
+}
+#endif
+
+#if (GBN_RV32_FAST & 128) && !GBN_RV32_STATS
+#if !(GBN_RV32_FAST & 4) || !(GBN_RV32_FAST & 16)
+#error "GBN_RV32_FAST bit 128 needs bits 4 and 16"
+#endif
+/* Fast mode: compact exit edges. After its budget and event checks an exit
+ * is a two-word link site, a two-word call of the shared miss routine and
+ * the target pc:
+ *     L: lui a3, lookup; jalr a3, a3   (a direct link patches both words)
+ *     M: lui a3, miss;   jalr a3, a3
+ *     P: .word pc
+ * The lookup routine reads the pc 8 bytes past its return address (M), the
+ * miss routine at its return address (P). Both exist per block kind (RAM
+ * blocks restore RAM_EPOCH) and per backend (the lookup table address). */
+static uint32_t exit_stub_code[2][48] __attribute__((aligned(64)));
+static const struct GbnRv32* exit_stub_backend[2];
+static unsigned exit_stub_miss[2];
+static uint32_t exit_stub(struct GbnRv32* backend, bool ram, bool miss) {
+	if (exit_stub_backend[ram] != backend) {
+		static struct GbnRv32Block routine; /* Emit is ~4 KiB: not on the compile stack */
+		static struct Emit r;
+		memset(&r, 0, sizeof(r));
+		routine.code = exit_stub_code[ram];
+		r.block = &routine;
+		struct Emit* e = &r;
+		word(e, 8u << 20 | TEMP << 15 | 2 << 12 | WAIT << 7 | 3); /* pc */
+		imm(e, LHS, WAIT, 5, 1); constant(e, RHS, 0x9e3779b1u);
+		op(e, LHS, LHS, RHS, 0, 1); imm(e, LHS, LHS, 5, GBN_RV32_HASH_SHIFT);
+		imm(e, LHS, LHS, 1, 2);
+		constant(e, RHS, (uint32_t) (uintptr_t) backend->lookup);
+		op(e, LHS, LHS, RHS, 0, 0);
+		word(e, LHS << 15 | 2 << 12 | LHS << 7 | 3);
+		unsigned misses[3], n = 0;
+		misses[n++] = e->count; word(e, beq(LHS, ZERO, 0));
+		word(e, offsetof(struct GbnRv32Block, chain) << 20 | LHS << 15 | 2 << 12 | RHS << 7 | 3);
+		misses[n++] = e->count; word(e, beq(RHS, ZERO, 0));
+		word(e, offsetof(struct GbnRv32Block, pc) << 20 | LHS << 15 | 2 << 12 | RESULT << 7 | 3);
+		misses[n++] = e->count; word(e, beq(RESULT, WAIT, 0) | 1u << 12);
+		word(e, RHS << 15 | 0x67); /* tail entry: no call, spill or prologue */
+		for (unsigned i = 0; i < n; ++i)
+			routine.code[misses[i]] |= beq(0, 0, 4 * (e->count - misses[i])) & 0xfe000f80u;
+		imm(e, TEMP, TEMP, 0, 8);
+		exit_stub_miss[ram] = e->count;
+		/* finish_count(e, 0, false), then the pc, as tail's own miss path */
+		word(e, TEMP << 15 | 2 << 12 | RHS << 7 | 3);
+		stack(e, TEMP, INITIAL_CAP, false);
+		op(e, LIMIT, TEMP, LIMIT, 0, 0x20);
+		far_jump(e, shared_frame(1, ram), TEMP, ZERO);
+		exit_stub_backend[ram] = backend; /* allocate_code's fence.i publishes it */
+	}
+	return (uint32_t) (uintptr_t) (exit_stub_code[ram] + (miss ? exit_stub_miss[ram] : 0));
 }
 #endif
 
@@ -2041,7 +2110,11 @@ static unsigned finish_body(struct GbnRv32* backend, struct GbnRv32Block* block,
 	for (unsigned i = 0; i < e->loop_jump_count; ++i)
         block->code[e->loop_jumps[i]] = beq(ZERO, ZERO, 4 * (loop_entry - e->loop_jumps[i]));
 	unsigned chain = loop_entry;
+#if GBN_RV32_FAST & 256
+	if (block->instructions && m->code_region < 8) {
+#else
 	if (block->instructions) {
+#endif
 		chain = e->count;
 		if (m->code_region < 8) {
 			constant(e, LHS, (uint32_t) (uintptr_t) &block->checked_epoch);
@@ -2295,6 +2368,17 @@ restart:;
 	e.read_only = true;
 	e.read_seen = e.dynamic_pc = e.skip_shifter = e.io_guarded = false;
 	memset(e.thumb_literal, 0, sizeof(e.thumb_literal));
+#if GBN_RV32_FAST & 256
+	/* Fast mode: a ROM block's chained entry proves its context right before
+	 * the body instead of in its tail; C entries and loops start after it. */
+	unsigned chain_at = 0;
+	if (m->code_region >= 8) {
+		chain_at = e.count;
+		constant(&e, TEMP, block->context_tag);
+		stop(&e, TEMP, CONTEXT, 1, false); e.stops[e.stop_count - 1].instruction = 0;
+		prologue_words = e.count;
+	}
+#endif
 	unsigned ram_guard_words = 0;
 	if (m->code_region < 8) {
 		uintptr_t address = (uintptr_t) m->code + (block->pc & m->code_mask);
@@ -2424,6 +2508,9 @@ restart:;
         block->code[fast_budget_at] = (uint32_t) block->instructions << 20 | ZERO << 15 | TEMP << 7 | 0x13;
 #endif
     unsigned chain = finish_body(backend, block, &e, prologue_words, edges, edge_count, &loop_entry);
+#if GBN_RV32_FAST & 256
+	if (m->code_region >= 8) chain = chain_at;
+#endif
 	e.count = 0;
 #if GBN_RV32_FAST & 4
 	far_jump(&e, shared_frame(0, m->code_region < 8), LHS, LHS);

@@ -77,6 +77,9 @@ static void reload_count(struct GbnDevices* d, unsigned channel) {
 
 void gbn_dma_write(struct Gbn* m, unsigned offset, uint16_t value) {
 	struct GbnDevices* d = m->devices;
+#if GBN_RV32_FAST & 64
+	gbn_timer_catchup_now(m); /* a sound DMA change must follow earlier overflows */
+#endif
 	unsigned channel = (offset - 0xb0) / 12, part = (offset - 0xb0) % 12;
 	struct GbnDma* c = &d->dma[channel];
 	if (part < 8) {
@@ -127,12 +130,19 @@ void gbn_dma_trigger(struct Gbn* m, unsigned timing, uint32_t when) {
 	select_dma(m);
 }
 
+#if GBN_RV32_FAST & 32
+static void fifo_burst(struct Gbn*, unsigned channel, unsigned fifo, uint32_t when);
+#endif
 void gbn_dma_fifo(struct Gbn* m, unsigned fifo, uint32_t when) {
 	struct GbnDevices* d = m->devices;
 	for (unsigned i = 1; i <= 2; ++i) {
 		struct GbnDma* c = &d->dma[i];
 		if ((c->control & 0xb000) != 0xb000 || c->dest != 0x040000a0u + 4 * fifo) continue;
 		if (c->remaining || c->finishing) continue;
+#if GBN_RV32_FAST & 32
+		fifo_burst(m, i, fifo, when);
+		continue;
+#endif
 		c->fifo = true; c->remaining = 4; c->when = when;
 		c->next_source &= ~3u;
 		c->next_dest = c->dest;
@@ -206,6 +216,43 @@ static enum GbnStatus dma_finish(struct Gbn* m,unsigned channel) {
 		return GBN_STEP;
 }
 
+#if GBN_RV32_FAST & 32
+/* Relaxed timing: a sound FIFO request moves its four words at once, without
+ * DMA events, and the CPU loses the burst's bus time. */
+static void fifo_burst(struct Gbn* m, unsigned channel, unsigned fifo, uint32_t when) {
+	struct GbnDevices* d = m->devices;
+	struct GbnDma* c = &d->dma[channel];
+	struct GbnFifo* f = &d->audio.fifo[fifo];
+	uint32_t source = c->next_source & ~3u, value = c->latch;
+	unsigned sm = source >= 0x08000000 && source < 0x0e000000 ? 0 : c->control >> 7 & 3;
+	unsigned cycles = 2;
+	for (unsigned beat = 0; beat < 4; ++beat) {
+		const uint8_t* p = dma_read_pointer(m, source, 4);
+		if (p) value = dma_raw_read(p, 4);
+		else if (source >= 0x02000000) {
+			struct GbnAccess access;
+			d->dma_access = true;
+			if (gbn_read(m, source, 4, &access) == GBN_STEP) value = access.value;
+			d->dma_access = false;
+		}
+		for (unsigned i = 0; i < 4 && f->size < 32; ++i)
+			f->data[(f->read + f->size++) & 31] = (uint8_t) (value >> (8 * i));
+		cycles += 2 + wait_cycles(m, source, 4, beat != 0) + wait_cycles(m, c->dest, 4, beat != 0);
+		source = advance(source, sm, 4);
+	}
+	++f->requests;
+	c->next_source = source; c->next_dest = c->dest;
+	c->latch = value; d->dma_bus = value; d->dma_bus_valid = true;
+	d->dma_pc = m->cpu.pc + (m->cpu.cpsr & 0x20 ? 2 : 4);
+	if (!(c->control & 0x200)) {
+		c->control &= ~0x8000u;
+		d->io[(0xba + channel * 12) / 2] &= ~0x8000u;
+	}
+	if ((int32_t) (when + cycles - m->now) > 0) m->now = when + cycles;
+	if (c->control & 0x4000) gbn_irq_at(m, (uint16_t) (0x100u << channel), m->now);
+}
+#endif
+
 /* Fuse a lone DMA, including its exact late first beat, through raw aligned
  * memory, strictly before any other event. Every bus beat still reads then
  * writes in order, including overlapping/fixed/decrementing transfers. */
@@ -238,6 +285,10 @@ static __attribute__((noinline)) bool dma_span(struct Gbn* m, unsigned channel) 
     uint32_t when = first ? m->now : c->when;
     unsigned other = m->event_head;
 	if (other == GBN_EVENT_DMA) other = m->event_next[other];
+#if GBN_RV32_FAST & 32
+	/* Relaxed timing: the whole run at once; later events wait for it. */
+	other = GBN_EVENT_COUNT;
+#endif
 	if (other < GBN_EVENT_COUNT) {
         int32_t distance = (int32_t) (m->events[other].when - when);
         if (distance <= 0 || (uint32_t) distance <= first_elapsed) return false;

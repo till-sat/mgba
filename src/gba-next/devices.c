@@ -81,6 +81,9 @@ enum GbnStatus gbn_service_events(struct Gbn* m) {
 	if (d->stopped) return GBN_UNSUPPORTED_DEVICE;
 	bool advanced = false;
 	for (;;) {
+#if GBN_RV32_FAST & 64
+		gbn_timer_catchup_now(m);
+#endif
         /* A halted CPU advances to its next real device boundary. PCM alone
          * cannot wake it. DMA may also cross PCM-only clocks; sound writes
          * synchronize before changing input. IRQ/DMA/timer ordering stays
@@ -92,6 +95,9 @@ enum GbnStatus gbn_service_events(struct Gbn* m) {
 			if (!d->dma_blocked && (!d->halted || advanced)) return GBN_STEP;
 			m->now = m->events[id].when;
 			advanced = true;
+#if GBN_RV32_FAST & 64
+			continue; /* overflows up to the event first */
+#endif
 		}
 		if (id < (int) GBN_EVENT_SAVE) return GBN_EVENT;
 		uint32_t when = m->events[id].when;

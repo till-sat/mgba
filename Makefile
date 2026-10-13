@@ -204,11 +204,15 @@ GBN_RV32_SLOTS ?= 16384
 GBN_RV32_WAYS ?= 8
 # Executable arena capacity; reduce for targets with less memory.
 GBN_RV32_CODE_MIB ?= 16
-# Relaxed-timing translation (bits: 1 block-level budget and event checks
-# without the ROM prefetch model, 2 lean loads, 4 shared prologue/epilogue,
-# 8 dead C/V elimination, 16 direct block links; 31 enables all). Pictures
-# and sound stay correct but no longer match the exact core frame for frame;
-# 0 is the exact translator, which test-gba-next-rv32 compares cycle by cycle.
+# Relaxed timing and fast paths (bits). Translator: 1 block-level budget and
+# event checks without the ROM prefetch model, 2 lean loads, 4 shared
+# prologue/epilogue, 8 dead C/V elimination, 16 direct block links, 128
+# compact exit edges, 256 ROM chained entries right before the body. Devices
+# (also without the translator): 32 DMA transfers and sound FIFO bursts at
+# once, 64 timer overflows only the sound FIFOs see without events. 511
+# enables all. Pictures and sound stay correct but no longer match the exact
+# core frame for frame; 0 is the exact translator, which test-gba-next-rv32
+# compares cycle by cycle.
 GBN_RV32_FAST ?= 0
 # Optional vector PPU kernels: bit 0 = 4bpp rows, bit 1 = RGB composition,
 # bit 2 = indexed spans. RISCV_C_ISA may keep ordinary C/LTO scalar.

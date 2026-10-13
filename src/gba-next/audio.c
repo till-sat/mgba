@@ -228,6 +228,9 @@ static void write_byte(struct Gbn* m, unsigned offset, uint8_t value) {
 }
 
 void gbn_audio_write(struct Gbn* m, unsigned offset, unsigned width, uint32_t value) {
+#if GBN_RV32_FAST & 64
+    gbn_timer_catchup_now(m);
+#endif
     if ((m->cpu_access || (m->devices->dma_access && m->devices->audio.pcm_detached))
             && m->devices->audio.batched) gbn_audio_catchup(m);
     struct GbnAudio* a = &m->devices->audio;
