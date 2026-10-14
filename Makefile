@@ -226,7 +226,9 @@ GBN_RV32_CODE_MIB ?= 16
 # 2097152 sound timer overflows without the general sample path, 33554432
 # the mixer loops service plain device events in place instead of returning
 # at each one, 134217728 unobserved line ends share one event up to 8 lines
-# apart (VCOUNT and DISPSTAT read through C). 268435455 enables all. Pictures and sound stay correct but no longer match the exact
+# apart (VCOUNT and DISPSTAT read through C), 268435456 Thumb cartridge
+# fetches pay the sequential wait five times in eight (the prefetch buffer
+# hides the rest on average). 536870911 enables all. Pictures and sound stay correct but no longer match the exact
 # core frame for frame; 0 is the exact translator, which test-gba-next-rv32
 # compares cycle by cycle.
 GBN_RV32_FAST ?= 0

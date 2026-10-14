@@ -105,6 +105,19 @@ struct Emit {
 #endif
 };
 
+#if (GBN_RV32_FAST & 268435456) && (GBN_RV32_FAST & 1024)
+/* Fast mode: a sequential Thumb fetch from the cartridge with its prefetch
+ * buffer on pays the wait five times in eight (by address); the buffer
+ * hides the rest on average. Paying always left this core frames late
+ * against the exact one, paying a quarter or none early; a half to three
+ * quarters matched it on every frame of the benchmark. */
+static unsigned thumb_fetch_wait(const struct Gbn* m, uint32_t pc) {
+	if (m->code_region < 8 || !(m->waitcnt & 0x4000)) return m->code_wait;
+	return (pc >> 1 & 7) < 5 ? m->code_wait : 0;
+}
+#else
+static __attribute__((unused)) unsigned thumb_fetch_wait(const struct Gbn* m, uint32_t pc) { (void) pc; return m->code_wait; }
+#endif
 static void word(struct Emit* e, uint32_t v) { e->block->code[e->count++] = v; }
 static void imm(struct Emit* e, unsigned rd, unsigned rs, unsigned fn, int v) {
 	word(e, ((uint32_t) v & 4095) << 20 | rs << 15 | fn << 12 | rd << 7 | 0x13);
@@ -1393,7 +1406,12 @@ static unsigned thumb_io_group(struct Emit* e, struct GbnRv32* backend,
 		imm(e, RESULT, LHS, 3, 16 - 2 * (n - 1)); op(e, RESULT, ZERO, RESULT, 0, 0x20);
 		op(e, LHS, LHS, RESULT, 7, 0); imm(e, LHS, LHS, 7, -2); op(e, PREFETCH, TEMP, LHS, 0, 0);
 	}
+#if (GBN_RV32_FAST & 268435456) && (GBN_RV32_FAST & 1024)
+	unsigned elapsed = n;
+	for (unsigned j = 0; j < n; ++j) elapsed += thumb_fetch_wait(m, pc + 2 * j);
+#else
 	unsigned elapsed = n * (1u + m->code_wait);
+#endif
 	if (elapsed < 2048) imm(e, NOW, NOW, 0, elapsed);
 	else { constant(e, RESULT, elapsed); op(e, NOW, NOW, RESULT, 0, 0); }
 #if GBN_RV32_STATS
@@ -3102,7 +3120,7 @@ static unsigned thumb_pop_pair(struct Emit* e, const struct Gbn* m, unsigned fir
 	}
 	/* The leaf adds one POP's internal cycle; the second one and both
 	 * fetches go with the block's deferred time. */
-	e->deferred += 1 + 2 * (1 + m->code_wait);
+	e->deferred += 3 + thumb_fetch_wait(m, pc) + thumb_fetch_wait(m, pc + 2);
 	e->block->instructions += 2;
 	return 2;
 }
@@ -3333,7 +3351,7 @@ restart:;
 			block->fallback = true; break;
 		}
 #if GBN_RV32_FAST & 1024
-		if (block->thumb) e.deferred += 1 + m->code_wait; else
+		if (block->thumb) e.deferred += 1 + thumb_fetch_wait(m, pc); else
 #endif
 		imm(&e, NOW, NOW, 0, 1 + (block->thumb ? m->code_wait : m->code_word_wait));
 		++block->instructions;
