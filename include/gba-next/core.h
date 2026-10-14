@@ -178,6 +178,9 @@ struct GbnDevices {
 	bool hblank_merged;
 	bool hblank_seen; /* hblank_observed(), refreshed by DISPSTAT/IE/DMA control writes */
 	uint32_t line_when;
+#if GBN_RV32_FAST & 134217728
+	uint8_t lazy_lines; /* merged line ends still to apply before the VIDEO event's own */
+#endif
 #endif
 #endif
 };

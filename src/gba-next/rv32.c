@@ -458,7 +458,9 @@ static void access_value(struct Emit* e, uint32_t pc, unsigned rd, unsigned kind
  * Bits 4/5 permit pure open-bus byte/halfword and word reads.
  * Dynamic timers/audio/SIO, WAITCNT and EEPROM keep the bus path. */
 static const uint8_t native_io_readable[0x210 / 2] = {
-#if GBN_RV32_FAST & 65536
+#if (GBN_RV32_FAST & 65536) && (GBN_RV32_FAST & 134217728)
+	[0] = 3, [1] = 3, [2] = 0, [3] = 0, /* DISPSTAT, VCOUNT: merged lines applied in C */
+#elif GBN_RV32_FAST & 65536
 	[0] = 3, [1] = 3, [2] = 0, [3] = 3, /* DISPSTAT: HBlank flag computed in C */
 #else
 	[0] = 3, [1] = 3, [2] = 3, [3] = 3,

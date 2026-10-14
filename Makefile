@@ -225,7 +225,8 @@ GBN_RV32_CODE_MIB ?= 16
 # merged into the line end, 1048576 plain immediate DMAs in one step,
 # 2097152 sound timer overflows without the general sample path, 33554432
 # the mixer loops service plain device events in place instead of returning
-# at each one. 67108863 enables all. Pictures and sound stay correct but no longer match the exact
+# at each one, 134217728 unobserved line ends share one event up to 8 lines
+# apart (VCOUNT and DISPSTAT read through C). 268435455 enables all. Pictures and sound stay correct but no longer match the exact
 # core frame for frame; 0 is the exact translator, which test-gba-next-rv32
 # compares cycle by cycle.
 GBN_RV32_FAST ?= 0

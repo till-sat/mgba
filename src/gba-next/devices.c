@@ -55,6 +55,15 @@ static bool hblank_observed(const struct GbnDevices* d) {
 void gbn_hblank_observe(struct Gbn* m) {
 	struct GbnDevices* d = m->devices;
 	if (!d) return;
+#if (GBN_RV32_FAST & 134217728) && (GBN_RV32_FAST & 2048)
+	gbn_video_catchup(m);
+	if (d->lazy_lines) {
+		/* LYC, its interrupt or an HBlank observer may have changed: the
+		 * span ends with the current line again, then is planned anew. */
+		d->lazy_lines = 0;
+		gbn_schedule_at(m, GBN_EVENT_VIDEO, d->line_when + 1232, 8);
+	}
+#endif
 	d->hblank_seen = hblank_observed(d);
 	if (!d->hblank_merged || !d->hblank_seen || (int32_t) (m->now - (d->line_when + 1008)) >= 0) return;
 	d->hblank_merged = false;
@@ -87,6 +96,40 @@ static void vcount_match(struct Gbn* m, uint32_t when) {
 	if (match && !old && (io[DISPSTAT] & 0x20)) gbn_irq_at(m, 4, when);
 }
 
+#if (GBN_RV32_FAST & 134217728) && (GBN_RV32_FAST & 65536) && (GBN_RV32_FAST & 2048)
+/* Fast mode: lines whose end nobody observes (merged HBlank, not 0, 160 or
+ * 227, not an interrupting VCount match) share one event, at most LAZY_LINES
+ * lines apart: that also bounds how late the timers' sound FIFO refills are
+ * caught up. Their ends are applied here, in order, as the event would have,
+ * when the span's event comes or something looks at the lines first. */
+enum { LAZY_LINES = 8 };
+static void ppu_line_end(struct Gbn* m);
+/* The ends of the merged lines that ended before until, short of last. */
+static void video_lines(struct Gbn* m, uint32_t until) {
+	struct GbnDevices* d = m->devices;
+	while (d->lazy_lines && (int32_t) (until - (d->line_when + 1232)) >= 0) {
+		ppu_line_end(m);
+		++d->io[VCOUNT];
+		vcount_match(m, d->line_when + 1232);
+		d->line_when += 1232;
+		--d->lazy_lines;
+	}
+}
+void gbn_video_catchup(struct Gbn* m) {
+	if (m->devices && m->devices->lazy_lines) video_lines(m, m->now);
+}
+/* The next line that needs its own event, from the line starting now. */
+static unsigned lazy_span(const struct GbnDevices* d) {
+	unsigned v = d->io[VCOUNT], n = v + LAZY_LINES;
+	if (v < 160 && n > 160) n = 160;
+	if (v < 227 && n > 227) n = 227;
+	if (n > 228) n = 228;
+	unsigned lyc = d->io[DISPSTAT] >> 8;
+	if ((d->io[DISPSTAT] & 0x20) && lyc > v && lyc < n) n = lyc;
+	return n - v;
+}
+#endif
+
 void gbn_video_start(struct Gbn* m, bool skip_bios) {
 	if (!m->devices) return;
 	struct GbnDevices* d = m->devices;
@@ -95,6 +138,9 @@ void gbn_video_start(struct Gbn* m, bool skip_bios) {
 	d->frames = 0;
 	d->io[VCOUNT] = skip_bios ? 126 : 0;
 	d->io[DISPSTAT] &= ~7u;
+#if (GBN_RV32_FAST & 134217728) && (GBN_RV32_FAST & 65536) && (GBN_RV32_FAST & 2048)
+	d->lazy_lines = 0;
+#endif
 	vcount_match(m, m->now);
 	gbn_schedule(m, GBN_EVENT_VIDEO, skip_bios ? 120 : 1008, 8);
 }
@@ -114,6 +160,19 @@ enum GbnStatus gbn_ppu_catchup(struct Gbn* m) {
 }
 #endif
 
+#if (GBN_RV32_FAST & 134217728) && (GBN_RV32_FAST & 65536) && (GBN_RV32_FAST & 2048)
+/* The catch-up bookkeeping of a merged line's end, as in the event below. */
+static void ppu_line_end(struct Gbn* m) {
+	struct GbnDevices* d = m->devices;
+	if (!d->video_running || (d->io[DISPSTAT] & 2) || d->io[VCOUNT] >= 160) return;
+	if (d->ppu_due == d->io[VCOUNT] + 1) {} else
+	if (d->ppu_due != d->io[VCOUNT]) {
+		(void) gbn_ppu_catchup(m);
+		d->ppu_drawn = (uint8_t) d->io[VCOUNT];
+	}
+	d->ppu_due = (uint8_t) (d->io[VCOUNT] + 1);
+}
+#endif
 /* passive (a mixer HLE servicing events between its samples): IRQ, DMA and
  * serial events stay pending for the main loop, the CPU state not being
  * committed then. */
@@ -179,6 +238,9 @@ static inline __attribute__((always_inline)) enum GbnStatus service_events(struc
 			gbn_cancel(m, GBN_EVENT_IRQ);
 			continue;
 		}
+#if (GBN_RV32_FAST & 134217728) && (GBN_RV32_FAST & 65536) && (GBN_RV32_FAST & 2048)
+		if (d->lazy_lines) video_lines(m, when - 1);
+#endif
 		if (d->video_running && !(d->io[DISPSTAT] & 2) && d->io[VCOUNT] < 160) {
 #if GBN_RV32_FAST & 2048
 			/* Lines that had no HBlank this frame (video started mid-frame)
@@ -238,7 +300,13 @@ static inline __attribute__((always_inline)) enum GbnStatus service_events(struc
 			d->line_when = when;
 			if (!d->hblank_seen) {
 				d->hblank_merged = true;
+#if (GBN_RV32_FAST & 134217728) && (GBN_RV32_FAST & 2048)
+				unsigned span = lazy_span(d);
+				d->lazy_lines = (uint8_t) (span - 1);
+				gbn_schedule_at(m, GBN_EVENT_VIDEO, when + span * 1232, 8);
+#else
 				gbn_schedule_at(m, GBN_EVENT_VIDEO, when + 1232, 8);
+#endif
 				continue;
 			}
 #endif
@@ -296,6 +364,9 @@ static void io_write(struct Gbn* m, uint32_t offset, uint16_t value, uint16_t ma
 		gbn_timer_write(m, (offset - 0x100) / 4, (offset & 2) != 0, value, mask);
 		return;
 	}
+#if (GBN_RV32_FAST & 134217728) && (GBN_RV32_FAST & 65536) && (GBN_RV32_FAST & 2048)
+	if (offset == 4 || offset == 0x200) gbn_video_catchup(m);
+#endif
 	uint16_t* io = m->devices->io;
 	uint16_t old = io[offset / 2];
 	if (offset == 0x202) { /* IF is write-one-to-clear, including byte writes. */
@@ -366,6 +437,9 @@ enum GbnStatus gbn_device_read(const struct Gbn* m, uint32_t address, unsigned w
 	if (region == 4) {
 		uint32_t offset = address & 0xffffff;
 		if (!io_supported(offset & ~1u) || (width == 4 && !io_supported(offset + 2))) return GBN_UNSUPPORTED_ADDRESS;
+#if (GBN_RV32_FAST & 134217728) && (GBN_RV32_FAST & 65536) && (GBN_RV32_FAST & 2048)
+		if ((offset & ~3u) == 4) gbn_video_catchup((struct Gbn*) m); /* lines and flags as of now */
+#endif
 		value = io_read(m, offset & ~1u);
 		if (width == 1) value = value >> ((offset & 1) * 8) & 255;
 		else if (width == 4) value |= (uint32_t) io_read(m, offset + 2) << 16;

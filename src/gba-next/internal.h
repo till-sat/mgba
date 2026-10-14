@@ -113,6 +113,9 @@ static inline void gbn_vram_written(struct GbnDevices* d, uint32_t lo, uint32_t 
 enum GbnStatus gbn_ppu_catchup(struct Gbn*);
 #if GBN_RV32_FAST & 65536
 void gbn_hblank_observe(struct Gbn*); /* after DISPSTAT, IE or DMA control writes */
+#if (GBN_RV32_FAST & 134217728) && (GBN_RV32_FAST & 2048)
+void gbn_video_catchup(struct Gbn*); /* apply the merged line ends passed by now */
+#endif
 #endif
 /* Before a write at address (width bytes, any region) that may change a line
  * not yet drawn: video memory, display registers, or DMA into them. */
@@ -121,6 +124,11 @@ static inline void gbn_ppu_before_write(struct Gbn* m, uint32_t address) {
 #if GBN_RV32_FAST & 65536
 	/* A merged line becomes due at its HBlank start, without an event. */
 	struct GbnDevices* d = m->devices;
+#if GBN_RV32_FAST & 134217728
+	if (d && d->lazy_lines && (int32_t) (m->now - (d->line_when + 1232)) >= 0 &&
+	    ((region >= 5 && region <= 7) || (region == 4 && (address & 0xffffff) < 0x60)))
+		gbn_video_catchup(m);
+#endif
 	if (d && d->hblank_merged && d->io[3] < 160 && d->ppu_due == d->io[3] &&
 	    (int32_t) (m->now - (d->line_when + 1008)) >= 0 &&
 	    ((region >= 5 && region <= 7) || (region == 4 && (address & 0xffffff) < 0x60)))
