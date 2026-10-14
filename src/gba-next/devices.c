@@ -102,13 +102,19 @@ static void vcount_match(struct Gbn* m, uint32_t when) {
  * lines apart: that also bounds how late the timers' sound FIFO refills are
  * caught up. Their ends are applied here, in order, as the event would have,
  * when the span's event comes or something looks at the lines first. */
-enum { LAZY_LINES = 8 };
+#ifndef GBN_LAZY_LINES
+#define GBN_LAZY_LINES 8
+#endif
+enum { LAZY_LINES = GBN_LAZY_LINES };
 static void ppu_line_end(struct Gbn* m);
 /* The ends of the merged lines that ended before until, short of last. */
 static void video_lines(struct Gbn* m, uint32_t until) {
 	struct GbnDevices* d = m->devices;
 	while (d->lazy_lines && (int32_t) (until - (d->line_when + 1232)) >= 0) {
 		ppu_line_end(m);
+		/* The merged HBlank's flag, raised although IE masks it (merging
+		 * proves that), so it changes no interrupt state. */
+		if (d->io[DISPSTAT] & 0x10) d->io[IF] |= 2;
 		++d->io[VCOUNT];
 		vcount_match(m, d->line_when + 1232);
 		d->line_when += 1232;
@@ -365,7 +371,8 @@ static void io_write(struct Gbn* m, uint32_t offset, uint16_t value, uint16_t ma
 		return;
 	}
 #if (GBN_RV32_FAST & 134217728) && (GBN_RV32_FAST & 65536) && (GBN_RV32_FAST & 2048)
-	if (offset == 4 || offset == 0x200) gbn_video_catchup(m);
+	/* Skipped line ends set VCount and masked HBlank flags first. */
+	if (offset == 4 || offset == 0x200 || offset == 0x202 || offset == 0x208) gbn_video_catchup(m);
 #endif
 	uint16_t* io = m->devices->io;
 	uint16_t old = io[offset / 2];
@@ -438,7 +445,7 @@ enum GbnStatus gbn_device_read(const struct Gbn* m, uint32_t address, unsigned w
 		uint32_t offset = address & 0xffffff;
 		if (!io_supported(offset & ~1u) || (width == 4 && !io_supported(offset + 2))) return GBN_UNSUPPORTED_ADDRESS;
 #if (GBN_RV32_FAST & 134217728) && (GBN_RV32_FAST & 65536) && (GBN_RV32_FAST & 2048)
-		if ((offset & ~3u) == 4) gbn_video_catchup((struct Gbn*) m); /* lines and flags as of now */
+		if ((offset & ~3u) == 4 || (offset & ~3u) == 0x200) gbn_video_catchup((struct Gbn*) m); /* lines and flags as of now */
 #endif
 		value = io_read(m, offset & ~1u);
 		if (width == 1) value = value >> ((offset & 1) * 8) & 255;

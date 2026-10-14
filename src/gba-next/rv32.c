@@ -469,7 +469,11 @@ static const uint8_t native_io_readable[0x210 / 2] = {
 	[0x48 / 2] = 3, [0x4a / 2] = 1,
 	[0x50 / 2] = 3, [0x52 / 2] = 1,
 	[0x130 / 2] = 3, [0x132 / 2] = 3, [0x134 / 2] = 1,
+#if (GBN_RV32_FAST & 65536) && (GBN_RV32_FAST & 134217728)
+	[0x200 / 2] = 1, [0x202 / 2] = 0, [0x208 / 2] = 1, /* IF (also in IE+IF words): merged lines' flags applied in C */
+#else
 	[0x200 / 2] = 3, [0x202 / 2] = 1, [0x208 / 2] = 1,
+#endif
 	/* DMA count reads are zero, even while the stored reload is nonzero.
 	 * Word reads join zero with the live control halfword. */
 	[0xb8 / 2] = 12, [0xba / 2] = 1,
