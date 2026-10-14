@@ -32,6 +32,25 @@ static inline uint32_t mixer_bytes(uint32_t a, uint32_t b) {
 	return ((a & 0x7f7f7f7fu) + (b & 0x7f7f7f7fu)) ^ ((a ^ b) & 0x80808080u);
 }
 
+#if GBN_RV32_FAST & 33554432
+/* Fast mode: at its deadline a mixer services the plain device events due
+ * (video lines, timers, sound) right here, as the main loop would right
+ * after it returned, and goes on mixing. An IRQ, DMA or serial event, a new
+ * frame, a halt or a half-full sample ring ends the run as before. */
+static bool mixer_events(struct Gbn* m, uint32_t pc, uint32_t* now, uint32_t* deadline) {
+	struct GbnDevices* d = m->devices;
+	uint32_t frames = d->frames, pictures = d->ppu.frames;
+	m->now = *now; m->cpu.pc = pc;
+	enum GbnStatus status = gbn_service_events_passive(m);
+	*now = m->now;
+	if (status != GBN_STEP || d->frames != frames || d->ppu.frames != pictures || d->halted ||
+	    d->dma_blocked || d->stopped || d->audio.size > GBN_AUDIO_CAPACITY / 2) return false;
+	int next = gbn_cpu_event(m);
+	*deadline = next >= 0 ? m->events[next].when : *now + GBN_MAX_DELAY;
+	return (int32_t) (*now - *deadline) < 0;
+}
+#endif
+
 static __attribute__((noinline)) uint32_t mixer_hle(struct Gbn* m) {
 	uint32_t pc = m->cpu.pc, head;
 	if (m->cpu.pipe[0] == mixer_head_ops[0]) head = pc;
@@ -82,6 +101,8 @@ static __attribute__((noinline)) uint32_t mixer_hle(struct Gbn* m) {
 	/* r0/r1 are the sample bytes around r3 - 1 (loop invariant, also kept
 	 * below); then every sample of a word follows from its position alone. */
 	bool positional = q >= 1 && (int8_t) rom[q - 1] == s && (int8_t) rom[q] == s + d;
+	bool wave_end = false;
+	for (;;) {
 	while ((int32_t) (now - deadline) < 0) {
 		if (at_head && positional) {
 			/* Whole word with independent samples (no position chain). */
@@ -120,7 +141,7 @@ static __attribute__((noinline)) uint32_t mixer_hle(struct Gbn* m) {
 	single:;
 		uint32_t cost = 20, count = 13, f = lr + step, n = f >> 23;
 		/* SUBS r2 / BLE leaves for the end of the wave; stop before it. */
-		if (n && (rem <= (int32_t) n || q + n >= limit)) break;
+		if (n && (rem <= (int32_t) n || q + n >= limit)) { wave_end = true; break; }
 		if (at_head) {
 			uint32_t o = base & (GBN_IWRAM_SIZE - 1);
 			word_r = *(const uint32_t*) __builtin_assume_aligned(iwram + o, 4);
@@ -154,6 +175,11 @@ static __attribute__((noinline)) uint32_t mixer_hle(struct Gbn* m) {
 		}
 		now += cost; retired += count;
 		if (ended) break;
+	}
+#if GBN_RV32_FAST & 33554432
+	if (!ended && !wave_end && retired && mixer_events(m, k ? head + 8 : head, &now, &deadline)) continue;
+#endif
+	break;
 	}
 	if (!retired) return 0;
 	uint32_t flags = m->cpu.cpsr & 0x0fffffffu;
@@ -239,6 +265,7 @@ static __attribute__((noinline)) uint32_t mixer_fix_hle(struct Gbn* m) {
 		word_r = sh ? r[6] << sh | r[6] >> (32 - sh) : r[6];
 		word_l = sh ? r[7] << sh | r[7] >> (32 - sh) : r[7];
 	}
+	for (;;) {
 	while ((int32_t) (now - deadline) < 0 && q < limit) {
 		uint32_t cost = 12 + load_cost, count = 9;
 		if (at_head) {
@@ -265,6 +292,11 @@ static __attribute__((noinline)) uint32_t mixer_fix_hle(struct Gbn* m) {
 		}
 		now += cost; retired += count;
 		if (ended) break;
+	}
+#if GBN_RV32_FAST & 33554432
+	if (!ended && q < limit && any && mixer_events(m, k ? head + 8 : head, &now, &deadline)) continue;
+#endif
+	break;
 	}
 	if (!any) return 0;
 	uint32_t flags = m->cpu.cpsr & 0x0fffffffu;

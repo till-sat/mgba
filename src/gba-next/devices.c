@@ -114,7 +114,11 @@ enum GbnStatus gbn_ppu_catchup(struct Gbn* m) {
 }
 #endif
 
-enum GbnStatus gbn_service_events(struct Gbn* m) {
+/* passive (a mixer HLE servicing events between its samples): IRQ, DMA and
+ * serial events stay pending for the main loop, the CPU state not being
+ * committed then. */
+static inline __attribute__((always_inline)) enum GbnStatus service_events(struct Gbn* m, bool passive) {
+	(void) passive;
 	if (!m->devices) return GBN_INVALID_ARGUMENT;
 	struct GbnDevices* d = m->devices;
 	if (d->stopped) return GBN_UNSUPPORTED_DEVICE;
@@ -139,6 +143,9 @@ enum GbnStatus gbn_service_events(struct Gbn* m) {
 #endif
 		}
 		if (id < (int) GBN_EVENT_SAVE) return GBN_EVENT;
+#if GBN_RV32_FAST & 33554432
+		if (passive && (id == (int) GBN_EVENT_IRQ || id == (int) GBN_EVENT_DMA || id == (int) GBN_EVENT_SIO)) return GBN_EVENT;
+#endif
 		uint32_t when = m->events[id].when;
 		if (id == GBN_EVENT_SAVE) {
 			gbn_cancel(m, GBN_EVENT_SAVE);
@@ -239,6 +246,10 @@ enum GbnStatus gbn_service_events(struct Gbn* m) {
 		}
 	}
 }
+enum GbnStatus gbn_service_events(struct Gbn* m) { return service_events(m, false); }
+#if GBN_RV32_FAST & 33554432
+enum GbnStatus gbn_service_events_passive(struct Gbn* m) { return service_events(m, true); }
+#endif
 
 static bool io_supported(uint32_t offset) {
 	return offset < 0x60 || gbn_audio_register(offset) || gbn_sio_register(offset) || (offset >= 0xb0 && offset < 0xe0) ||

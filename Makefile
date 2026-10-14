@@ -223,8 +223,9 @@ GBN_RV32_CODE_MIB ?= 16
 # mixer's resampling and fixed-frequency loops run in C, 32768 BG rows reused
 # while their VRAM pages are unchanged, 65536 HBlank starts nobody observes
 # merged into the line end, 1048576 plain immediate DMAs in one step,
-# 2097152 sound timer overflows without the general sample path. 33554431
-# enables all. Pictures and sound stay correct but no longer match the exact
+# 2097152 sound timer overflows without the general sample path, 33554432
+# the mixer loops service plain device events in place instead of returning
+# at each one. 67108863 enables all. Pictures and sound stay correct but no longer match the exact
 # core frame for frame; 0 is the exact translator, which test-gba-next-rv32
 # compares cycle by cycle.
 GBN_RV32_FAST ?= 0
