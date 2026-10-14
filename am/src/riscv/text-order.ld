@@ -3,7 +3,8 @@
  * benchmark's hottest functions on the proto-soc chip model (10-14 sim profile),
  * densest first and the large dispatch functions after them (best measured),
  * so that they conflict with each other as little as possible in the 32 KiB
- * two-way I-cache. Names that a build lacks match nothing. */
+ * two-way I-cache; objects before cached_indexed: best of a 16-layout search
+ * (10-14). Names that a build lacks match nothing. */
 *(.text.gbn_ppu_indexed_vector .text.gbn_ppu_indexed_vector.*)
 *(.text.gbn_ppu_row_matches_vector .text.gbn_ppu_row_matches_vector.*)
 *(.text.gbn_rvv_equal .text.gbn_rvv_equal.*)
@@ -17,7 +18,7 @@
 *(.text.dma_now_stub .text.dma_now_stub.*)
 *(.text.dma_start_leaf .text.dma_start_leaf.*)
 *(.text.gbn_audio_timeline_queue .text.gbn_audio_timeline_queue.*)
-*(.text.cached_indexed_aligned .text.cached_indexed_aligned.*)
+*(.text.objects_aligned .text.objects_aligned.*)
 *(.text.gbn_schedule_at .text.gbn_schedule_at.*)
 *(.text.dma_write_pointer .text.dma_write_pointer.*)
 *(.text.memcpy)
@@ -34,7 +35,7 @@
 *(.text.select_dma .text.select_dma.*)
 *(.text.dma_read_pointer .text.dma_read_pointer.*)
 *(.text.vcount_match .text.vcount_match.*)
-*(.text.objects_aligned .text.objects_aligned.*)
+*(.text.cached_indexed_aligned .text.cached_indexed_aligned.*)
 *(.text.dma_finish .text.dma_finish.*)
 *(.text.object_membership .text.object_membership.*)
 *(.text.branch_mode .text.branch_mode.*)
